@@ -1,0 +1,92 @@
+job_details:
+  name: olmoe_1b_7b
+  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+
+parameters:
+  # Data.
+  # The paper uses OLMoE-mix-0924. This keeps the local pretokenized path used by
+  # the existing JSC configs so the job is runnable in this workspace.
+  data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50304]
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]
+  null_tokenizer_pad_id: [-1]
+
+  # Model: OLMoE-1B-7B, Table 10.
+  num_layers: [16]
+  hidden_size: [2048]
+  num_attention_heads: [16]
+  num_query_groups: [16]          # Full MHA, not GQA/MoA.
+  ffn_hidden_size: [1024]
+  swiglu: [true]
+  disable_bias_linear: [true]
+  untie_embeddings_and_output_weights: [true]
+  seq_length: [4096]
+  max_position_embeddings: [4096]
+  position_embedding_type: ["rope"]
+  rotary_base: [10000]
+  normalization: ["RMSNorm"]
+  layernorm_epsilon: [1.0e-5]
+  qk_layernorm: [true]
+  init_method_std: [0.02]
+  embedding_init_method_std: [0.02]
+  # Paper initialization is truncated normal at +/-3 std; Megatron's CLI exposes
+  # the std but not the truncation cutoff in this config path.
+
+  # MoE: every layer is a dropless token-choice MoE layer.
+  num_experts: [64]
+  moe_layer_freq: [1]
+  moe_router_topk: [8]
+  moe_ffn_hidden_size: [1024]
+  moe_router_load_balancing_type: ["aux_loss"]
+  moe_aux_loss_coeff: [0.01]      # LBL weight.
+  moe_z_loss_coeff: [0.001]       # Router z-loss weight.
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_router_dtype: ["fp32"]
+
+  # Optimizer.
+  optimizer: ["adam"]             # AdamW via Megatron's decoupled_weight_decay default.
+  lr: [4.0e-4]
+  min_lr: [4.0e-5]
+  weight_decay: [0.1]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+  adam_eps: [1.0e-8]
+  clip_grad: [1.0]
+
+  # LR schedule.
+  lr_decay_style: ["cosine"]
+  lr_warmup_iters: [2500]
+  # 5,033B tokens / (1024 samples * 4096 tokens) = 1,199,961 steps.
+  train_iters: [1199961]
+  # The paper also reports a final 100B-token linear anneal to LR 0. A single
+  # Megatron cosine schedule does not encode that second phase; run it as a
+  # follow-on anneal job or switch to WSD if you want to approximate it here.
+
+  # Batch and precision.
+  micro_batch_size: [1]
+  global_batch_size: [1024]
+  bf16: [true]
+  accumulate_allreduce_grads_in_fp32: [true]
+  main_grads_dtype: ["fp32"]
+  seed: [1000]
+
+  # Parallelism. This is sized for the current 8-GPU JSC launcher, not the
+  # paper's 256 H100 setup.
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [8]
+  use_distributed_optimizer: [true]
+  ckpt_format: ["torch_dist"]
+
+  # Eval, logging, and checkpoint cadence are operational choices, not paper
+  # hyperparameters.
+  eval_interval: [1000]
+  eval_iters: [20]
+  save_interval: [5000]
+  log_interval: [10]
+  wandb_project: ["megatron-olmoe"]

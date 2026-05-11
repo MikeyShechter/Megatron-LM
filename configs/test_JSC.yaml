@@ -1,0 +1,74 @@
+job_details:
+  name: gpt_moe_small
+  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]                # = n_layer
+  hidden_size: [768]              # = n_embd
+  num_attention_heads: [6]        # = n_head
+  disable_bias_linear: [true]
+  seq_length: [1024]              # = sequence_length
+  max_position_embeddings: [1024]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  num_experts: [64]
+  moe_router_topk: [16]           # = top_k
+  # Megatron load-balancing choices: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, none.
+  moe_router_load_balancing_type: ["aux_loss"]
+  moe_aux_loss_coeff: [0.01]      # = aux_coeff_train (single value; no separate train/val)
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  # 768 * 0.5 = 384
+  moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_momentum: [0.95]           # = momentum
+  lr: [0.02]                      # = lr_muon
+  decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;
+                                  #   nanogpt had lr_embed=0.3 separately, not replicable here)
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]               # fallback if switching to adam
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  # WSD (Warmup-Stable-Decay) is Megatron's equivalent of nanogpt's warmdown.
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]            # = warmup_iters
+  lr_wsd_decay_iters: [1714]      # = warmdown_iters
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [2]           # = device_batch_size
+  global_batch_size: [16]        # = batch_size
+  train_iters: [2]             # = num_iterations
+  bf16: [true]
+  seed: [1000]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [1]
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [125]            # = val_loss_every
+  eval_iters: [20]                # structural diff: iteration count, not token count
+                                  # 20 * 512 * 1024 ≈ 10M tokens ≈ original val_tokens
+  save_interval: [200]            # = save_every
+  log_interval: [1]
+  wandb_project: ["megatron-moe"]
+
+  moe_aux_loss_coeff: [0.01]
