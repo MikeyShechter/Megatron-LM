@@ -51,6 +51,12 @@ export GLOO_SOCKET_IFNAME=ib0
 export NCCL_IB_DISABLE=0
 export NCCL_DEBUG=WARN
 
+# Determinism controls required by Megatron/PyTorch deterministic mode.
+export NCCL_ALGO=Ring
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=0
+
 # Master node — same resolution pattern as run_moe.sh
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$(getent hosts "$master_addr" | awk '{print $1; exit}')
@@ -81,6 +87,7 @@ srun \
     export VIRTUAL_ENV=/workspace/.venv
     export TRITON_LIBCUDA_PATH=/.singularity.d/libs
     export LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/compat/lib.real:\${LD_LIBRARY_PATH:-}
+    export PYTHONPATH=/workspace:/workspace/.venv/lib/python3.12/site-packages:/usr/local/lib/python3.12/dist-packages:\${PYTHONPATH:-}
     NODE_RANK=\${SLURM_NODEID}
     cd /workspace
     /workspace/.venv/bin/python -m torch.distributed.run \

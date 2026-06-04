@@ -84,3 +84,38 @@ def test_flat_config_injects_checkpoint_latest_flags(monkeypatch, tmp_path):
 
     assert args.save_only_latest
     assert args.save_pre_decay
+
+
+def test_centered_fsq_load_balance_args(monkeypatch):
+    args = _parse_args(
+        monkeypatch,
+        [
+            '--moe-router-load-balancing-type',
+            'centered_fsq',
+            '--moe-aux-loss-coeff',
+            '0.01',
+            '--load-balance-ste-width',
+            '0.5',
+        ],
+    )
+
+    assert args.moe_router_load_balancing_type == ['centered_fsq']
+    assert args.moe_load_balance_ste_width == 0.5
+
+
+def test_flat_config_injects_centered_fsq_load_balance(monkeypatch, tmp_path):
+    config_path = tmp_path / 'spec.yaml'
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                'moe_router_load_balancing_type': 'centered_fsq',
+                'moe_aux_loss_coeff': 0.01,
+                'load_balance_ste_width': 0.25,
+            }
+        )
+    )
+
+    args = _parse_args(monkeypatch, ['--config', str(config_path)])
+
+    assert args.moe_router_load_balancing_type == ['centered_fsq']
+    assert args.moe_load_balance_ste_width == 0.25

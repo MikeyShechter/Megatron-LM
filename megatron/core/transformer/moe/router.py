@@ -13,10 +13,12 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
+    centered_fsq_load_balancing_loss_func,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     save_to_aux_losses_tracker,
+    save_to_router_metrics_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -277,7 +279,7 @@ class TopKRouter(Router):
 
     def is_aux_loss_enabled(self) -> bool:
         """Check if the auxiliary loss is enabled."""
-        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
+        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss", "centered_fsq"]:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
@@ -321,6 +323,122 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens,
         )
         return probs
+
+    def _apply_centered_fsq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        routing_map: torch.Tensor,
+        with_padding_mask: bool = False,
+    ):
+        """Apply the centered-FSQ auxiliary loss for the given logits and routing map."""
+        centered_fsq_aux_loss_coeff = self.get_aux_loss_coeff("centered_fsq")
+        if centered_fsq_aux_loss_coeff == 0:
+            return probs
+
+        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=self.tp_cp_group,
+                topk=self.topk,
+                with_padding_mask=with_padding_mask,
+            )
+        )
+
+        aux_loss = centered_fsq_load_balancing_loss_func(
+            logits=logits,
+            routing_map=routing_map,
+            tokens_per_expert=global_tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=centered_fsq_aux_loss_coeff,
+            load_balance_ste_width=self.config.moe_load_balance_ste_width,
+            reduce_group=self.tp_cp_group,
+        )
+        probs = self.attach_and_log_load_balancing_loss(
+            probs,
+            centered_fsq_aux_loss_coeff,
+            aux_loss,
+            "centered_fsq_load_balancing_loss",
+            self.tp_cp_group,
+            valid_token_count=local_num_tokens,
+        )
+        return probs
+
+    def _save_router_metrics(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        logits: torch.Tensor,
+        routing_map: torch.Tensor,
+    ) -> None:
+        """Save additive router diagnostics for later logging."""
+        if self.layer_number is None:
+            return
+
+        routing_map = routing_map.bool()
+        valid_tokens = routing_map.any(dim=-1)
+        token_count = valid_tokens.sum().float()
+        tokens_per_expert = routing_map.float().sum(dim=0)
+        scores = scores_for_aux_loss.float()
+        probs = probs.float()
+
+        eps = 1e-9
+        entropy_per_token = -(scores * (scores + eps).log()).sum(dim=-1)
+        entropy_per_token = entropy_per_token / scores.new_tensor(self.config.num_moe_experts).log()
+        entropy_sum = (entropy_per_token * valid_tokens.float()).sum()
+        prob_sum = scores.sum(dim=0)
+
+        topk_count = min(2, probs.size(-1))
+        top_coefficients = torch.topk(probs, k=topk_count, dim=-1).values
+        top1_coef = top_coefficients[:, 0]
+        if topk_count == 2:
+            top2_coef = top_coefficients[:, 1]
+        else:
+            top2_coef = torch.zeros_like(top1_coef)
+        avg_1_2_coef_diff_sum = ((top1_coef - top2_coef) * valid_tokens.float()).sum()
+
+        ste_in_rect_count = token_count.new_tensor(0.0)
+        ste_selected_count = tokens_per_expert.sum()
+        ste_over_rect_count = torch.zeros_like(tokens_per_expert)
+        if self.config.moe_load_balance_ste_width > 0.0:
+            selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
+            threshold = selected_logits.min(dim=-1, keepdim=True).values
+            threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
+            margin = logits.float() - threshold
+            half_width = self.config.moe_load_balance_ste_width * 0.5
+            selected_in_rect = routing_map & (margin.abs() < half_width)
+            selected_over_rect = routing_map & (margin >= half_width)
+            ste_in_rect_count = selected_in_rect.float().sum()
+            ste_over_rect_count = selected_over_rect.float().sum(dim=0)
+
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        if self.is_mtp_layer:
+            layer_number = self.layer_number + self.config.num_layers
+        else:
+            layer_number = self.layer_number
+
+        save_to_router_metrics_tracker(
+            "tokens_per_expert", tokens_per_expert, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker("prob_sum", prob_sum, layer_number, num_layers)
+        save_to_router_metrics_tracker("token_count", token_count, layer_number, num_layers)
+        save_to_router_metrics_tracker("entropy_sum", entropy_sum, layer_number, num_layers)
+        save_to_router_metrics_tracker(
+            "avg_1_2_coef_diff_sum", avg_1_2_coef_diff_sum, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "ste_in_rect_count", ste_in_rect_count, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "ste_selected_count", ste_selected_count, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "ste_over_rect_count", ste_over_rect_count, layer_number, num_layers
+        )
 
     def _apply_seq_aux_loss(
         self,
@@ -636,9 +754,11 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
-            # Calculate scores and routing_map for aux loss
+        routing_map_for_aux_loss = None
+        scores_for_aux_loss = None
+        should_apply_aux_loss = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
+        should_track_router_metrics = self.layer_number is not None
+        if should_apply_aux_loss or should_track_router_metrics:
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
                 self.topk,
@@ -646,9 +766,26 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
+
+        if should_track_router_metrics:
+            self._save_router_metrics(
+                probs,
+                scores_for_aux_loss,
+                logits,
+                routing_map_for_aux_loss,
+            )
+
+        # Apply each aux loss type and attach aux loss autograd function to probs
+        if should_apply_aux_loss:
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
+            probs = self._apply_centered_fsq_aux_loss(
+                probs,
+                logits,
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
             )

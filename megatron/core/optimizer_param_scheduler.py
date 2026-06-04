@@ -57,6 +57,33 @@ def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
     return None
 
 
+def get_decoupled_lr_for_logging(
+    param_groups: list[dict], configured_decoupled_lr: float | None = None
+) -> float | None:
+    """Return the LR for the decoupled embedding/output parameter group, if present.
+
+    Args:
+        param_groups (list[dict]): Parameter groups from the optimizer.
+        configured_decoupled_lr (float, optional): User-configured decoupled LR. This is used
+            as a compatibility fallback for older param groups that do not carry
+            ``is_decoupled_lr=True``.
+
+    Returns:
+        float | None: The decoupled learning rate, or None if no decoupled group is found.
+    """
+    for param_group in param_groups:
+        if param_group.get('is_decoupled_lr', False):
+            return param_group.get('lr')
+
+    if configured_decoupled_lr is None:
+        return None
+
+    for param_group in param_groups:
+        if param_group.get('max_lr') == configured_decoupled_lr:
+            return param_group.get('lr')
+    return None
+
+
 def param_group_override_to_tuple(
     param_group_override: ParamGroupOverride | None,
 ) -> tuple[tuple[str, Any], ...] | None:

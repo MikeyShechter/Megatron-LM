@@ -54,6 +54,18 @@ else:
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
+_MOE_ROUTER_METRICS_TRACKER: dict = {}
+
+_MOE_ROUTER_METRIC_SPECS = {
+    "tokens_per_expert": "expert",
+    "prob_sum": "expert",
+    "token_count": "scalar",
+    "entropy_sum": "scalar",
+    "avg_1_2_coef_diff_sum": "scalar",
+    "ste_in_rect_count": "scalar",
+    "ste_selected_count": "scalar",
+    "ste_over_rect_count": "expert",
+}
 
 
 def switch_load_balancing_loss_func(
@@ -144,6 +156,84 @@ def switch_load_balancing_loss_func(
         num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
     )
     return aux_loss
+
+
+class _RectangularIndicatorSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+        ctx.bandwidth = float(bandwidth)
+        ctx.save_for_backward(margin)
+        return (margin >= 0).to(dtype=margin.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (margin,) = ctx.saved_tensors
+        half_width = ctx.bandwidth * 0.5
+        window = (margin.float().abs() < half_width).to(dtype=torch.float32)
+        grad_margin = grad_output.float() * window
+        return grad_margin.to(dtype=margin.dtype), None
+
+
+def _centered_fsq_from_load(load_frac: torch.Tensor, num_experts: int) -> torch.Tensor:
+    expected_frac = load_frac.new_tensor(1.0 / num_experts)
+    return 1.0 + num_experts * torch.square(load_frac - expected_frac).sum()
+
+
+def _load_balance_ste_tokens_per_expert(
+    logits: torch.Tensor, routing_map: torch.Tensor, load_balance_ste_width: float
+) -> torch.Tensor:
+    routing_map = routing_map.bool()
+    valid_tokens = routing_map.any(dim=-1)
+    selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
+    threshold = selected_logits.min(dim=-1, keepdim=True).values
+    threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
+    margin = logits.float() - threshold
+    soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
+    soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
+    return soft_mask.sum(dim=0)
+
+
+def centered_fsq_load_balancing_loss_func(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    total_num_tokens: Union[int, torch.Tensor],
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    load_balance_ste_width: float = 0.0,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Calculate centered-FSQ load balancing loss with optional rectangular STE.
+
+    The forward value is computed from the hard routed load fractions. When
+    ``load_balance_ste_width`` is positive, a straight-through rectangular mask around the
+    top-k boundary provides gradient to selected and near-boundary unselected experts without
+    changing the hard-load forward value.
+    """
+    if isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens_tensor = total_num_tokens.to(
+            device=tokens_per_expert.device, dtype=torch.float32
+        )
+    else:
+        total_num_tokens_tensor = tokens_per_expert.new_tensor(float(total_num_tokens))
+
+    denom = torch.clamp(total_num_tokens_tensor * float(topk), min=1.0)
+    hard_load_frac = tokens_per_expert.float() / denom
+    load_frac = hard_load_frac
+
+    if load_balance_ste_width > 0.0:
+        ste_tokens_per_expert = _load_balance_ste_tokens_per_expert(
+            logits, routing_map, load_balance_ste_width
+        )
+        if reduce_group is not None:
+            ste_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                ste_tokens_per_expert, reduce_group
+            )
+        ste_load_frac = ste_tokens_per_expert.float() / denom
+        load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
+
+    return _centered_fsq_from_load(load_frac, num_experts) * moe_aux_loss_coeff
 
 
 def z_loss_func(
@@ -1009,6 +1099,204 @@ def clear_aux_losses_tracker() -> None:
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
+
+
+def get_moe_router_metrics_tracker() -> dict:
+    """Return the MoE router metrics tracker."""
+    return _MOE_ROUTER_METRICS_TRACKER
+
+
+def save_to_router_metrics_tracker(
+    name: str,
+    value: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+) -> None:
+    """Save additive per-layer router metrics for logging.
+
+    Args:
+        name (str): Metric name.
+        value (torch.Tensor): Scalar or per-expert additive value.
+        layer_number (int): 1-indexed layer number.
+        num_layers (int): Total number of layers represented in the tracker.
+    """
+    if layer_number is None:
+        return
+
+    tracker = get_moe_router_metrics_tracker()
+    value = value.detach().float()
+    if name not in tracker:
+        tracker[name] = torch.zeros(
+            (num_layers, *value.shape), device=value.device, dtype=torch.float32
+        )
+    tracker[name][layer_number - 1] += value
+
+
+def clear_moe_router_metrics_tracker() -> None:
+    """Clear the MoE router metrics tracker."""
+    tracker = get_moe_router_metrics_tracker()
+    for values in tracker.values():
+        values.zero_()
+
+
+def _initialize_router_metrics_tracker(
+    num_layers: int, num_experts: int, device: torch.device
+) -> None:
+    tracker = get_moe_router_metrics_tracker()
+    for name, shape_type in _MOE_ROUTER_METRIC_SPECS.items():
+        if name in tracker:
+            continue
+        shape = (num_layers, num_experts) if shape_type == "expert" else (num_layers,)
+        tracker[name] = torch.zeros(shape, device=device, dtype=torch.float32)
+
+
+def reduce_moe_router_metrics_tracker_across_ranks(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> None:
+    """Reduce additive MoE router metrics across pipeline, tensor, context, and data ranks."""
+    tracker = get_moe_router_metrics_tracker()
+    if not tracker:
+        return
+
+    if pg_collection is None:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
+    else:
+        pp_group = pg_collection.pp
+        tp_dp_cp_group = pg_collection.tp_dp_cp
+
+    for values in tracker.values():
+        torch.distributed.all_reduce(values, group=pp_group)
+        torch.distributed.all_reduce(values, group=tp_dp_cp_group)
+
+
+def _as_load_balance_type_list(moe_router_load_balancing_type: Union[str, List[str]]) -> List[str]:
+    if isinstance(moe_router_load_balancing_type, list):
+        return moe_router_load_balancing_type
+    return [moe_router_load_balancing_type]
+
+
+def _mean_active(values: torch.Tensor, active_layers: torch.Tensor) -> torch.Tensor:
+    if active_layers.any():
+        return values[active_layers].mean()
+    return values.new_tensor(0.0)
+
+
+def _build_moe_router_metrics_log(
+    metrics: dict[str, torch.Tensor],
+    prefix: str,
+    num_experts: int,
+    loss_scale: float,
+    moe_router_load_balancing_type: Union[str, List[str]],
+) -> dict[str, float]:
+    """Build W&B/TensorBoard scalars from reduced additive router metrics."""
+    if not metrics:
+        return {}
+
+    tokens_per_expert = metrics["tokens_per_expert"].float()
+    prob_sum = metrics["prob_sum"].float()
+    token_count = metrics["token_count"].float()
+    assignment_count = tokens_per_expert.sum(dim=-1)
+    active_layers = assignment_count > 0
+    if not active_layers.any():
+        return {}
+
+    target = tokens_per_expert.new_tensor(1.0 / num_experts)
+    load_frac = tokens_per_expert / assignment_count.clamp(min=1.0).unsqueeze(-1)
+    max_vio_per_layer = (load_frac.max(dim=-1).values - target) / target
+    total_vio_per_layer = torch.abs(load_frac - target).sum(dim=-1) / target
+    entropy_per_layer = metrics["entropy_sum"].float() / token_count.clamp(min=1.0)
+    avg_1_2_coef_diff_per_layer = (
+        metrics["avg_1_2_coef_diff_sum"].float() / token_count.clamp(min=1.0)
+    )
+
+    log: dict[str, float] = {
+        f"{prefix}/router_entropy": float(_mean_active(entropy_per_layer, active_layers).item()),
+        f"{prefix}/router_values/avg_1_2_coef_diff": float(
+            _mean_active(avg_1_2_coef_diff_per_layer, active_layers).item()
+        ),
+    }
+
+    if prefix == "val":
+        active_max_vio = max_vio_per_layer[active_layers]
+        log["vio/MaxVioGlobal"] = float(active_max_vio.mean().item())
+        log["vio/MaxVioGlobalWorstLayer"] = float(active_max_vio.max().item())
+        log["vio/TotalVioGlobal"] = float(total_vio_per_layer[active_layers].mean().item())
+        for layer_idx in torch.nonzero(active_layers, as_tuple=False).flatten().tolist():
+            log[f"vio/MaxVio/Layer {layer_idx}"] = float(max_vio_per_layer[layer_idx].item())
+
+    prob_mean = prob_sum / token_count.clamp(min=1.0).unsqueeze(-1)
+    aux_loss_per_layer = tokens_per_expert.new_zeros(tokens_per_expert.size(0))
+    load_balance_types = _as_load_balance_type_list(moe_router_load_balancing_type)
+    if "aux_loss" in load_balance_types:
+        aux_loss_per_layer += num_experts * (load_frac * prob_mean).sum(dim=-1)
+    if "centered_fsq" in load_balance_types:
+        aux_loss_per_layer += 1.0 + num_experts * torch.square(load_frac - target).sum(dim=-1)
+    if "aux_loss" in load_balance_types or "centered_fsq" in load_balance_types:
+        log[f"{prefix}/aux_loss"] = float(_mean_active(aux_loss_per_layer, active_layers).item())
+
+    if prefix == "val":
+        ste_selected_count = metrics["ste_selected_count"].float()
+        ste_in_rect_count = metrics["ste_in_rect_count"].float()
+        ste_over_rect_count = metrics["ste_over_rect_count"].float()
+        in_rect_frac = ste_in_rect_count.sum() / ste_selected_count.sum().clamp(min=1.0)
+        over_rect_frac_per_expert = (
+            ste_over_rect_count / token_count.clamp(min=1.0).unsqueeze(-1)
+        )
+        active_over_rect = over_rect_frac_per_expert[active_layers]
+        avg_over_rect = (
+            active_over_rect.mean() if active_over_rect.numel() else in_rect_frac.new_tensor(0.0)
+        )
+        max_over_rect = (
+            active_over_rect.max() if active_over_rect.numel() else in_rect_frac.new_tensor(0.0)
+        )
+
+        log["ste/all_layers/in_rect_frac"] = float(in_rect_frac.item())
+        log["ste/all_layers/max_over_rect"] = float(max_over_rect.item())
+        log["ste/all_layers/avg_over_rect"] = float(avg_over_rect.item())
+
+    return log
+
+
+def track_moe_router_metrics(
+    loss_scale: float,
+    iteration: int,
+    writer: Optional["SummaryWriter"] = None,
+    wandb_writer: Optional["wandb.Run"] = None,
+    prefix: str = "train",
+    force_initialize: bool = False,
+    num_layers: Optional[int] = None,
+    num_experts: Optional[int] = None,
+    moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss",
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> dict[str, float]:
+    """Reduce and log accumulated MoE router diagnostics."""
+    tracker = get_moe_router_metrics_tracker()
+    if force_initialize:
+        assert num_layers is not None
+        assert num_experts is not None
+        device = next(iter(tracker.values())).device if tracker else torch.device("cuda")
+        _initialize_router_metrics_tracker(num_layers, num_experts, device)
+
+    reduce_moe_router_metrics_tracker_across_ranks(pg_collection=pg_collection)
+    log = _build_moe_router_metrics_log(
+        tracker,
+        prefix=prefix,
+        num_experts=num_experts,
+        loss_scale=loss_scale,
+        moe_router_load_balancing_type=moe_router_load_balancing_type,
+    )
+
+    if writer:
+        for key, value in log.items():
+            writer.add_scalar(key, value, iteration)
+    if wandb_writer and log:
+        wandb_writer.log(log, iteration)
+
+    clear_moe_router_metrics_tracker()
+    return log
 
 
 def reduce_aux_losses_tracker_across_ranks(

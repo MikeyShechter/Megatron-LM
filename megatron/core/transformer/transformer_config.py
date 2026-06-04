@@ -639,6 +639,7 @@ class TransformerConfig(ModelParallelConfig):
     Options:
     - "aux_loss": Load balancing loss used in GShard and SwitchTransformer, calculated at
     micro-batch level.
+    - "centered_fsq": Centered fractional-squared routed-load loss with optional rectangular STE.
     - "seq_aux_loss": Load balancing loss used in DeepSeekV2 and DeepSeekV3, computes loss
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
@@ -736,6 +737,16 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
+
+    moe_load_balance_ste_width: float = field(
+        default=0.0,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--moe-load-balance-ste-width", "--load-balance-ste-width"]
+            }
+        },
+    )
+    """Width of the rectangular STE window used by centered-FSQ load balancing."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
@@ -1317,6 +1328,9 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_router_load_balancing_type"
             )
 
+        if self.moe_load_balance_ste_width < 0.0:
+            raise ValueError("moe_load_balance_ste_width must be non-negative")
+
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
@@ -1324,23 +1338,25 @@ class TransformerConfig(ModelParallelConfig):
                 for load_balancing_type in self.moe_router_load_balancing_type:
                     if load_balancing_type not in [
                         "aux_loss",
+                        "centered_fsq",
                         "seq_aux_loss",
                         "global_aux_loss",
                         "none",
                     ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
-                            "seq_aux_loss, global_aux_loss or none load balancing"
+                            "centered_fsq, seq_aux_loss, global_aux_loss or none load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
+                "centered_fsq",
                 "seq_aux_loss",
                 "global_aux_loss",
                 "none",
             ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
-                    "seq_aux_loss, global_aux_loss or none load balancing"
+                    "centered_fsq, seq_aux_loss, global_aux_loss or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

@@ -53,7 +53,10 @@ from typing import Any, Dict, Optional
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+from megatron.core.optimizer_param_scheduler import (
+    get_canonical_lr_for_logging,
+    get_decoupled_lr_for_logging,
+)
 
 from .log_handler import CustomHandler
 
@@ -203,7 +206,12 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    clear_moe_router_metrics_tracker,
+    track_moe_metrics,
+    track_moe_router_metrics,
+)
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
@@ -2031,10 +2039,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_num_moe_logging_layers(args):
+    """Return the number of MoE layers represented in MoE logging trackers."""
+    if is_hybrid_model(args):
+        from operator import itemgetter
+
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+
+        return itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+    return args.num_layers
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate: float | None,
+    decoupled_learning_rate: float | None,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -2129,6 +2149,9 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    decoupled_learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
+        decoupled_learning_rate
+    )
     # TensorBoard and WandB values.
     if (writer or wandb_writer) and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2139,6 +2162,18 @@ def training_log(
                 writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
+                wandb_writer.log({'train/learning_rate': learning_rate}, iteration)
+        if decoupled_learning_rate is not None:
+            if writer:
+                writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
+                writer.add_scalar(
+                    'decoupled-learning-rate vs samples',
+                    decoupled_learning_rate,
+                    args.consumed_train_samples,
+                )
+            if wandb_writer:
+                wandb_writer.log({'decoupled_lr': decoupled_learning_rate}, iteration)
+                wandb_writer.log({'train/decoupled_lr': decoupled_learning_rate}, iteration)
         if args.skipped_train_samples > 0:
             if writer:
                 writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
@@ -2163,6 +2198,7 @@ def training_log(
                 writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
+                wandb_writer.log({f"train/{key.replace(' ', '_')}": loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
             if writer:
                 writer.add_scalar('loss-scale', loss_scale, iteration)
@@ -2225,6 +2261,8 @@ def training_log(
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
+        if "centered_fsq" in args.moe_router_load_balancing_type:
+            track_names.append("centered_fsq_load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in args.moe_router_load_balancing_type:
@@ -2232,16 +2270,7 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
-        if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols,
-                get_hybrid_layer_counts,
-            )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
-        else:
-            layers = args.num_layers
+        layers = _get_num_moe_logging_layers(args)
 
         track_moe_metrics(
             loss_scale=moe_loss_scale,
@@ -2255,6 +2284,18 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
+        )
+        track_moe_router_metrics(
+            loss_scale=moe_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            prefix="train",
+            force_initialize=True,
+            num_layers=layers,
+            num_experts=args.num_experts,
+            moe_router_load_balancing_type=args.moe_router_load_balancing_type,
             pg_collection=pg_collection,
         )
 
@@ -3273,12 +3314,17 @@ def train(
             params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+            decoupled_learning_rate = get_decoupled_lr_for_logging(
+                optimizer.param_groups, args.decoupled_lr
+            )
         else:
             learning_rate = None
+            decoupled_learning_rate = None
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
             learning_rate,
+            decoupled_learning_rate,
             iteration,
             loss_scale,
             report_memory_flag,
@@ -3350,6 +3396,7 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 clear_aux_losses_tracker()
+                clear_moe_router_metrics_tracker()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -3448,6 +3495,8 @@ def evaluate(
     rerun_state_machine.set_mode(RerunMode.DISABLED)
 
     total_loss_dict = {}
+    if args.num_experts is not None:
+        clear_moe_router_metrics_tracker()
 
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
@@ -3672,9 +3721,31 @@ def evaluate_and_print_results(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
             if wandb_writer and is_last_rank():
+                val_prefix = "val" if suffix == "" else f"val/{suffix.lstrip('-')}"
                 wandb_writer.log(
-                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                    {
+                        '{} validation{}'.format(key, suffix): total_loss_dict[key].item(),
+                        f"{val_prefix}/{key.replace(' ', '_')}": total_loss_dict[key].item(),
+                    },
+                    iteration,
                 )
+
+        if args.num_experts is not None:
+            eval_num_microbatches = args.eval_global_batch_size // (
+                args.eval_micro_batch_size * args.data_parallel_size
+            )
+            router_loss_scale = 1.0 / max(1, iterations * eval_num_microbatches)
+            track_moe_router_metrics(
+                loss_scale=router_loss_scale,
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                prefix="val",
+                force_initialize=True,
+                num_layers=_get_num_moe_logging_layers(args),
+                num_experts=args.num_experts,
+                moe_router_load_balancing_type=args.moe_router_load_balancing_type,
+            )
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)

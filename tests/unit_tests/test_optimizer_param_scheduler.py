@@ -8,6 +8,7 @@ import pytest
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_decoupled_lr_for_logging,
 )
 
 
@@ -348,3 +349,28 @@ class TestGetCanonicalLrForLogging:
         """lr=0.0 is a legitimate value, not to be confused with None."""
         param_groups = [{'lr': 0.0, 'default_config': True}]
         assert get_canonical_lr_for_logging(param_groups) == 0.0
+
+
+class TestGetDecoupledLrForLogging:
+    """Tests for get_decoupled_lr_for_logging."""
+
+    def test_tagged_decoupled_group(self):
+        param_groups = [
+            {'lr': 0.01, 'default_config': True},
+            {'lr': 0.002, 'is_decoupled_lr': True},
+        ]
+
+        assert get_decoupled_lr_for_logging(param_groups) == 0.002
+
+    def test_configured_lr_fallback(self):
+        param_groups = [
+            {'lr': 0.01, 'max_lr': 0.01},
+            {'lr': 0.0015, 'max_lr': 0.002},
+        ]
+
+        assert get_decoupled_lr_for_logging(param_groups, configured_decoupled_lr=0.002) == 0.0015
+
+    def test_missing_decoupled_group(self):
+        param_groups = [{'lr': 0.01, 'default_config': True}]
+
+        assert get_decoupled_lr_for_logging(param_groups) is None
