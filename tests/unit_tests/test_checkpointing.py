@@ -23,10 +23,14 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _read_tracker_iteration_for_cleanup,
     get_checkpoint_tracker_filename,
+    get_wsd_pre_decay_iteration,
     load_checkpoint,
     read_metadata,
     save_checkpoint,
+    should_delete_previous_checkpoint,
+    should_save_pre_decay_checkpoint,
 )
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -72,6 +76,93 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def _retention_args(**overrides):
+    values = {
+        'global_batch_size': 1,
+        'lr_decay_iters': 100,
+        'lr_decay_samples': None,
+        'lr_decay_style': 'WSD',
+        'lr_wsd_decay_iters': 20,
+        'lr_wsd_decay_samples': None,
+        'save_only_latest': False,
+        'save_pre_decay': True,
+        'save_retain_interval': None,
+        'train_iters': 100,
+        'train_samples': None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_wsd_pre_decay_iteration_from_iters():
+    args = _retention_args(lr_decay_iters=120, lr_wsd_decay_iters=30, train_iters=120)
+
+    assert get_wsd_pre_decay_iteration(args) == 90
+    assert should_save_pre_decay_checkpoint(args, 90)
+    assert not should_save_pre_decay_checkpoint(args, 89)
+
+
+def test_wsd_pre_decay_iteration_uses_train_iters_default():
+    args = _retention_args(lr_decay_iters=None, lr_wsd_decay_iters=25, train_iters=100)
+
+    assert get_wsd_pre_decay_iteration(args) == 75
+
+
+def test_wsd_pre_decay_iteration_from_samples():
+    args = _retention_args(
+        global_batch_size=10,
+        lr_decay_samples=1200,
+        lr_wsd_decay_iters=None,
+        lr_wsd_decay_samples=300,
+        train_samples=1200,
+    )
+
+    assert get_wsd_pre_decay_iteration(args) == 90
+
+
+def test_pre_decay_checkpoint_is_not_saved_for_final_iteration():
+    args = _retention_args(lr_decay_iters=100, lr_wsd_decay_iters=20, train_iters=80)
+
+    assert get_wsd_pre_decay_iteration(args) == 80
+    assert not should_save_pre_decay_checkpoint(args, 80)
+
+
+def test_save_only_latest_deletes_previous_checkpoint():
+    args = _retention_args(save_only_latest=True)
+
+    assert should_delete_previous_checkpoint(args, previous_iteration=40, current_iteration=60)
+    assert not should_delete_previous_checkpoint(args, previous_iteration=60, current_iteration=60)
+
+
+def test_save_only_latest_keeps_wsd_pre_decay_checkpoint():
+    args = _retention_args(save_only_latest=True)
+
+    assert get_wsd_pre_decay_iteration(args) == 80
+    assert not should_delete_previous_checkpoint(args, previous_iteration=80, current_iteration=100)
+
+
+def test_save_retain_interval_keeps_wsd_pre_decay_checkpoint():
+    args = _retention_args(save_retain_interval=50)
+
+    assert should_delete_previous_checkpoint(args, previous_iteration=40, current_iteration=60)
+    assert not should_delete_previous_checkpoint(args, previous_iteration=50, current_iteration=60)
+    assert not should_delete_previous_checkpoint(args, previous_iteration=80, current_iteration=100)
+
+
+def test_rank0_cleanup_tracker_read_has_no_distributed_sync(tmp_path, monkeypatch):
+    tracker_path = tmp_path / 'latest_checkpointed_iteration.txt'
+    tracker_path.write_text('5')
+    monkeypatch.setattr(
+        'megatron.training.checkpointing.read_metadata',
+        mock.Mock(side_effect=AssertionError("cleanup must not use distributed metadata read")),
+    )
+
+    assert _read_tracker_iteration_for_cleanup(str(tracker_path)) == 5
+
+    tracker_path.write_text('release')
+    assert _read_tracker_iteration_for_cleanup(str(tracker_path)) == 0
 
 
 def create_checkpoint(load_path, ckpt_format):

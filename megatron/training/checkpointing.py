@@ -105,6 +105,76 @@ def finalize_deletion_processes(blocking=False):
     for proc in finished:
         _deletion_processes.remove(proc)
 
+
+def get_wsd_pre_decay_iteration(args: Namespace) -> int | None:
+    """Return the checkpoint iteration immediately before WSD learning-rate decay."""
+    if getattr(args, 'lr_decay_style', None) != 'WSD':
+        return None
+
+    lr_wsd_decay_iters = getattr(args, 'lr_wsd_decay_iters', None)
+    if lr_wsd_decay_iters is not None:
+        if lr_wsd_decay_iters <= 0:
+            return None
+        lr_decay_iters = getattr(args, 'lr_decay_iters', None)
+        if lr_decay_iters is None:
+            lr_decay_iters = getattr(args, 'train_iters', None)
+        if lr_decay_iters is None:
+            return None
+        pre_decay_iteration = lr_decay_iters - lr_wsd_decay_iters
+    else:
+        lr_wsd_decay_samples = getattr(args, 'lr_wsd_decay_samples', None)
+        if lr_wsd_decay_samples is None or lr_wsd_decay_samples <= 0:
+            return None
+        lr_decay_samples = getattr(args, 'lr_decay_samples', None)
+        if lr_decay_samples is None:
+            lr_decay_samples = getattr(args, 'train_samples', None)
+        global_batch_size = getattr(args, 'global_batch_size', None)
+        if lr_decay_samples is None or global_batch_size is None:
+            return None
+        pre_decay_iteration = (lr_decay_samples - lr_wsd_decay_samples) // global_batch_size
+
+    if pre_decay_iteration <= 0:
+        return None
+    return pre_decay_iteration
+
+
+def should_save_pre_decay_checkpoint(args: Namespace, iteration: int) -> bool:
+    """Return whether this iteration should create the protected WSD pre-decay checkpoint."""
+    if not getattr(args, 'save_pre_decay', False):
+        return False
+    pre_decay_iteration = get_wsd_pre_decay_iteration(args)
+    if pre_decay_iteration is None:
+        return False
+    return iteration == pre_decay_iteration and iteration != getattr(args, 'train_iters', None)
+
+
+def should_delete_previous_checkpoint(
+    args: Namespace, previous_iteration: int, current_iteration: int
+) -> bool:
+    """Return whether the previous persistent checkpoint should be deleted."""
+    if previous_iteration <= 0 or previous_iteration == current_iteration:
+        return False
+
+    pre_decay_iteration = get_wsd_pre_decay_iteration(args)
+    if getattr(args, 'save_pre_decay', False) and previous_iteration == pre_decay_iteration:
+        return False
+
+    if getattr(args, 'save_only_latest', False):
+        return True
+
+    save_retain_interval = getattr(args, 'save_retain_interval', None)
+    return save_retain_interval is not None and previous_iteration % save_retain_interval != 0
+
+
+def _read_tracker_iteration_for_cleanup(tracker_filename: str) -> int:
+    """Read the tracker file from rank 0 without distributed synchronization."""
+    with open_file(tracker_filename, 'r') as f:
+        metadata = f.read().strip()
+    if metadata == "release":
+        return 0
+    return int(metadata)
+
+
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
@@ -782,11 +852,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             def iter_finalize_fn():
                 prev_iteration = 0
-                save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
-                if save_retain_interval is not None:
+                save_retain_interval = getattr(
+                    args, 'save_retain_interval', None
+                )  # For backwards compatibility of tests.
+                if save_retain_interval is not None or getattr(args, 'save_only_latest', False):
                     if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
-                        with open_file(tracker_filename, 'r') as f:
-                            prev_iteration = int(f.read().strip())
+                        prev_iteration = _read_tracker_iteration_for_cleanup(tracker_filename)
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
@@ -799,33 +870,44 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
 
-                if save_retain_interval is not None:
-                    if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
-                        checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
-                                                              return_base_dir=True)
-                        # Don't delete if `checkpoint_name` is a symbolic link.
-                        if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
-                            print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                         f'at {args.save} since it is a symbolic link')
+                if should_delete_previous_checkpoint(args, prev_iteration, iteration):
+                    checkpoint_name = get_checkpoint_name(
+                        args.save, iteration=prev_iteration, return_base_dir=True
+                    )
+                    # Don't delete if `checkpoint_name` is a symbolic link.
+                    if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(
+                            f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
+                            f'at {args.save} since it is a symbolic link'
+                        )
+                    else:
+                        # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
+                        # Use multiprocessing to delete checkpoint in background
+                        if args.async_save:
+                            # Clean up any finished deletion processes before starting a new one
+                            finalize_deletion_processes(blocking=False)
+                            ctx = multiprocessing.get_context('fork')
+                            delete_process = ctx.Process(
+                                target=_async_delete_checkpoint_impl,
+                                args=(
+                                    args.save,
+                                    prev_iteration,
+                                    args.log_progress,
+                                    True,
+                                    args.async_ckpt_cpu_priority,
+                                    args.async_ckpt_io_priority,
+                                ),
+                                daemon=True,
+                            )
+                            delete_process.start()
+                            # Track the process so we can join it later to prevent zombies
+                            _deletion_processes.append(delete_process)
                         else:
-                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            # Use multiprocessing to delete checkpoint in background
-                            if args.async_save:
-                                # Clean up any finished deletion processes before starting a new one
-                                finalize_deletion_processes(blocking=False)
-                                ctx = multiprocessing.get_context('fork')
-                                delete_process = ctx.Process(
-                                    target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, args.log_progress, True,
-                                          args.async_ckpt_cpu_priority, args.async_ckpt_io_priority),
-                                    daemon=True
-                                )
-                                delete_process.start()
-                                # Track the process so we can join it later to prevent zombies
-                                _deletion_processes.append(delete_process)
-                            else:
-                                th = threading.Thread(target=_async_delete_checkpoint_impl, args=(args.save, prev_iteration, args.log_progress))
-                                th.start()
+                            th = threading.Thread(
+                                target=_async_delete_checkpoint_impl,
+                                args=(args.save, prev_iteration, args.log_progress),
+                            )
+                            th.start()
 
         if args.async_save:
             assert async_save_request is not None

@@ -83,6 +83,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_config_alias_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -125,8 +126,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # into sys.argv so they are visible to the main argparse pass below.
     # Keys use underscores (e.g. micro_batch_size) and map to --flag-name form.
     # CLI args that follow --config override the YAML values.
-    # Keys in _CONFIG_SKIP are handled externally (e.g. by the sbatch script).
-    _CONFIG_SKIP = frozenset({'output_dir', 'run_name', 'config_label', 'output'})
+    # Keys in _CONFIG_SKIP are handled externally (e.g. by the submit script).
+    _CONFIG_SKIP = frozenset({'config_label', 'output'})
     _pre = argparse.ArgumentParser(add_help=False)
     _pre.add_argument('--config', type=str, default=None)
     _pre_args, _remaining = _pre.parse_known_args()
@@ -160,6 +161,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    _apply_config_alias_args(parser, args)
 
     args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
 
@@ -2302,6 +2305,31 @@ def _add_logging_args(parser):
     group = log_factory.build_group(parser, title="logging")
 
     return parser
+
+
+def _add_config_alias_args(parser):
+    group = parser.add_argument_group(title='config aliases')
+    group.add_argument('--output-dir', type=str, default=None,
+                       help='Directory to use for both --save and --load. '
+                       'Mutually exclusive with --save and --load.')
+    group.add_argument('--run-name', type=str, default=None,
+                       help='Alias for --wandb-exp-name. '
+                       'Mutually exclusive with --wandb-exp-name.')
+
+    return parser
+
+
+def _apply_config_alias_args(parser, args):
+    if args.output_dir is not None:
+        if args.save is not None or args.load is not None:
+            parser.error('--output-dir cannot be used with --save or --load')
+        args.save = args.output_dir
+        args.load = args.output_dir
+
+    if args.run_name is not None:
+        if args.wandb_exp_name is not None:
+            parser.error('--run-name cannot be used with --wandb-exp-name')
+        args.wandb_exp_name = args.run_name
 
 
 def _add_regularization_args(parser):

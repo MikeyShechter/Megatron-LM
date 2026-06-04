@@ -12,6 +12,8 @@ parameters:
   padded_vocab_size: [50304]
   null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
   null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
 
   # ── Model ─────────────────────────────────────────────────────────────────────
   num_layers: [12]                # = n_layer
@@ -31,6 +33,7 @@ parameters:
   moe_token_dispatcher_type: ["alltoall"]
   # 768 * 0.5 = 384
   moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
+  moe_router_dtype: ["fp32"]
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
   optimizer: ["muon"]
@@ -48,13 +51,13 @@ parameters:
   # WSD (Warmup-Stable-Decay) is Megatron's equivalent of nanogpt's warmdown.
   lr_decay_style: ["WSD"]
   lr_warmup_iters: [0]            # = warmup_iters
-  lr_wsd_decay_iters: [1714]      # = warmdown_iters
+  lr_wsd_decay_iters: [7]      # = warmdown_iters
   lr_wsd_decay_style: ["linear"]
 
   # ── Batch & iters ─────────────────────────────────────────────────────────────
-  micro_batch_size: [2]           # = device_batch_size
-  global_batch_size: [16]        # = batch_size
-  train_iters: [2]             # = num_iterations
+  micro_batch_size: [8]           # = device_batch_size
+  global_batch_size: [32]        # = batch_size
+  train_iters: [20]             # = num_iterations
   bf16: [true]
   seed: [1000]
 
@@ -64,10 +67,10 @@ parameters:
   expert_model_parallel_size: [1]
 
   # ── Eval & logging ────────────────────────────────────────────────────────────
-  eval_interval: [125]            # = val_loss_every
-  eval_iters: [20]                # structural diff: iteration count, not token count
+  eval_interval: [5]            # = val_loss_every
+  eval_iters: [2]                # structural diff: iteration count, not token count
                                   # 20 * 512 * 1024 ≈ 10M tokens ≈ original val_tokens
-  save_interval: [200]            # = save_every
+  save_interval: [5]            # = save_every
   log_interval: [1]
   wandb_project: ["megatron-moe"]
 

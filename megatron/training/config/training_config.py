@@ -393,6 +393,15 @@ class CheckpointConfig:
     (other checkpoints except the last checkpoint are automatically deleted).
     """
 
+    save_only_latest: bool = False
+    """If set, remove the previous checkpoint after saving a new one."""
+
+    save_pre_decay: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--save-pre-decay"], "action": "store_true"}},
+    )
+    """If set, always keep the checkpoint immediately before WSD learning-rate decay."""
+
     most_recent_k: int | None = -1
     """Number of latest checkpoint to be saved."""
 
