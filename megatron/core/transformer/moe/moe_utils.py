@@ -174,9 +174,29 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
         return grad_margin.to(dtype=margin.dtype), None
 
 
-def _centered_fsq_from_load(load_frac: torch.Tensor, num_experts: int) -> torch.Tensor:
+DIRECT_LOAD_BALANCING_LOSS_TYPES = ("fsq", "centered_fsq", "maxvio", "maxviosq", "totalvio")
+
+
+def _direct_load_balance_from_load(
+    load_frac: torch.Tensor, num_experts: int, load_balancing_type: str
+) -> torch.Tensor:
     expected_frac = load_frac.new_tensor(1.0 / num_experts)
-    return 1.0 + num_experts * torch.square(load_frac - expected_frac).sum()
+    num_experts_tensor = load_frac.new_tensor(float(num_experts))
+
+    if load_balancing_type == "fsq":
+        return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
+    if load_balancing_type == "centered_fsq":
+        return 1.0 + num_experts_tensor * torch.square(load_frac - expected_frac).sum(dim=-1)
+    if load_balancing_type == "maxvio":
+        return 1.0 + (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
+    if load_balancing_type == "maxviosq":
+        raw_penalty = (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
+        max_penalty = max(num_experts - 1.0, 1.0)
+        return 1.0 + torch.square(raw_penalty) / max_penalty
+    if load_balancing_type == "totalvio":
+        raw_penalty = torch.abs(load_frac - expected_frac).sum(dim=-1) / expected_frac
+        return 1.0 + 0.5 * raw_penalty
+    raise ValueError(f"Unsupported direct load balancing type: {load_balancing_type}")
 
 
 def _load_balance_ste_tokens_per_expert(
@@ -193,7 +213,8 @@ def _load_balance_ste_tokens_per_expert(
     return soft_mask.sum(dim=0)
 
 
-def centered_fsq_load_balancing_loss_func(
+def direct_load_balancing_loss_func(
+    load_balancing_type: str,
     logits: torch.Tensor,
     routing_map: torch.Tensor,
     tokens_per_expert: torch.Tensor,
@@ -204,13 +225,7 @@ def centered_fsq_load_balancing_loss_func(
     load_balance_ste_width: float = 0.0,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
-    """Calculate centered-FSQ load balancing loss with optional rectangular STE.
-
-    The forward value is computed from the hard routed load fractions. When
-    ``load_balance_ste_width`` is positive, a straight-through rectangular mask around the
-    top-k boundary provides gradient to selected and near-boundary unselected experts without
-    changing the hard-load forward value.
-    """
+    """Calculate direct routed-load balance loss with optional rectangular STE."""
     if isinstance(total_num_tokens, torch.Tensor):
         total_num_tokens_tensor = total_num_tokens.to(
             device=tokens_per_expert.device, dtype=torch.float32
@@ -233,7 +248,9 @@ def centered_fsq_load_balancing_loss_func(
         ste_load_frac = ste_tokens_per_expert.float() / denom
         load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
 
-    return _centered_fsq_from_load(load_frac, num_experts) * moe_aux_loss_coeff
+    return _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type) * (
+        moe_aux_loss_coeff
+    )
 
 
 def z_loss_func(
@@ -1232,9 +1249,15 @@ def _build_moe_router_metrics_log(
     load_balance_types = _as_load_balance_type_list(moe_router_load_balancing_type)
     if "aux_loss" in load_balance_types:
         aux_loss_per_layer += num_experts * (load_frac * prob_mean).sum(dim=-1)
-    if "centered_fsq" in load_balance_types:
-        aux_loss_per_layer += 1.0 + num_experts * torch.square(load_frac - target).sum(dim=-1)
-    if "aux_loss" in load_balance_types or "centered_fsq" in load_balance_types:
+    for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES:
+        if load_balancing_type in load_balance_types:
+            aux_loss_per_layer += _direct_load_balance_from_load(
+                load_frac, num_experts, load_balancing_type
+            )
+    if "aux_loss" in load_balance_types or any(
+        load_balancing_type in load_balance_types
+        for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
+    ):
         log[f"{prefix}/aux_loss"] = float(_mean_active(aux_loss_per_layer, active_layers).item())
 
     if prefix == "val":

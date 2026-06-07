@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core.transformer.moe.moe_utils import centered_fsq_load_balancing_loss_func
+from megatron.core.transformer.moe.moe_utils import direct_load_balancing_loss_func
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -10,7 +10,8 @@ def _centered_fsq_loss_and_grad(load_balance_ste_width):
     logits = torch.tensor([[2.7, 2.5, 2.4, 0.1]], dtype=torch.float32, requires_grad=True)
     routing_map = torch.tensor([[True, True, False, False]])
     tokens_per_expert = routing_map.sum(dim=0)
-    loss = centered_fsq_load_balancing_loss_func(
+    loss = direct_load_balancing_loss_func(
+        load_balancing_type="centered_fsq",
         logits=logits,
         routing_map=routing_map,
         tokens_per_expert=tokens_per_expert,
@@ -50,7 +51,8 @@ def test_centered_fsq_forward_value_for_arbitrary_load():
     routing_map = torch.zeros((10, 4), dtype=torch.bool)
     tokens_per_expert = torch.tensor([4, 3, 1, 2])
 
-    loss = centered_fsq_load_balancing_loss_func(
+    loss = direct_load_balancing_loss_func(
+        load_balancing_type="centered_fsq",
         logits=logits,
         routing_map=routing_map,
         tokens_per_expert=tokens_per_expert,

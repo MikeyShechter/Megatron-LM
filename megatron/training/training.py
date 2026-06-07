@@ -2259,13 +2259,17 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
-        if "aux_loss" in args.moe_router_load_balancing_type:
+        moe_router_load_balancing_types = args.moe_router_load_balancing_type
+        if isinstance(moe_router_load_balancing_types, str):
+            moe_router_load_balancing_types = [moe_router_load_balancing_types]
+        if "aux_loss" in moe_router_load_balancing_types:
             track_names.append("load_balancing_loss")
-        if "centered_fsq" in args.moe_router_load_balancing_type:
-            track_names.append("centered_fsq_load_balancing_loss")
-        if "seq_aux_loss" in args.moe_router_load_balancing_type:
+        for load_balancing_type in ("fsq", "centered_fsq", "maxvio", "maxviosq", "totalvio"):
+            if load_balancing_type in moe_router_load_balancing_types:
+                track_names.append(f"{load_balancing_type}_load_balancing_loss")
+        if "seq_aux_loss" in moe_router_load_balancing_types:
             track_names.append("seq_load_balancing_loss")
-        if "global_aux_loss" in args.moe_router_load_balancing_type:
+        if "global_aux_loss" in moe_router_load_balancing_types:
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")

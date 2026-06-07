@@ -8,13 +8,14 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    DIRECT_LOAD_BALANCING_LOSS_TYPES,
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
-    centered_fsq_load_balancing_loss_func,
     compute_routing_scores_for_aux_loss,
+    direct_load_balancing_loss_func,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -279,7 +280,12 @@ class TopKRouter(Router):
 
     def is_aux_loss_enabled(self) -> bool:
         """Check if the auxiliary loss is enabled."""
-        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss", "centered_fsq"]:
+        aux_loss_types = (
+            "aux_loss",
+            "seq_aux_loss",
+            "global_aux_loss",
+        ) + DIRECT_LOAD_BALANCING_LOSS_TYPES
+        for aux_loss_type in aux_loss_types:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
@@ -324,16 +330,20 @@ class TopKRouter(Router):
         )
         return probs
 
-    def _apply_centered_fsq_aux_loss(
+    def _apply_direct_load_balancing_aux_losses(
         self,
         probs: torch.Tensor,
         logits: torch.Tensor,
         routing_map: torch.Tensor,
         with_padding_mask: bool = False,
     ):
-        """Apply the centered-FSQ auxiliary loss for the given logits and routing map."""
-        centered_fsq_aux_loss_coeff = self.get_aux_loss_coeff("centered_fsq")
-        if centered_fsq_aux_loss_coeff == 0:
+        """Apply direct routed-load auxiliary losses for the given logits and routing map."""
+        direct_loss_coeffs = []
+        for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES:
+            direct_aux_loss_coeff = self.get_aux_loss_coeff(load_balancing_type)
+            if direct_aux_loss_coeff != 0:
+                direct_loss_coeffs.append((load_balancing_type, direct_aux_loss_coeff))
+        if not direct_loss_coeffs:
             return probs
 
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
@@ -345,25 +355,27 @@ class TopKRouter(Router):
             )
         )
 
-        aux_loss = centered_fsq_load_balancing_loss_func(
-            logits=logits,
-            routing_map=routing_map,
-            tokens_per_expert=global_tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=self.topk,
-            num_experts=self.config.num_moe_experts,
-            moe_aux_loss_coeff=centered_fsq_aux_loss_coeff,
-            load_balance_ste_width=self.config.moe_load_balance_ste_width,
-            reduce_group=self.tp_cp_group,
-        )
-        probs = self.attach_and_log_load_balancing_loss(
-            probs,
-            centered_fsq_aux_loss_coeff,
-            aux_loss,
-            "centered_fsq_load_balancing_loss",
-            self.tp_cp_group,
-            valid_token_count=local_num_tokens,
-        )
+        for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
+            aux_loss = direct_load_balancing_loss_func(
+                load_balancing_type=load_balancing_type,
+                logits=logits,
+                routing_map=routing_map,
+                tokens_per_expert=global_tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=direct_aux_loss_coeff,
+                load_balance_ste_width=self.config.moe_load_balance_ste_width,
+                reduce_group=self.tp_cp_group,
+            )
+            probs = self.attach_and_log_load_balancing_loss(
+                probs,
+                direct_aux_loss_coeff,
+                aux_loss,
+                f"{load_balancing_type}_load_balancing_loss",
+                self.tp_cp_group,
+                valid_token_count=local_num_tokens,
+            )
         return probs
 
     def _save_router_metrics(
@@ -783,7 +795,7 @@ class TopKRouter(Router):
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
             )
-            probs = self._apply_centered_fsq_aux_loss(
+            probs = self._apply_direct_load_balancing_aux_losses(
                 probs,
                 logits,
                 routing_map_for_aux_loss,
