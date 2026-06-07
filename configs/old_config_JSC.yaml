@@ -15,6 +15,9 @@ parameters:
   save_only_latest: [true]
   save_pre_decay: [true]
 
+  task-eval-tasks: ['dclm-core-22']
+  task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
+
   # ── Model ─────────────────────────────────────────────────────────────────────
   num_layers: [12]                # = n_layer
   hidden_size: [768]              # = n_embd
@@ -34,6 +37,13 @@ parameters:
   moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
   moe_router_dtype: ["fp32"]
   
+  # LIST_EXPS:
+  #   - moe_router_load_balancing_type: ["centered_fsq"]
+  #     load_balance_ste_width: [1.0]
+  #     moe_aux_loss_coeff: [0.01]
+  #   - moe_router_load_balancing_type: ["aux_loss"]
+  #     load_balance_ste_width: [0.0]
+  #     moe_aux_loss_coeff: [0.01]
   
   LIST_EXPS:
     - moe_router_load_balancing_type: ["centered_fsq"]
@@ -49,6 +59,8 @@ parameters:
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
   optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
   muon_momentum: [0.95]           # = momentum
   lr: [0.02]                      # = lr_muon
   decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;

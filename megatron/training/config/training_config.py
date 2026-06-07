@@ -156,6 +156,14 @@ class ValidationConfig:
        match the number of validation datasets.
     """
 
+    task_eval_tasks: str | None = None
+    """Comma-separated prepared task names, or dclm-core-22, to evaluate as answer-token
+    validation loss datasets. If not set, task-loss validation is disabled.
+    """
+
+    task_eval_data_dir: str | None = "/e/project1/laionize/shechter1/core_megatron_datasets"
+    """Directory containing prepared task-loss validation .pt files."""
+
 
 @dataclass(kw_only=True)
 class SchedulerConfig:

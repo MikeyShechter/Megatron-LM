@@ -1,5 +1,5 @@
 job_details:
-  name: gpt_moe_small
+  name: test_evals
   output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
 
 parameters:
@@ -14,6 +14,9 @@ parameters:
   null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
   save_only_latest: [true]
   save_pre_decay: [true]
+
+  task-eval-tasks: ['dclm-core-22']
+  task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
 
   # ── Model ─────────────────────────────────────────────────────────────────────
   num_layers: [12]                # = n_layer
@@ -39,6 +42,8 @@ parameters:
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
   optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
   muon_momentum: [0.95]           # = momentum
   lr: [0.02]                      # = lr_muon
   decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;

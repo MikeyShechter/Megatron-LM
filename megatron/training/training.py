@@ -3653,10 +3653,11 @@ def evaluate_and_print_results(
 
     wandb_writer = get_wandb_writer()
 
-    data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
+    multiple_validation_sets = args.multiple_validation_sets and isinstance(data_iterator, list)
+    data_iterators = data_iterator if multiple_validation_sets else [data_iterator]
 
-    if not args.multiple_validation_sets:
-        eval_iters = [args.eval_iters]
+    if not multiple_validation_sets:
+        eval_iters = [args.eval_iters[0] if isinstance(args.eval_iters, list) else args.eval_iters]
     else:
         eval_iters = args.eval_iters
 
@@ -3665,29 +3666,35 @@ def evaluate_and_print_results(
 
         # with full validation we need to distribute eval_iters to all ranks
         if mpu.get_tensor_model_parallel_rank() == 0:
-            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+            eval_iters = torch.tensor(eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
-        args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
-    elif not args.multiple_validation_sets:
-        eval_iters = [args.eval_iters]
+        args.eval_iters = eval_iters[0] if not multiple_validation_sets else eval_iters
+    elif not multiple_validation_sets:
+        eval_iters = [args.eval_iters[0] if isinstance(args.eval_iters, list) else args.eval_iters]
     else:
         eval_iters = args.eval_iters
 
-    if args.validation_set_names:
-        assert args.multiple_validation_sets, \
+    if args.validation_set_names and multiple_validation_sets:
+        assert multiple_validation_sets, \
             "--validation-set-names requires --multiple-validation-sets"
         assert len(args.validation_set_names) == len(data_iterators), \
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
+    task_loss_task_names = set(getattr(args, "task_loss_eval_task_names", []) or [])
+    task_loss_values = []
+    base_wandb_prefix = "test" if "test set" in prefix else "val"
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
-        if args.multiple_validation_sets:
+        validation_set_name = None
+        if multiple_validation_sets:
             if args.validation_set_names:
-                suffix = f"-{args.validation_set_names[index]}"
+                validation_set_name = args.validation_set_names[index]
+                suffix = f"-{validation_set_name}"
             else:
                 suffix = f"-{index}"
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
@@ -3721,14 +3728,23 @@ def evaluate_and_print_results(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
             if wandb_writer and is_last_rank():
-                val_prefix = "val" if suffix == "" else f"val/{suffix.lstrip('-')}"
-                wandb_writer.log(
-                    {
-                        '{} validation{}'.format(key, suffix): total_loss_dict[key].item(),
-                        f"{val_prefix}/{key.replace(' ', '_')}": total_loss_dict[key].item(),
-                    },
-                    iteration,
-                )
+                value = total_loss_dict[key].item()
+                if key == "lm loss" and validation_set_name in task_loss_task_names:
+                    task_loss_values.append(value)
+                    wandb_writer.log({f"tasks/{validation_set_name}": value}, iteration)
+                else:
+                    val_prefix = (
+                        base_wandb_prefix
+                        if suffix == ""
+                        else f"{base_wandb_prefix}/{suffix.lstrip('-')}"
+                    )
+                    wandb_writer.log(
+                        {
+                            '{} validation{}'.format(key, suffix): value,
+                            f"{val_prefix}/{key.replace(' ', '_')}": value,
+                        },
+                        iteration,
+                    )
 
         if args.num_experts is not None:
             eval_num_microbatches = args.eval_global_batch_size // (
@@ -3755,6 +3771,9 @@ def evaluate_and_print_results(
         print_rank_last(string)
         print_rank_last('-' * length)
 
+    if task_loss_values and wandb_writer and is_last_rank():
+        wandb_writer.log({"tasks/average": sum(task_loss_values) / len(task_loss_values)}, iteration)
+
 
 def cyclic_iter(iterable):
     while True:
@@ -3770,6 +3789,35 @@ def cyclic_iter(iterable):
                 "This may indicate the validation dataloader is empty or eval_iters is incorrectly set. "
                 "Check that your validation dataset has data and that the dataloader is properly configured."
             )
+
+
+def _cap_eval_iters_to_dataloader(eval_iters, dataloader):
+    """Cap eval iterations to the number of full batches available from a dataloader."""
+    if eval_iters is None:
+        return 0
+
+    available_iters = None
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None:
+        total_samples = getattr(batch_sampler, "total_samples", None)
+        consumed_samples = getattr(batch_sampler, "consumed_samples", 0)
+        batch_size = getattr(batch_sampler, "global_batch_size", None)
+        if batch_size is None:
+            batch_size = getattr(batch_sampler, "micro_batch_times_data_parallel_size", None)
+        if total_samples is not None and batch_size:
+            remaining_samples = max(0, int(total_samples) - int(consumed_samples))
+            if getattr(batch_sampler, "drop_last", True):
+                available_iters = remaining_samples // int(batch_size)
+            else:
+                available_iters = math.ceil(remaining_samples / int(batch_size))
+
+    if available_iters is None:
+        try:
+            available_iters = len(dataloader)
+        except TypeError:
+            return eval_iters
+
+    return min(int(eval_iters), int(available_iters))
 
 
 def get_train_valid_test_num_samples():
@@ -3883,10 +3931,6 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                 if args.skip_train or args.full_validation:
                     valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
                 else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
                     valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
@@ -3968,12 +4012,20 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     group=mpu.get_data_parallel_group(with_context_parallel=True),
                 )
                 args.eval_iters = eval_iters_tensor.item()
+        elif args.multiple_validation_sets and valid_dataloaders[0] is not None:
+            requested_eval_iters = args.eval_iters
+            if not isinstance(requested_eval_iters, list):
+                requested_eval_iters = [requested_eval_iters] * len(valid_dataloaders)
+            args.eval_iters = [
+                _cap_eval_iters_to_dataloader(iterations, dataloader)
+                for iterations, dataloader in zip(requested_eval_iters, valid_dataloaders)
+            ]
 
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                valid_dl_type = "cyclic" if args.full_validation or args.multiple_validation_sets else dl_type
                 valid_data_iterators = [
                     _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
                 ]

@@ -59,7 +59,7 @@ export PYTHONHASHSEED=0
 
 # Master node — same resolution pattern as run_moe.sh
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_ADDR=$(getent hosts "$master_addr" | awk '{print $1; exit}')
+export MASTER_ADDR=$(getent ahostsv4 "$master_addr" | awk '{print $1; exit}')
 export MASTER_PORT=$((12802 + ($SLURM_JOBID % 1000)))
 export GPUS_PER_NODE=${SLURM_GPUS_ON_NODE}
 export WORLD_SIZE=$((SLURM_NNODES * GPUS_PER_NODE))

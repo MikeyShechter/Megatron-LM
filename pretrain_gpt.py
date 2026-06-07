@@ -44,6 +44,10 @@ from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, g
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.task_loss_dataset import (
+    load_prepared_task_loss_validation_datasets,
+    resolve_task_loss_task_names,
+)
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -374,9 +378,40 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
+    if getattr(args, "task_eval_tasks", None):
+        task_valid_ds = load_prepared_task_loss_validation_datasets(args, config)
+        regular_valid_ds = (
+            []
+            if valid_ds is None
+            else valid_ds if isinstance(valid_ds, list) else [valid_ds]
+        )
+        if args.validation_set_names is None:
+            regular_names = []
+        elif isinstance(args.validation_set_names, str):
+            regular_names = [args.validation_set_names]
+        else:
+            regular_names = list(args.validation_set_names)
+        if not regular_names and regular_valid_ds:
+            regular_names = ["regular"] if len(regular_valid_ds) == 1 else [
+                f"regular_{index}" for index in range(len(regular_valid_ds))
+            ]
+        valid_ds = regular_valid_ds + task_valid_ds
+        args.validation_set_names = regular_names + [dataset.name for dataset in task_valid_ds]
+
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
+
+
+def configure_task_loss_eval_args(args: Any) -> None:
+    """Route prepared task-loss datasets through named validation datasets."""
+
+    task_names = resolve_task_loss_task_names(getattr(args, "task_eval_tasks", None))
+    if not task_names:
+        return
+
+    args.multiple_validation_sets = True
+    args.task_loss_eval_task_names = task_names
 
 
 def get_embedding_ranks(pp_ranks: List[int]):
@@ -411,6 +446,7 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+    configure_task_loss_eval_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(full_config,
         train_valid_test_datasets_provider,
