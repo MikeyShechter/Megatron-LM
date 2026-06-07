@@ -1,11 +1,16 @@
 job_details:
-  name: test_evals
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  name: test_aux_losses
+  output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
-  data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
-  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  LIST_DATASETS:
+    - data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+      data_args_path: [null]
+      data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    - data_path: [null]
+      data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+      data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
   vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
@@ -35,8 +40,9 @@ parameters:
   # 768 * 0.5 = 384
   moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
   moe_router_dtype: ["fp32"]
+                           
 
-  moe_router_load_balancing_type: ["centered_fsq"]
+  moe_router_load_balancing_type: ['aux_loss']
   load_balance_ste_width: [1.0]
   moe_aux_loss_coeff: [0.01]
 
@@ -84,4 +90,3 @@ parameters:
   log_interval: [1]
   wandb_project: ["megatron-moe"]
 
-  moe_aux_loss_coeff: [0.01]

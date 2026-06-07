@@ -8,8 +8,8 @@
 #SBATCH --partition=booster
 #SBATCH --threads-per-core=1
 #SBATCH --job-name=megatron
-#SBATCH --output=/e/project1/laionize/shechter1/logs/slurm-%j.out
-#SBATCH --error=/e/project1/laionize/shechter1/logs/slurm-%j.out
+#SBATCH --output=/e/project1/reformo/shechter1/logs/slurm-%j.out
+#SBATCH --error=/e/project1/reformo/shechter1/logs/slurm-%j.out
 
 
 if [[ $# -lt 1 ]]; then
@@ -19,9 +19,15 @@ fi
 
 export CONF=$1
 
+# Where all run outputs (wandb, caches, tmp, logs) live. Switch between
+# 'laionize' and 'reformo' based on available quota. NOTE: #SBATCH --output
+# and #SBATCH --error above are not shell-expanded, so update them by hand
+# when switching.
+STORAGE=${STORAGE:-reformo}
+
 REPO_DIR=/e/project1/laionize/shechter1/repos/Megatron-LM
 SIF=/e/project1/laionize/shechter1/containers/megatron-lm-dev.sif
-RUN_STORAGE=/e/project1/laionize/shechter1
+RUN_STORAGE=/e/project1/${STORAGE}/shechter1
 
 if [[ "${CONF}" != /* ]]; then
   CONF="${SLURM_SUBMIT_DIR:-$PWD}/${CONF}"
@@ -33,7 +39,7 @@ fi
 export CONF
 
 CONF_DIR=$(dirname "${CONF}")
-APPTAINER_BINDS="${REPO_DIR}:/workspace,/e/data1/datasets:/datasets,${CONF_DIR}:${CONF_DIR},${RUN_STORAGE}:${RUN_STORAGE}"
+APPTAINER_BINDS="${REPO_DIR}:/workspace,/e/data1/datasets:/datasets,${CONF_DIR}:${CONF_DIR},${RUN_STORAGE}:${RUN_STORAGE},/e/project1/laionize/shechter1:/e/project1/laionize/shechter1,/dev/shm:/dev/shm"
 
 # W&B — offline so compute nodes don't need outbound network
 export WANDB_MODE=offline
