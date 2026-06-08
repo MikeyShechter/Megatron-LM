@@ -639,11 +639,11 @@ class TransformerConfig(ModelParallelConfig):
     Options:
     - "aux_loss": Load balancing loss used in GShard and SwitchTransformer, calculated at
     micro-batch level.
-    - "fsq": Fractional-squared routed-load loss with optional rectangular STE.
-    - "centered_fsq": Centered fractional-squared routed-load loss with optional rectangular STE.
-    - "maxvio": Maximum routed-load violation loss with optional rectangular STE.
-    - "maxviosq": Squared maximum routed-load violation loss with optional rectangular STE.
-    - "totalvio": Total routed-load violation loss with optional rectangular STE.
+    - "fsq": Fractional-squared routed-load loss with optional STE.
+    - "centered_fsq": Centered fractional-squared routed-load loss with optional STE.
+    - "maxvio": Maximum routed-load violation loss with optional STE.
+    - "maxviosq": Squared maximum routed-load violation loss with optional STE.
+    - "totalvio": Total routed-load violation loss with optional STE.
     - "seq_aux_loss": Load balancing loss used in DeepSeekV2 and DeepSeekV3, computes loss
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
@@ -750,7 +750,7 @@ class TransformerConfig(ModelParallelConfig):
             }
         },
     )
-    """Width of the rectangular STE window used by direct routed-load balancing losses."""
+    """Constant width of the rectangular STE window used by direct routed-load balancing losses."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""

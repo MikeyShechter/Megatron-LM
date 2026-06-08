@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
     direct_load_balancing_loss_func,
+    get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -355,6 +356,9 @@ class TopKRouter(Router):
             )
         )
 
+        load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope = (
+            get_load_balance_ste_params(self.config)
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             aux_loss = direct_load_balancing_loss_func(
                 load_balancing_type=load_balancing_type,
@@ -365,7 +369,9 @@ class TopKRouter(Router):
                 topk=self.topk,
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=direct_aux_loss_coeff,
-                load_balance_ste_width=self.config.moe_load_balance_ste_width,
+                load_balance_ste_width=load_balance_ste_width,
+                load_balance_ste_type=load_balance_ste_type,
+                load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
                 reduce_group=self.tp_cp_group,
             )
             probs = self.attach_and_log_load_balancing_loss(
@@ -414,12 +420,13 @@ class TopKRouter(Router):
         ste_in_rect_count = token_count.new_tensor(0.0)
         ste_selected_count = tokens_per_expert.sum()
         ste_over_rect_count = torch.zeros_like(tokens_per_expert)
-        if self.config.moe_load_balance_ste_width > 0.0:
+        load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
+        if load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
             selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
             threshold = selected_logits.min(dim=-1, keepdim=True).values
             threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
             margin = logits.float() - threshold
-            half_width = self.config.moe_load_balance_ste_width * 0.5
+            half_width = load_balance_ste_width * 0.5
             selected_in_rect = routing_map & (margin.abs() < half_width)
             selected_over_rect = routing_map & (margin >= half_width)
             ste_in_rect_count = selected_in_rect.float().sum()

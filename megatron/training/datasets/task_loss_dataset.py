@@ -140,6 +140,11 @@ def load_prepared_task_loss_validation_datasets(
             f"but this run uses sequence_length={config.sequence_length}"
         )
 
+    # Tile small datasets up to one full eval global batch so MegatronPretrainingSampler
+    # (drop_last=True) yields at least one batch; otherwise eval_iters caps to 0 and the
+    # task is silently dropped from logs.
+    min_samples = int(getattr(args, "eval_global_batch_size", 0) or 0)
+
     datasets = []
     missing_tasks = []
     for task_name in task_names:
@@ -158,6 +163,9 @@ def load_prepared_task_loss_validation_datasets(
             )
             for sample in payload["samples"]
         ]
+        if min_samples and 0 < len(samples) < min_samples:
+            repeats = -(-min_samples // len(samples))
+            samples = (samples * repeats)[:min_samples]
         datasets.append(PreparedTaskLossGPTDataset(task_name, samples, config))
 
     if missing_tasks:

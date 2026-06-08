@@ -209,6 +209,7 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     clear_moe_router_metrics_tracker,
+    get_load_balance_ste_params,
     track_moe_metrics,
     track_moe_router_metrics,
 )
@@ -1302,6 +1303,15 @@ def pretrain(
     ft_integration.shutdown()
     one_logger_utils.finish()
 
+    if (
+        args.do_train
+        and (args.train_iters or 0) > 0
+        and iteration >= args.train_iters
+        and args.save is not None
+        and torch.distributed.get_rank() == 0
+    ):
+        Path(args.save).joinpath('done').touch()
+
 
 def update_train_iters(args):
 
@@ -2302,6 +2312,9 @@ def training_log(
             moe_router_load_balancing_type=args.moe_router_load_balancing_type,
             pg_collection=pg_collection,
         )
+        if wandb_writer:
+            _, ste_bandwidth, _ = get_load_balance_ste_params(args)
+            wandb_writer.log({"train/ste_bandwidth": ste_bandwidth}, iteration)
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
@@ -2901,6 +2914,8 @@ def train(
 
     # Iterations.
     iteration = args.iteration
+    config.curr_iteration = iteration
+    config.train_iters = args.train_iters
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
@@ -3162,6 +3177,8 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        config.curr_iteration = iteration
+        config.train_iters = args.train_iters
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -3755,12 +3772,17 @@ def evaluate_and_print_results(
                 args.eval_micro_batch_size * args.data_parallel_size
             )
             router_loss_scale = 1.0 / max(1, iterations * eval_num_microbatches)
+            router_metrics_prefix = (
+                base_wandb_prefix
+                if suffix == ""
+                else f"{base_wandb_prefix}/{suffix.lstrip('-')}"
+            )
             track_moe_router_metrics(
                 loss_scale=router_loss_scale,
                 iteration=iteration,
                 writer=writer,
                 wandb_writer=wandb_writer,
-                prefix="val",
+                prefix=router_metrics_prefix,
                 force_initialize=True,
                 num_layers=_get_num_moe_logging_layers(args),
                 num_experts=args.num_experts,
@@ -3935,7 +3957,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                 if args.skip_train or args.full_validation:
                     valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
                 else:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                    # Mod by dataset size so resume works when consumed_valid_samples
+                    # has exceeded the valid set (treat valid as cyclic).
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples % len(valid_d)))
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)

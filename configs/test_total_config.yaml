@@ -1,11 +1,10 @@
 job_details:
-  name: basic_extra
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  name: test_configs
+  output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
-  data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
-  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
   vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
@@ -25,7 +24,7 @@ parameters:
   disable_bias_linear: [true]
   seq_length: [1024]              # = sequence_length
   max_position_embeddings: [1024]
-  squared_relu: [true]
+  
 
   # ── MoE ──────────────────────────────────────────────────────────────────────
   num_experts: [64]
@@ -36,45 +35,23 @@ parameters:
   # 768 * 0.5 = 384
   moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
   moe_router_dtype: ["fp32"]
-  
-  # LIST_EXPS:
-  #   - moe_router_load_balancing_type: ["centered_fsq"]
-  #     load_balance_ste_width: [1.0]
-  #     moe_aux_loss_coeff: [0.01]
-  #   - moe_router_load_balancing_type: ["aux_loss"]
-  #     load_balance_ste_width: [0.0]
-  #     moe_aux_loss_coeff: [0.01]
-  
-  LIST_EXPS:
-    - moe_router_load_balancing_type: ["centered_fsq"]
-      load_balance_ste_width: [0.5, 0.1, 2.0, 5.0]
-      moe_aux_loss_coeff: [0.01, 0.001]
-    - moe_router_load_balancing_type: ["centered_fsq"]
-      load_balance_ste_width: [1.0]
-      moe_aux_loss_coeff: [0.001]
-    - moe_router_load_balancing_type: ["aux_loss"]
-      load_balance_ste_width: [0.0]
-      moe_aux_loss_coeff: [0.1, 0.001]
-  
+
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
-  optimizer: ["muon"]
   muon_scale_mode: ["shape_scaling"]
   muon_nesterov: [true]
-  muon_momentum: [0.95]           # = momentum
-  lr: [0.02]                      # = lr_muon
-  decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;
-                                  #   nanogpt had lr_embed=0.3 separately, not replicable here)
+  muon_momentum: [0.95]
+
+
   min_lr: [1.0e-6]
-  weight_decay: [0.0]
+  
   clip_grad: [1.0]
-  adam_beta1: [0.9]
+  adam_beta1: [0.9]               # fallback if switching to adam
   adam_beta2: [0.95]
 
   # ── LR schedule ──────────────────────────────────────────────────────────────
   # WSD (Warmup-Stable-Decay) is Megatron's equivalent of nanogpt's warmdown.
-  lr_decay_style: ["WSD"]
-  lr_warmup_iters: [0]            # = warmup_iters
+
   lr_wsd_decay_iters: [1714]      # = warmdown_iters
   lr_wsd_decay_style: ["linear"]
 
@@ -101,3 +78,88 @@ parameters:
   log_interval: [10]
   wandb_project: ["megatron-moe"]
 
+  LIST_LB:
+    - moe_router_load_balancing_type: ["centered_fsq"]
+      load_balance_ste_width: [1.0]
+      moe_aux_loss_coeff: [0.01]
+    - moe_router_load_balancing_type: ["centered_fsq"]
+      load_balance_ste_width: [0.1]
+      moe_aux_loss_coeff: [0.1]
+    - moe_router_load_balancing_type: ["centered_fsq"]
+      load_balance_ste_width: [0.5]
+      moe_aux_loss_coeff: [0.02]
+    - moe_router_load_balancing_type: ["aux_loss"]
+      load_balance_ste_width: [0.0]
+      moe_aux_loss_coeff: [0.01]
+
+  LIST_ALL_EXPS:
+  - optimizer: ["muon"]  # baseline
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.0]
+    squared_relu: [true]
+  - optimizer: ["adam"]  # adam optimizer x3 lrs
+    lr: [0.001, 0.002, 0.004]
+    decoupled_lr: [null]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.0]
+    squared_relu: [true]
+  - optimizer: ["muon"]  # DCLM dataset
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: [null]
+    data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.0]
+    squared_relu: [true]
+  - optimizer: ["muon"]  # cosine scheduler
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["cosine"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.0]
+    squared_relu: [true]
+  - optimizer: ["muon"]  # 600 warmup
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [600]
+    weight_decay: [0.0]
+    squared_relu: [true]
+  - optimizer: ["muon"]  # weight decay
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.1]
+    squared_relu: [true]
+  - optimizer: ["muon"]  # gelu activation
+    lr: [0.02]
+    decoupled_lr: [0.002]
+    data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+    data_args_path: [null]
+    data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/c4_gpt_neox"]
+    lr_decay_style: ["WSD"]
+    lr_warmup_iters: [0]
+    weight_decay: [0.0]
+    squared_relu: [false]

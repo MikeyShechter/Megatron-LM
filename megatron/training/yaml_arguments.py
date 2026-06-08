@@ -423,9 +423,17 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
-        return MLATransformerConfig(**kw_args)
+        config = MLATransformerConfig(**kw_args)
     else:
-        return TransformerConfig(**kw_args)
+        config = TransformerConfig(**kw_args)
+    for attr in (
+        "moe_load_balance_ste_type",
+        "moe_load_balance_ste_schedule",
+        "moe_load_balance_ste_width_end",
+    ):
+        if hasattr(args, attr):
+            setattr(config, attr, getattr(args, attr))
+    return config
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
@@ -439,4 +447,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

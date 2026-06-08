@@ -170,11 +170,89 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
         (margin,) = ctx.saved_tensors
         half_width = ctx.bandwidth * 0.5
         window = (margin.float().abs() < half_width).to(dtype=torch.float32)
-        grad_margin = grad_output.float() * window
+        grad_margin = grad_output.float() * window / ctx.bandwidth
+        return grad_margin.to(dtype=margin.dtype), None
+
+
+class _TanhSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, margin: torch.Tensor, slope: float) -> torch.Tensor:
+        ctx.slope = float(slope)
+        ctx.save_for_backward(margin)
+        return (margin >= 0).to(dtype=margin.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (margin,) = ctx.saved_tensors
+        slope = ctx.slope
+        k = max(1.0 / slope, 1.0)
+        tanh_value = torch.tanh(slope * margin.float())
+        grad_margin = grad_output.float() * k * slope * (1.0 - tanh_value.square())
         return grad_margin.to(dtype=margin.dtype), None
 
 
 DIRECT_LOAD_BALANCING_LOSS_TYPES = ("fsq", "centered_fsq", "maxvio", "maxviosq", "totalvio")
+
+
+def _get_load_balance_ste_schedule_progress(curr_iteration: int, train_iters: Optional[int]) -> float:
+    if train_iters is None or train_iters <= 1:
+        return 0.0
+    progress = float(curr_iteration) / float(train_iters - 1)
+    return min(max(progress, 0.0), 1.0)
+
+
+def _get_scheduled_load_balance_ste_value(
+    constant_value: float,
+    start_value: Optional[float],
+    end_value: Optional[float],
+    schedule: str,
+    curr_iteration: int,
+    train_iters: Optional[int],
+) -> float:
+    if schedule == "constant":
+        return constant_value
+
+    start = constant_value if start_value is None else start_value
+    end = constant_value if end_value is None else end_value
+    progress = _get_load_balance_ste_schedule_progress(curr_iteration, train_iters)
+
+    if schedule == "linear":
+        return start + (end - start) * progress
+    if schedule == "cosine":
+        return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+    if schedule == "exponential":
+        return start * ((end / start) ** progress)
+    return constant_value
+
+
+def get_load_balance_ste_params(config: object) -> tuple[str, float, float]:
+    """Resolve the active routed-load STE type and scheduled control value."""
+    schedule = getattr(config, "moe_load_balance_ste_schedule", "constant")
+    curr_iteration = getattr(config, "curr_iteration", 0)
+    train_iters = getattr(config, "train_iters", None)
+    ste_width = getattr(config, "moe_load_balance_ste_width", 0.0)
+    ste_width_end = getattr(config, "moe_load_balance_ste_width_end", 1e-3)
+
+    rect_bandwidth = _get_scheduled_load_balance_ste_value(
+        constant_value=ste_width,
+        start_value=None,
+        end_value=ste_width_end,
+        schedule=schedule,
+        curr_iteration=curr_iteration,
+        train_iters=train_iters,
+    )
+    tanh_bandwidth = _get_scheduled_load_balance_ste_value(
+        constant_value=ste_width,
+        start_value=None,
+        end_value=ste_width_end,
+        schedule=schedule,
+        curr_iteration=curr_iteration,
+        train_iters=train_iters,
+    )
+    ste_type = getattr(config, "moe_load_balance_ste_type", "rect")
+    ste_bandwidth = tanh_bandwidth if ste_type == "tanh" else rect_bandwidth
+    tanh_slope = 1.0 / ste_bandwidth if ste_type == "tanh" else 1.0
+    return ste_type, ste_bandwidth, tanh_slope
 
 
 def _direct_load_balance_from_load(
@@ -200,7 +278,11 @@ def _direct_load_balance_from_load(
 
 
 def _load_balance_ste_tokens_per_expert(
-    logits: torch.Tensor, routing_map: torch.Tensor, load_balance_ste_width: float
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    load_balance_ste_type: str,
+    load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
 ) -> torch.Tensor:
     routing_map = routing_map.bool()
     valid_tokens = routing_map.any(dim=-1)
@@ -208,7 +290,10 @@ def _load_balance_ste_tokens_per_expert(
     threshold = selected_logits.min(dim=-1, keepdim=True).values
     threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
     margin = logits.float() - threshold
-    soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
+    if load_balance_ste_type == "tanh":
+        soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+    else:
+        soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
     soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
     return soft_mask.sum(dim=0)
 
@@ -223,9 +308,11 @@ def direct_load_balancing_loss_func(
     num_experts: int,
     moe_aux_loss_coeff: float,
     load_balance_ste_width: float = 0.0,
+    load_balance_ste_type: str = "rect",
+    load_balance_tanh_ste_slope: float = 1.0,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
-    """Calculate direct routed-load balance loss with optional rectangular STE."""
+    """Calculate direct routed-load balance loss with optional STE."""
     if isinstance(total_num_tokens, torch.Tensor):
         total_num_tokens_tensor = total_num_tokens.to(
             device=tokens_per_expert.device, dtype=torch.float32
@@ -237,9 +324,13 @@ def direct_load_balancing_loss_func(
     hard_load_frac = tokens_per_expert.float() / denom
     load_frac = hard_load_frac
 
-    if load_balance_ste_width > 0.0:
+    if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
         ste_tokens_per_expert = _load_balance_ste_tokens_per_expert(
-            logits, routing_map, load_balance_ste_width
+            logits,
+            routing_map,
+            load_balance_ste_type,
+            load_balance_ste_width,
+            load_balance_tanh_ste_slope,
         )
         if reduce_group is not None:
             ste_tokens_per_expert = reduce_from_tensor_model_parallel_region(
@@ -1201,6 +1292,21 @@ def _mean_active(values: torch.Tensor, active_layers: torch.Tensor) -> torch.Ten
     return values.new_tensor(0.0)
 
 
+def _validation_metric_prefixes(prefix: str, metric_root: str) -> List[str]:
+    if prefix == "val":
+        return [metric_root]
+    if not prefix.startswith("val/"):
+        return []
+
+    validation_name = prefix.split("/", 1)[1]
+    if metric_root in ("vio", "ste") and validation_name != "regular":
+        return []
+
+    if validation_name == "regular":
+        return [metric_root]
+    return [f"{metric_root}/{validation_name}"]
+
+
 def _build_moe_router_metrics_log(
     metrics: dict[str, torch.Tensor],
     prefix: str,
@@ -1229,20 +1335,36 @@ def _build_moe_router_metrics_log(
         metrics["avg_1_2_coef_diff_sum"].float() / token_count.clamp(min=1.0)
     )
 
-    log: dict[str, float] = {
-        f"{prefix}/router_entropy": float(_mean_active(entropy_per_layer, active_layers).item()),
-        f"{prefix}/router_values/avg_1_2_coef_diff": float(
-            _mean_active(avg_1_2_coef_diff_per_layer, active_layers).item()
-        ),
-    }
+    task_specific_validation = (
+        prefix.startswith("val/") and prefix.split("/", 1)[1] != "regular"
+    )
+    # Collapse val/regular -> val so per-task metrics live alongside the train/val pair.
+    effective_prefix = "val" if prefix == "val/regular" else prefix
+    mean_entropy = float(_mean_active(entropy_per_layer, active_layers).item())
 
-    if prefix == "val":
+    log: dict[str, float] = {}
+    if task_specific_validation:
+        task_name = prefix.split("/", 1)[1]
+        log[f"task_entropy/{task_name}"] = mean_entropy
+    else:
+        log[f"{effective_prefix}/router_entropy"] = mean_entropy
+        log[f"{effective_prefix}/router_values/avg_1_2_coef_diff"] = float(
+            _mean_active(avg_1_2_coef_diff_per_layer, active_layers).item()
+        )
+
+    vio_prefixes = _validation_metric_prefixes(prefix, "vio")
+    if vio_prefixes:
         active_max_vio = max_vio_per_layer[active_layers]
-        log["vio/MaxVioGlobal"] = float(active_max_vio.mean().item())
-        log["vio/MaxVioGlobalWorstLayer"] = float(active_max_vio.max().item())
-        log["vio/TotalVioGlobal"] = float(total_vio_per_layer[active_layers].mean().item())
-        for layer_idx in torch.nonzero(active_layers, as_tuple=False).flatten().tolist():
-            log[f"vio/MaxVio/Layer {layer_idx}"] = float(max_vio_per_layer[layer_idx].item())
+        for vio_prefix in vio_prefixes:
+            log[f"{vio_prefix}/MaxVioGlobal"] = float(active_max_vio.mean().item())
+            log[f"{vio_prefix}/MaxVioGlobalWorstLayer"] = float(active_max_vio.max().item())
+            log[f"{vio_prefix}/TotalVioGlobal"] = float(
+                total_vio_per_layer[active_layers].mean().item()
+            )
+            for layer_idx in torch.nonzero(active_layers, as_tuple=False).flatten().tolist():
+                log[f"{vio_prefix}/MaxVio/Layer {layer_idx}"] = float(
+                    max_vio_per_layer[layer_idx].item()
+                )
 
     prob_mean = prob_sum / token_count.clamp(min=1.0).unsqueeze(-1)
     aux_loss_per_layer = tokens_per_expert.new_zeros(tokens_per_expert.size(0))
@@ -1254,13 +1376,19 @@ def _build_moe_router_metrics_log(
             aux_loss_per_layer += _direct_load_balance_from_load(
                 load_frac, num_experts, load_balancing_type
             )
-    if "aux_loss" in load_balance_types or any(
-        load_balancing_type in load_balance_types
-        for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
+    if not task_specific_validation and (
+        "aux_loss" in load_balance_types
+        or any(
+            load_balancing_type in load_balance_types
+            for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
+        )
     ):
-        log[f"{prefix}/aux_loss"] = float(_mean_active(aux_loss_per_layer, active_layers).item())
+        log[f"{effective_prefix}/aux_loss"] = float(
+            _mean_active(aux_loss_per_layer, active_layers).item()
+        )
 
-    if prefix == "val":
+    ste_prefixes = _validation_metric_prefixes(prefix, "ste")
+    if ste_prefixes:
         ste_selected_count = metrics["ste_selected_count"].float()
         ste_in_rect_count = metrics["ste_in_rect_count"].float()
         ste_over_rect_count = metrics["ste_over_rect_count"].float()
@@ -1276,9 +1404,10 @@ def _build_moe_router_metrics_log(
             active_over_rect.max() if active_over_rect.numel() else in_rect_frac.new_tensor(0.0)
         )
 
-        log["ste/all_layers/in_rect_frac"] = float(in_rect_frac.item())
-        log["ste/all_layers/max_over_rect"] = float(max_over_rect.item())
-        log["ste/all_layers/avg_over_rect"] = float(avg_over_rect.item())
+        for ste_prefix in ste_prefixes:
+            log[f"{ste_prefix}/all_layers/in_rect_frac"] = float(in_rect_frac.item())
+            log[f"{ste_prefix}/all_layers/max_over_rect"] = float(max_over_rect.item())
+            log[f"{ste_prefix}/all_layers/avg_over_rect"] = float(avg_over_rect.item())
 
     return log
 

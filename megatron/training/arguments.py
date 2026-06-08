@@ -1812,7 +1812,15 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+    for attr in (
+        "moe_load_balance_ste_type",
+        "moe_load_balance_ste_schedule",
+        "moe_load_balance_ste_width_end",
+    ):
+        if hasattr(args, attr):
+            setattr(config, attr, getattr(args, attr))
+    return config
 
 
 def _add_transformer_engine_args(parser):
@@ -3185,6 +3193,18 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "fsq", "centered_fsq", "maxvio", "maxviosq", and "totalvio" correspond to direct routed-load losses; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-load-balance-ste-type', '--load-balance-ste-type',
+                       type=str, choices=['rect', 'tanh'], default='rect',
+                       help='Surrogate gradient operator for direct routed-load balancing losses.')
+    group.add_argument('--moe-load-balance-ste-schedule', '--load-balance-ste-schedule',
+                       type=str, choices=['constant', 'linear', 'cosine', 'exponential'],
+                       default='constant',
+                       help='Schedule for direct routed-load balancing STE control values.')
+    group.add_argument('--moe-load-balance-ste-width-end',
+                       '--load-balance-ste-width-end',
+                       type=float, default=1e-3,
+                       dest='moe_load_balance_ste_width_end',
+                       help='Ending effective STE width for scheduled direct load balancing.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
