@@ -303,10 +303,13 @@ class TopKRouter(Router):
         if aux_loss_coeff == 0:
             return probs
 
+        use_global_lb = getattr(self.config, "moe_use_global_lb", False)
+        reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
+
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=reduce_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -326,7 +329,8 @@ class TopKRouter(Router):
             aux_loss_coeff,
             aux_loss,
             "load_balancing_loss",
-            self.tp_cp_group,
+            reduce_group,
+            reduce_group_has_dp=use_global_lb,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -347,10 +351,13 @@ class TopKRouter(Router):
         if not direct_loss_coeffs:
             return probs
 
+        use_global_lb = getattr(self.config, "moe_use_global_lb", False)
+        reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
+
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=reduce_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -372,14 +379,15 @@ class TopKRouter(Router):
                 load_balance_ste_width=load_balance_ste_width,
                 load_balance_ste_type=load_balance_ste_type,
                 load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
-                reduce_group=self.tp_cp_group,
+                reduce_group=reduce_group,
             )
             probs = self.attach_and_log_load_balancing_loss(
                 probs,
                 direct_aux_loss_coeff,
                 aux_loss,
                 f"{load_balancing_type}_load_balancing_loss",
-                self.tp_cp_group,
+                reduce_group,
+                reduce_group_has_dp=use_global_lb,
                 valid_token_count=local_num_tokens,
             )
         return probs

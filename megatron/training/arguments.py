@@ -1817,6 +1817,7 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_load_balance_ste_type",
         "moe_load_balance_ste_schedule",
         "moe_load_balance_ste_width_end",
+        "moe_use_global_lb",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))
@@ -3205,6 +3206,13 @@ def _add_moe_args(parser):
                        type=float, default=1e-3,
                        dest='moe_load_balance_ste_width_end',
                        help='Ending effective STE width for scheduled direct load balancing.')
+    group.add_argument('--moe-use-global-lb', '--use-global-lb',
+                       action='store_true', default=False,
+                       dest='moe_use_global_lb',
+                       help='If set, aux_loss and direct routed-load (STE) load-balancing '
+                            'losses reduce token statistics across the TPxDPxCP group '
+                            '(global LB, "Demons in the Details" style) instead of only '
+                            'TPxCP.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
