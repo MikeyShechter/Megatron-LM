@@ -992,7 +992,15 @@ def topk_routing_with_score_function(
     # - All the intermediate calculations are in fp32.
     # - The final probs are casted to the same dtype as the logits.
     if score_function == "softmax":
-        if use_pre_softmax:
+        if expert_bias is not None:
+            # Aux-loss-free routing with softmax: softmax across experts to get
+            # per-expert scores, add the per-expert bias for top-k selection only,
+            # and use the un-biased softmax scores as the routing weights.
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            scores_for_routing = scores + expert_bias.float()
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            probs = torch.gather(scores, dim=1, index=top_indices)
+        elif use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
