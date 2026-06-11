@@ -10,6 +10,7 @@
 #SBATCH --job-name=megatron
 #SBATCH --output=/e/project1/reformo/shechter1/logs/slurm-%j.out
 #SBATCH --error=/e/project1/reformo/shechter1/logs/slurm-%j.out
+#SBATCH --exclude=jpbo-083-[43-46]
 
 
 if [[ $# -lt 1 ]]; then

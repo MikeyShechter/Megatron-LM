@@ -1818,6 +1818,8 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_load_balance_ste_schedule",
         "moe_load_balance_ste_width_end",
         "moe_use_global_lb",
+        "moe_learnable_bias_type",
+        "moe_learnable_bias_pass_grad_through_scores",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))
@@ -3206,6 +3208,22 @@ def _add_moe_args(parser):
                        type=float, default=1e-3,
                        dest='moe_load_balance_ste_width_end',
                        help='Ending effective STE width for scheduled direct load balancing.')
+    group.add_argument('--moe-learnable-bias-type',
+                       type=str, choices=['none', 'expert_bias', 'per_token_bias'],
+                       default='none',
+                       dest='moe_learnable_bias_type',
+                       help='Learnable routing biases added to the scores for top-k selection '
+                            '(DeepSeek-style; gating weights stay unbiased), trained by the '
+                            'direct routed-load (STE) losses. "expert_bias": one bias per '
+                            'expert; "per_token_bias": per-token biases from a linear layer '
+                            'like the router gate. Works with any direct load balancing type.')
+    group.add_argument('--moe-learnable-bias-pass-grad-through-scores',
+                       action='store_true', default=False,
+                       dest='moe_learnable_bias_pass_grad_through_scores',
+                       help='For learnable_expert_biases/learnable_per_token_biases load '
+                            'balancing: pass the STE gradient of the LB loss through the '
+                            'routing scores p as well as the biases. If unset, only the '
+                            'biases receive gradient.')
     group.add_argument('--moe-use-global-lb', '--use-global-lb',
                        action='store_true', default=False,
                        dest='moe_use_global_lb',

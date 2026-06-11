@@ -216,6 +216,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.task_loss_dataset import PreparedTaskLossGPTDataset
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
@@ -3959,7 +3960,14 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                 else:
                     # Mod by dataset size so resume works when consumed_valid_samples
                     # has exceeded the valid set (treat valid as cyclic).
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples % len(valid_d)))
+                    # Task-loss datasets always start at 0: consumed_valid_samples is
+                    # estimated from the regular valid set, and a bogus offset can leave
+                    # fewer than one eval batch, silently dropping the task on resume.
+                    if isinstance(valid_d, PreparedTaskLossGPTDataset):
+                        consumed = 0
+                    else:
+                        consumed = args.consumed_valid_samples % len(valid_d)
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, consumed))
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)

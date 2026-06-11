@@ -1,5 +1,5 @@
 job_details:
-  name: scheduling
+  name: learnable_bias_more_hparams
   output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
@@ -40,10 +40,21 @@ parameters:
   
   moe_use_global_lb: [true]
   moe_router_load_balancing_type: ["centered_fsq"]
-  load_balance_ste_width: [0.1, 1.0, 5.0, 10.0]
-  moe_aux_loss_coeff: [0.1, 0.01, 0.001]
-  load_balance_ste_type: ["rect", "tanh"]
-  load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
+  moe_aux_loss_coeff: [0.0001, 0.00001]
+
+  
+  load_balance_ste_type: ["rect"]
+  # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
+  moe_router_score_function: ["sigmoid", "sqrtsoftplus"]
+  moe_learnable_bias_pass_grad_through_scores: [true, false]
+  LIST_EXPS:
+    - moe_learnable_bias_type: ['expert_bias']
+      load_balance_ste_width: [0.1, 1.0, 5.0, 10.0, 20.0]
+    - moe_learnable_bias_type: ['per_token_bias']
+      load_balance_ste_width: [0.05, 0.1, 0.5, 1.0, 5.0]
+
+  # moe_router_enable_expert_bias: [true]
+  # moe_router_bias_update_rate: [0.0001]
 
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
