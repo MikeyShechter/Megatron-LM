@@ -2275,7 +2275,14 @@ def training_log(
             moe_router_load_balancing_types = [moe_router_load_balancing_types]
         if "aux_loss" in moe_router_load_balancing_types:
             track_names.append("load_balancing_loss")
-        for load_balancing_type in ("fsq", "centered_fsq", "maxvio", "maxviosq", "totalvio"):
+        for load_balancing_type in (
+            "fsq",
+            "centered_fsq",
+            "centered_fsq_and_var",
+            "maxvio",
+            "maxviosq",
+            "totalvio",
+        ):
             if load_balancing_type in moe_router_load_balancing_types:
                 track_names.append(f"{load_balancing_type}_load_balancing_loss")
         if "seq_aux_loss" in moe_router_load_balancing_types:

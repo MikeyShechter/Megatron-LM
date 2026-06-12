@@ -191,7 +191,14 @@ class _TanhSTE(torch.autograd.Function):
         return grad_margin.to(dtype=margin.dtype), None
 
 
-DIRECT_LOAD_BALANCING_LOSS_TYPES = ("fsq", "centered_fsq", "maxvio", "maxviosq", "totalvio")
+DIRECT_LOAD_BALANCING_LOSS_TYPES = (
+    "fsq",
+    "centered_fsq",
+    "centered_fsq_and_var",
+    "maxvio",
+    "maxviosq",
+    "totalvio",
+)
 
 
 def _get_load_balance_ste_schedule_progress(curr_iteration: int, train_iters: Optional[int]) -> float:
@@ -263,7 +270,7 @@ def _direct_load_balance_from_load(
 
     if load_balancing_type == "fsq":
         return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
-    if load_balancing_type == "centered_fsq":
+    if load_balancing_type in ("centered_fsq", "centered_fsq_and_var"):
         return 1.0 + num_experts_tensor * torch.square(load_frac - expected_frac).sum(dim=-1)
     if load_balancing_type == "maxvio":
         return 1.0 + (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
@@ -277,6 +284,17 @@ def _direct_load_balance_from_load(
     raise ValueError(f"Unsupported direct load balancing type: {load_balancing_type}")
 
 
+def _load_balance_margin(
+    logits: torch.Tensor, routing_map: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    routing_map = routing_map.bool()
+    valid_tokens = routing_map.any(dim=-1)
+    selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
+    threshold = selected_logits.min(dim=-1, keepdim=True).values
+    threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
+    return logits.float() - threshold, valid_tokens
+
+
 def _load_balance_ste_tokens_per_expert(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
@@ -284,18 +302,37 @@ def _load_balance_ste_tokens_per_expert(
     load_balance_ste_width: float,
     load_balance_tanh_ste_slope: float,
 ) -> torch.Tensor:
-    routing_map = routing_map.bool()
-    valid_tokens = routing_map.any(dim=-1)
-    selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
-    threshold = selected_logits.min(dim=-1, keepdim=True).values
-    threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
-    margin = logits.float() - threshold
+    margin, valid_tokens = _load_balance_margin(logits, routing_map)
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
     else:
         soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
     soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
     return soft_mask.sum(dim=0)
+
+
+def _centered_fsq_variance_loss(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    denom: torch.Tensor,
+    num_experts: int,
+    load_balance_ste_width: float,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Variance term from the uniformly noised centered-logit DLB objective."""
+    if load_balance_ste_width <= 0.0:
+        return logits.new_tensor(0.0)
+
+    margin, valid_tokens = _load_balance_margin(logits, routing_map)
+    half_width = load_balance_ste_width * 0.5
+    expected_indicator = torch.clamp((margin + half_width) / load_balance_ste_width, 0.0, 1.0)
+    expected_indicator = expected_indicator * valid_tokens.unsqueeze(-1).to(
+        dtype=expected_indicator.dtype
+    )
+    variance_sum = (expected_indicator * (1.0 - expected_indicator)).sum()
+    if reduce_group is not None:
+        variance_sum = reduce_from_tensor_model_parallel_region(variance_sum, reduce_group)
+    return logits.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
 
 
 def direct_load_balancing_loss_func(
@@ -339,9 +376,18 @@ def direct_load_balancing_loss_func(
         ste_load_frac = ste_tokens_per_expert.float() / denom
         load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
 
-    return _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type) * (
-        moe_aux_loss_coeff
-    )
+    loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
+    if load_balancing_type == "centered_fsq_and_var":
+        loss = loss + _centered_fsq_variance_loss(
+            logits,
+            routing_map,
+            denom,
+            num_experts,
+            load_balance_ste_width,
+            reduce_group,
+        )
+
+    return loss * moe_aux_loss_coeff
 
 
 def z_loss_func(
