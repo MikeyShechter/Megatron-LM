@@ -1,5 +1,5 @@
 job_details:
-  name: test_regular_scale
+  name: rect_location_sqrtsoftplus
   output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
@@ -39,16 +39,20 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["centered_fsq"]
-  moe_aux_loss_coeff: [0.0]
-
-  load_balance_ste_width: [0.001]
+  moe_router_load_balancing_type: ["centered_fsq", "centered_fsq_and_var"]
+  moe_aux_loss_coeff: [0.01]
+  load_balance_ste_width: [0.1, 1.0, 10]
+  
   load_balance_ste_type: ["rect"]
   # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
-  moe_router_score_function: ["sigmoid"]
+  moe_router_score_function: ["sqrtsoftplus"] # decide
   moe_ste_rect_poistion: ['topk', 'topk_plus_one', 'midpoint']
-  # moe_learnable_bias_type: ['expert_bias','per_token_bias']
   # moe_learnable_bias_pass_grad_through_scores: [true, false]
+  # LIST_EXPS:
+  #   - moe_learnable_bias_type: ['expert_bias']
+  #     load_balance_ste_width: [0.1, 1.0, 5.0, 10.0, 20.0]
+  #   - moe_learnable_bias_type: ['per_token_bias']
+  #     load_balance_ste_width: [0.05, 0.1, 0.5, 1.0, 5.0]
 
   # moe_router_enable_expert_bias: [true]
   # moe_router_bias_update_rate: [0.0001]
@@ -78,7 +82,7 @@ parameters:
   # ── Batch & iters ─────────────────────────────────────────────────────────────
   micro_batch_size: [32]           # = device_batch_size
   global_batch_size: [512]        # = batch_size
-  train_iters: [100]             # = num_iterations
+  train_iters: [6000]             # = num_iterations
   bf16: [true]
   seed: [1000]
   deterministic_mode: [true]

@@ -1817,6 +1817,7 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_load_balance_ste_type",
         "moe_load_balance_ste_schedule",
         "moe_load_balance_ste_width_end",
+        "moe_ste_rect_poistion",
         "moe_use_global_lb",
         "moe_learnable_bias_type",
         "moe_learnable_bias_pass_grad_through_scores",
@@ -3209,6 +3210,12 @@ def _add_moe_args(parser):
                        type=float, default=1e-3,
                        dest='moe_load_balance_ste_width_end',
                        help='Ending effective STE width for scheduled direct load balancing.')
+    group.add_argument('--moe-ste-rect-poistion', '--ste-rect-poistion',
+                       type=str, choices=['topk', 'topk_plus_one', 'midpoint'],
+                       default='topk',
+                       dest='moe_ste_rect_poistion',
+                       help='Center location for the rectangular STE window used by direct '
+                            'routed-load balancing losses.')
     group.add_argument('--moe-learnable-bias-type',
                        type=str, choices=['none', 'expert_bias', 'per_token_bias'],
                        default='none',

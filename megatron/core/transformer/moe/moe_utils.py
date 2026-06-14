@@ -285,13 +285,31 @@ def _direct_load_balance_from_load(
 
 
 def _load_balance_margin(
-    logits: torch.Tensor, routing_map: torch.Tensor
+    logits: torch.Tensor, routing_map: torch.Tensor, ste_rect_poistion: str = "topk"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     routing_map = routing_map.bool()
     valid_tokens = routing_map.any(dim=-1)
-    selected_logits = logits.float().masked_fill(~routing_map, float('inf'))
-    threshold = selected_logits.min(dim=-1, keepdim=True).values
-    threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
+    logits = logits.float()
+
+    if ste_rect_poistion in ("topk", "midpoint"):
+        selected_logits = logits.masked_fill(~routing_map, float('inf'))
+        topk_threshold = selected_logits.min(dim=-1, keepdim=True).values
+        topk_threshold = torch.where(
+            valid_tokens.unsqueeze(-1), topk_threshold, torch.zeros_like(topk_threshold)
+        )
+    if ste_rect_poistion in ("topk_plus_one", "midpoint"):
+        unselected_logits = logits.masked_fill(routing_map, float('-inf'))
+        topk_plus_one_threshold = unselected_logits.max(dim=-1, keepdim=True).values
+
+    if ste_rect_poistion == "topk":
+        threshold = topk_threshold
+    elif ste_rect_poistion == "topk_plus_one":
+        threshold = topk_plus_one_threshold
+    elif ste_rect_poistion == "midpoint":
+        threshold = 0.5 * (topk_threshold + topk_plus_one_threshold)
+    else:
+        raise ValueError(f"Unsupported STE rect position: {ste_rect_poistion}")
+
     return logits.float() - threshold, valid_tokens
 
 
@@ -301,8 +319,9 @@ def _load_balance_ste_tokens_per_expert(
     load_balance_ste_type: str,
     load_balance_ste_width: float,
     load_balance_tanh_ste_slope: float,
+    ste_rect_poistion: str,
 ) -> torch.Tensor:
-    margin, valid_tokens = _load_balance_margin(logits, routing_map)
+    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
     else:
@@ -317,13 +336,14 @@ def _centered_fsq_variance_loss(
     denom: torch.Tensor,
     num_experts: int,
     load_balance_ste_width: float,
+    ste_rect_poistion: str,
     reduce_group: Optional[torch.distributed.ProcessGroup],
 ) -> torch.Tensor:
     """Variance term from the uniformly noised centered-logit DLB objective."""
     if load_balance_ste_width <= 0.0:
         return logits.new_tensor(0.0)
 
-    margin, valid_tokens = _load_balance_margin(logits, routing_map)
+    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     half_width = load_balance_ste_width * 0.5
     expected_indicator = torch.clamp((margin + half_width) / load_balance_ste_width, 0.0, 1.0)
     expected_indicator = expected_indicator * valid_tokens.unsqueeze(-1).to(
@@ -347,6 +367,7 @@ def direct_load_balancing_loss_func(
     load_balance_ste_width: float = 0.0,
     load_balance_ste_type: str = "rect",
     load_balance_tanh_ste_slope: float = 1.0,
+    load_balance_ste_rect_poistion: str = "topk",
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
@@ -362,12 +383,16 @@ def direct_load_balancing_loss_func(
     load_frac = hard_load_frac
 
     if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
+        ste_rect_poistion = (
+            load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
+        )
         ste_tokens_per_expert = _load_balance_ste_tokens_per_expert(
             logits,
             routing_map,
             load_balance_ste_type,
             load_balance_ste_width,
             load_balance_tanh_ste_slope,
+            ste_rect_poistion,
         )
         if reduce_group is not None:
             ste_tokens_per_expert = reduce_from_tensor_model_parallel_region(
@@ -384,6 +409,7 @@ def direct_load_balancing_loss_func(
             denom,
             num_experts,
             load_balance_ste_width,
+            load_balance_ste_rect_poistion,
             reduce_group,
         )
 

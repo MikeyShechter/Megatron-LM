@@ -11,6 +11,7 @@ from megatron.core.transformer.moe.moe_utils import (
     DIRECT_LOAD_BALANCING_LOSS_TYPES,
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    _load_balance_margin,
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
@@ -408,6 +409,7 @@ class TopKRouter(Router):
         load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope = (
             get_load_balance_ste_params(self.config)
         )
+        load_balance_ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             aux_loss = direct_load_balancing_loss_func(
                 load_balancing_type=load_balancing_type,
@@ -421,6 +423,7 @@ class TopKRouter(Router):
                 load_balance_ste_width=load_balance_ste_width,
                 load_balance_ste_type=load_balance_ste_type,
                 load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
+                load_balance_ste_rect_poistion=load_balance_ste_rect_poistion,
                 reduce_group=reduce_group,
             )
             probs = self.attach_and_log_load_balancing_loss(
@@ -523,10 +526,8 @@ class TopKRouter(Router):
         if load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
             # True margin: biased scores when selection biases are active, else logits.
             margin_input, _ = self._margin_input_for_ste(logits, detached=True)
-            selected_values = margin_input.float().masked_fill(~routing_map, float('inf'))
-            threshold = selected_values.min(dim=-1, keepdim=True).values
-            threshold = torch.where(valid_tokens.unsqueeze(-1), threshold, torch.zeros_like(threshold))
-            margin = margin_input.float() - threshold
+            ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
+            margin, _ = _load_balance_margin(margin_input, routing_map, ste_rect_poistion)
             half_width = load_balance_ste_width * 0.5
             selected_in_rect = routing_map & (margin.abs() < half_width)
             selected_over_rect = routing_map & (margin >= half_width)

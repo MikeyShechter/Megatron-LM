@@ -430,6 +430,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         "moe_load_balance_ste_type",
         "moe_load_balance_ste_schedule",
         "moe_load_balance_ste_width_end",
+        "moe_ste_rect_poistion",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))
