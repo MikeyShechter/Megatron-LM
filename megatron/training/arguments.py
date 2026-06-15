@@ -3232,6 +3232,11 @@ def _add_moe_args(parser):
                             'balancing: pass the STE gradient of the LB loss through the '
                             'routing scores p as well as the biases. If unset, only the '
                             'biases receive gradient.')
+    group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,
+                       dest='moe_learnable_bias_lr_mult',
+                       help='Learning-rate multiplier for learnable MoE routing bias '
+                            'parameters. Applies to both expert_bias and per_token_bias while '
+                            'preserving their optimizer assignment.')
     group.add_argument('--moe-use-global-lb', '--use-global-lb',
                        action='store_true', default=False,
                        dest='moe_use_global_lb',

@@ -236,6 +236,7 @@ class TopKRouter(Router):
             self.learnable_expert_biases = torch.nn.Parameter(
                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
             )
+            setattr(self.learnable_expert_biases, 'is_moe_learnable_bias_parameter', True)
         if self.learnable_bias_type == "per_token_bias":
             self.learnable_bias_weight = torch.nn.Parameter(
                 torch.empty(
@@ -248,6 +249,7 @@ class TopKRouter(Router):
                 dtype=self.config.params_dtype
             )
             setattr(self.learnable_bias_weight, 'sequence_parallel', self.config.sequence_parallel)
+            setattr(self.learnable_bias_weight, 'is_moe_learnable_bias_parameter', True)
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:

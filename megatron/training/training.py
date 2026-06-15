@@ -146,6 +146,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     is_linear_attention_variant,
 )
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer.optimizer_config import ParamKey
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -1642,6 +1643,16 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    moe_learnable_bias_lr_mult = getattr(args, 'moe_learnable_bias_lr_mult', None)
+    if moe_learnable_bias_lr_mult is not None:
+        moe_learnable_bias_override = {'max_lr': config.lr * moe_learnable_bias_lr_mult}
+        if config.min_lr is not None:
+            moe_learnable_bias_override['min_lr'] = (
+                config.min_lr * moe_learnable_bias_lr_mult
+            )
+        config_overrides[ParamKey(attr='is_moe_learnable_bias_parameter')] = (
+            moe_learnable_bias_override
+        )
 
     return config, config_overrides
 
