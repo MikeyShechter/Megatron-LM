@@ -1425,6 +1425,12 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+        assert getattr(args, 'moe_learnable_bias_lr_mult', None) is None, (
+            "--moe-learnable-bias-lr-mult cannot be used with "
+            "--tie-learnable-bias-lr-to-aux-loss-coeff"
+        )
+        args.moe_learnable_bias_lr_mult = args.moe_aux_loss_coeff
 
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
@@ -3254,11 +3260,18 @@ def _add_moe_args(parser):
                             'letting moe_aux_loss_coeff balance LB vs LM pressure on the biases. '
                             'Requires moe_learnable_bias_type != none and (for rect) '
                             'moe_load_balance_ste_width > 0.')
-    group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,
-                       dest='moe_learnable_bias_lr_mult',
-                       help='Learning-rate multiplier for learnable MoE routing bias '
-                            'parameters. Applies to both expert_bias and per_token_bias while '
-                            'preserving their optimizer assignment.')
+    learnable_bias_lr_group = group.add_mutually_exclusive_group()
+    learnable_bias_lr_group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,
+                                         dest='moe_learnable_bias_lr_mult',
+                                         help='Learning-rate multiplier for learnable MoE '
+                                              'routing bias parameters. Applies to both '
+                                              'expert_bias and per_token_bias while preserving '
+                                              'their optimizer assignment.')
+    learnable_bias_lr_group.add_argument('--tie-learnable-bias-lr-to-aux-loss-coeff',
+                                         action='store_true', default=False,
+                                         dest='tie_learnable_bias_lr_to_aux_loss_coeff',
+                                         help='Set moe_learnable_bias_lr_mult to '
+                                              'moe_aux_loss_coeff so both scales move together.')
     group.add_argument('--moe-use-global-lb', '--use-global-lb',
                        action='store_true', default=False,
                        dest='moe_use_global_lb',
