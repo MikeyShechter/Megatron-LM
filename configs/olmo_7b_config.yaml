@@ -90,3 +90,4 @@ parameters:
   save_interval: [5000]
   log_interval: [10]
   wandb_project: ["megatron-olmoe"]
+  log_timers_to_tensorboard: [true]

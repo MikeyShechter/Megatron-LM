@@ -87,3 +87,4 @@ parameters:
   save_interval: [5]            # = save_every
   log_interval: [1]
   wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]

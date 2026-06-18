@@ -1818,9 +1818,12 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_load_balance_ste_schedule",
         "moe_load_balance_ste_width_end",
         "moe_ste_rect_poistion",
+        "moe_load_balance_gate_metric",
+        "moe_load_balance_gate_threshold",
         "moe_use_global_lb",
         "moe_learnable_bias_type",
         "moe_learnable_bias_pass_grad_through_scores",
+        "moe_lm_loss_ste",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))
@@ -3216,6 +3219,17 @@ def _add_moe_args(parser):
                        dest='moe_ste_rect_poistion',
                        help='Center location for the rectangular STE window used by direct '
                             'routed-load balancing losses.')
+    group.add_argument('--moe-load-balance-gate-metric', '--load-balance-gate-metric',
+                       type=str, choices=['none', 'maxvio', 'totalvio'],
+                       default='none',
+                       dest='moe_load_balance_gate_metric',
+                       help='Detached hard-load metric used to gate direct routed-load '
+                            'balancing gradients. If the metric is at or below '
+                            'moe_load_balance_gate_threshold, the direct loss gradient is zero.')
+    group.add_argument('--moe-load-balance-gate-threshold', '--load-balance-gate-threshold',
+                       type=float, default=0.0,
+                       dest='moe_load_balance_gate_threshold',
+                       help='Threshold for moe_load_balance_gate_metric.')
     group.add_argument('--moe-learnable-bias-type',
                        type=str, choices=['none', 'expert_bias', 'per_token_bias'],
                        default='none',
@@ -3232,6 +3246,14 @@ def _add_moe_args(parser):
                             'balancing: pass the STE gradient of the LB loss through the '
                             'routing scores p as well as the biases. If unset, only the '
                             'biases receive gradient.')
+    group.add_argument('--moe-lm-loss-ste',
+                       action='store_true', default=False,
+                       dest='moe_lm_loss_ste',
+                       help='Apply the rect/tanh STE on the top-k selection so the LM loss '
+                            'also trains the learnable routing biases (moe_learnable_bias_type), '
+                            'letting moe_aux_loss_coeff balance LB vs LM pressure on the biases. '
+                            'Requires moe_learnable_bias_type != none and (for rect) '
+                            'moe_load_balance_ste_width > 0.')
     group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,
                        dest='moe_learnable_bias_lr_mult',
                        help='Learning-rate multiplier for learnable MoE routing bias '

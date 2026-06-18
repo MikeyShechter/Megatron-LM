@@ -19,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     direct_load_balancing_loss_func,
     get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
+    load_balance_ste_soft_mask,
     router_gating_linear,
     save_to_aux_losses_tracker,
     save_to_router_metrics_tracker,
@@ -219,6 +220,7 @@ class TopKRouter(Router):
 
         # Learnable routing biases (rect/tanh-STE trained, DeepSeek-style selection).
         self.learnable_bias_type = getattr(self.config, "moe_learnable_bias_type", "none")
+        self.lm_loss_ste = getattr(self.config, "moe_lm_loss_ste", False)
         self.learnable_expert_biases = None
         self.learnable_bias_weight = None
         self._per_token_bias = None
@@ -412,6 +414,10 @@ class TopKRouter(Router):
             get_load_balance_ste_params(self.config)
         )
         load_balance_ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
+        load_balance_gate_metric = getattr(self.config, "moe_load_balance_gate_metric", "none")
+        load_balance_gate_threshold = getattr(
+            self.config, "moe_load_balance_gate_threshold", 0.0
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             aux_loss = direct_load_balancing_loss_func(
                 load_balancing_type=load_balancing_type,
@@ -426,6 +432,8 @@ class TopKRouter(Router):
                 load_balance_ste_type=load_balance_ste_type,
                 load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
                 load_balance_ste_rect_poistion=load_balance_ste_rect_poistion,
+                load_balance_gate_metric=load_balance_gate_metric,
+                load_balance_gate_threshold=load_balance_gate_threshold,
                 reduce_group=reduce_group,
             )
             probs = self.attach_and_log_load_balancing_loss(
@@ -484,6 +492,45 @@ class TopKRouter(Router):
         ):
             scores = scores.detach()
         return scores + bias, True
+
+    def _apply_learnable_bias_lm_ste(
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Route the LM-loss gradient to the learnable routing biases via the STE.
+
+        Top-k selection is non-differentiable, so the LM loss cannot train the
+        learnable bias b on its own. Here probs are scaled by the rect/tanh STE soft
+        selection mask (the same one the LB loss uses), whose forward value matches the
+        hard routing map (so probs, and therefore the MoE output, are unchanged) while
+        its backward pass flows gradient through the biased selection margin to b.
+        Selection is then shaped by both balance (LB loss) and performance (LM loss),
+        letting moe_aux_loss_coeff control the trade-off directly instead of
+        moe_learnable_bias_lr_mult.
+        """
+        load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope = (
+            get_load_balance_ste_params(self.config)
+        )
+        # margin_input = p.detach() + b, so the STE gradient flows to b (and only to the
+        # router logits if moe_learnable_bias_pass_grad_through_scores is set).
+        margin_input, _ = self._margin_input_for_ste(logits, detached=False)
+        ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
+        if padding_mask is not None:
+            routing_map = routing_map & ~padding_mask.unsqueeze(-1)
+        soft_mask = load_balance_ste_soft_mask(
+            margin_input,
+            routing_map,
+            load_balance_ste_type,
+            load_balance_ste_width,
+            load_balance_tanh_ste_slope,
+            ste_rect_poistion,
+        )
+        # soft_mask == routing_map in forward, and probs is zero off the selected set,
+        # so probs is unchanged; the gradient flows through soft_mask to b.
+        return probs * soft_mask.to(probs.dtype)
 
     def _save_router_metrics(
         self,
@@ -849,13 +896,14 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
-        # Learnable routing biases shift top-k selection only (DeepSeek-style):
-        # selection uses p + b while gating weights stay unbiased, so the LM loss
-        # gives no gradient to b; it learns only from the LB loss below.
+        # Learnable routing biases shift top-k selection (DeepSeek-style): selection
+        # uses p + b while gating weights stay unbiased. top-k selection is itself
+        # non-differentiable, so the LM-loss gradient reaches b through the STE applied
+        # to probs in _apply_learnable_bias_lm_ste below (the LB loss trains b as well).
         learnable_bias = self._get_learnable_routing_bias()
         selection_bias = self.expert_bias
         if learnable_bias is not None:
-            selection_bias = learnable_bias.detach()
+            selection_bias = learnable_bias
 
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
@@ -883,6 +931,17 @@ class TopKRouter(Router):
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            )
+
+        # Pass the LM-loss gradient to learnable routing biases via the selection STE.
+        if (
+            self.lm_loss_ste
+            and self.learnable_bias_type != "none"
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            probs = self._apply_learnable_bias_lm_ste(
+                probs, logits, routing_map, padding_mask=padding_mask
             )
 
         routing_map_for_aux_loss = None

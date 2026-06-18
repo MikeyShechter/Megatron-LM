@@ -284,6 +284,29 @@ def _direct_load_balance_from_load(
     raise ValueError(f"Unsupported direct load balancing type: {load_balancing_type}")
 
 
+def _direct_load_balance_gate(
+    hard_load_frac: torch.Tensor,
+    num_experts: int,
+    load_balance_gate_metric: str,
+    load_balance_gate_threshold: float,
+) -> torch.Tensor:
+    if load_balance_gate_metric == "none":
+        return hard_load_frac.new_tensor(1.0)
+
+    expected_frac = hard_load_frac.new_tensor(1.0 / num_experts)
+    if load_balance_gate_metric == "maxvio":
+        gate_metric = (torch.amax(hard_load_frac.detach(), dim=-1) - expected_frac) / expected_frac
+    elif load_balance_gate_metric == "totalvio":
+        gate_metric = (
+            torch.abs(hard_load_frac.detach() - expected_frac).sum(dim=-1) / expected_frac
+        )
+    else:
+        raise ValueError(f"Unsupported direct load balance gate metric: {load_balance_gate_metric}")
+
+    threshold = hard_load_frac.new_tensor(float(load_balance_gate_threshold))
+    return (gate_metric > threshold).to(dtype=hard_load_frac.dtype)
+
+
 def _load_balance_margin(
     logits: torch.Tensor, routing_map: torch.Tensor, ste_rect_poistion: str = "topk"
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -313,6 +336,27 @@ def _load_balance_margin(
     return logits.float() - threshold, valid_tokens
 
 
+def load_balance_ste_soft_mask(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    load_balance_ste_type: str,
+    load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
+    ste_rect_poistion: str,
+) -> torch.Tensor:
+    """Per-token soft selection mask from the load-balance STE (rect or tanh).
+
+    The forward value matches the hard ``routing_map`` while the backward pass
+    routes gradient through the selection margin. Shape [num_tokens, num_experts].
+    """
+    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
+    if load_balance_ste_type == "tanh":
+        soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+    else:
+        soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
+    return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
+
+
 def _load_balance_ste_tokens_per_expert(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
@@ -321,12 +365,14 @@ def _load_balance_ste_tokens_per_expert(
     load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
 ) -> torch.Tensor:
-    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
-    if load_balance_ste_type == "tanh":
-        soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
-    else:
-        soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
-    soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
+    soft_mask = load_balance_ste_soft_mask(
+        logits,
+        routing_map,
+        load_balance_ste_type,
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+        ste_rect_poistion,
+    )
     return soft_mask.sum(dim=0)
 
 
@@ -368,6 +414,8 @@ def direct_load_balancing_loss_func(
     load_balance_ste_type: str = "rect",
     load_balance_tanh_ste_slope: float = 1.0,
     load_balance_ste_rect_poistion: str = "topk",
+    load_balance_gate_metric: str = "none",
+    load_balance_gate_threshold: float = 0.0,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
@@ -413,6 +461,13 @@ def direct_load_balancing_loss_func(
             reduce_group,
         )
 
+    gate = _direct_load_balance_gate(
+        hard_load_frac,
+        num_experts,
+        load_balance_gate_metric,
+        load_balance_gate_threshold,
+    )
+    loss = loss.detach() + gate * (loss - loss.detach())
     return loss * moe_aux_loss_coeff
 
 
