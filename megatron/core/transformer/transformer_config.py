@@ -641,8 +641,10 @@ class TransformerConfig(ModelParallelConfig):
     micro-batch level.
     - "fsq": Fractional-squared routed-load loss with optional STE.
     - "centered_fsq": Centered fractional-squared routed-load loss with optional STE.
-    - "centered_fsq_and_var": Centered fractional-squared routed-load loss plus the
-      uniformly noised load-variance penalty.
+    - "centered_fsq_and_var": Centered fractional-squared routed-load loss plus a hard
+      load-variance penalty, both differentiated through the load-balance STE.
+    - "noisy_centered_fsq": Analytic uniformly noised centered fractional-squared
+      routed-load loss.
     - "maxvio": Maximum routed-load violation loss with optional STE.
     - "maxviosq": Squared maximum routed-load violation loss with optional STE.
     - "totalvio": Total routed-load violation loss with optional STE.
@@ -1347,6 +1349,7 @@ class TransformerConfig(ModelParallelConfig):
                         "fsq",
                         "centered_fsq",
                         "centered_fsq_and_var",
+                        "noisy_centered_fsq",
                         "maxvio",
                         "maxviosq",
                         "totalvio",
@@ -1356,14 +1359,16 @@ class TransformerConfig(ModelParallelConfig):
                     ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
-                            "fsq, centered_fsq, centered_fsq_and_var, maxvio, maxviosq, "
-                            "totalvio, seq_aux_loss, global_aux_loss or none load balancing"
+                            "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, "
+                            "maxvio, maxviosq, totalvio, seq_aux_loss, global_aux_loss or none "
+                            "load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
                 "fsq",
                 "centered_fsq",
                 "centered_fsq_and_var",
+                "noisy_centered_fsq",
                 "maxvio",
                 "maxviosq",
                 "totalvio",
@@ -1373,8 +1378,8 @@ class TransformerConfig(ModelParallelConfig):
             ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
-                    "fsq, centered_fsq, centered_fsq_and_var, maxvio, maxviosq, totalvio, "
-                    "seq_aux_loss, global_aux_loss or none load balancing"
+                    "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, maxvio, "
+                    "maxviosq, totalvio, seq_aux_loss, global_aux_loss or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

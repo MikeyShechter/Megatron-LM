@@ -2290,6 +2290,7 @@ def training_log(
             "fsq",
             "centered_fsq",
             "centered_fsq_and_var",
+            "noisy_centered_fsq",
             "maxvio",
             "maxviosq",
             "totalvio",

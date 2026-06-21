@@ -195,6 +195,7 @@ DIRECT_LOAD_BALANCING_LOSS_TYPES = (
     "fsq",
     "centered_fsq",
     "centered_fsq_and_var",
+    "noisy_centered_fsq",
     "maxvio",
     "maxviosq",
     "totalvio",
@@ -270,7 +271,7 @@ def _direct_load_balance_from_load(
 
     if load_balancing_type == "fsq":
         return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
-    if load_balancing_type in ("centered_fsq", "centered_fsq_and_var"):
+    if load_balancing_type in ("centered_fsq", "centered_fsq_and_var", "noisy_centered_fsq"):
         return 1.0 + num_experts_tensor * torch.square(load_frac - expected_frac).sum(dim=-1)
     if load_balancing_type == "maxvio":
         return 1.0 + (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
@@ -376,7 +377,58 @@ def _load_balance_ste_tokens_per_expert(
     return soft_mask.sum(dim=0)
 
 
-def _centered_fsq_variance_loss(
+def _uniform_noisy_expected_indicator(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    load_balance_ste_width: float,
+    ste_rect_poistion: str,
+) -> torch.Tensor:
+    """Expected top-k indicator under uniform noise matching the rect STE window."""
+    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
+    half_width = load_balance_ste_width * 0.5
+    expected_indicator = torch.clamp((margin + half_width) / load_balance_ste_width, 0.0, 1.0)
+    return expected_indicator * valid_tokens.unsqueeze(-1).to(dtype=expected_indicator.dtype)
+
+
+def _centered_fsq_variance_loss_from_expected_indicator(
+    expected_indicator: torch.Tensor,
+    denom: torch.Tensor,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    variance_sum = (expected_indicator * (1.0 - expected_indicator)).sum()
+    if reduce_group is not None:
+        variance_sum = reduce_from_tensor_model_parallel_region(variance_sum, reduce_group)
+    return expected_indicator.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
+
+
+def _centered_fsq_hard_ste_variance_loss(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    denom: torch.Tensor,
+    num_experts: int,
+    load_balance_ste_type: str,
+    load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
+    ste_rect_poistion: str,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Hard variance term whose gradient flows through the load-balance STE."""
+    ste_mask = load_balance_ste_soft_mask(
+        logits,
+        routing_map,
+        load_balance_ste_type,
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+        ste_rect_poistion,
+    )
+    variance_sum = (ste_mask * (1.0 - ste_mask)).sum()
+    if reduce_group is not None:
+        variance_sum = reduce_from_tensor_model_parallel_region(variance_sum, reduce_group)
+    return ste_mask.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
+
+
+def _noisy_centered_fsq_loss(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
     denom: torch.Tensor,
@@ -385,20 +437,26 @@ def _centered_fsq_variance_loss(
     ste_rect_poistion: str,
     reduce_group: Optional[torch.distributed.ProcessGroup],
 ) -> torch.Tensor:
-    """Variance term from the uniformly noised centered-logit DLB objective."""
-    if load_balance_ste_width <= 0.0:
-        return logits.new_tensor(0.0)
-
-    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
-    half_width = load_balance_ste_width * 0.5
-    expected_indicator = torch.clamp((margin + half_width) / load_balance_ste_width, 0.0, 1.0)
-    expected_indicator = expected_indicator * valid_tokens.unsqueeze(-1).to(
-        dtype=expected_indicator.dtype
+    """Analytic uniformly noised centered-FSQ objective."""
+    expected_indicator = _uniform_noisy_expected_indicator(
+        logits,
+        routing_map,
+        load_balance_ste_width,
+        ste_rect_poistion,
     )
-    variance_sum = (expected_indicator * (1.0 - expected_indicator)).sum()
+    expected_tokens_per_expert = expected_indicator.sum(dim=0)
     if reduce_group is not None:
-        variance_sum = reduce_from_tensor_model_parallel_region(variance_sum, reduce_group)
-    return logits.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
+        expected_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            expected_tokens_per_expert, reduce_group
+        )
+    expected_load_frac = expected_tokens_per_expert.float() / denom
+    loss = _direct_load_balance_from_load(expected_load_frac, num_experts, "centered_fsq")
+    return loss + _centered_fsq_variance_loss_from_expected_indicator(
+        expected_indicator,
+        denom,
+        num_experts,
+        reduce_group,
+    )
 
 
 def direct_load_balancing_loss_func(
@@ -430,7 +488,17 @@ def direct_load_balancing_loss_func(
     hard_load_frac = tokens_per_expert.float() / denom
     load_frac = hard_load_frac
 
-    if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
+    if load_balancing_type == "noisy_centered_fsq":
+        loss = _noisy_centered_fsq_loss(
+            logits,
+            routing_map,
+            denom,
+            num_experts,
+            load_balance_ste_width,
+            load_balance_ste_rect_poistion,
+            reduce_group,
+        )
+    elif load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
         ste_rect_poistion = (
             load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
         )
@@ -449,17 +517,21 @@ def direct_load_balancing_loss_func(
         ste_load_frac = ste_tokens_per_expert.float() / denom
         load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
 
-    loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
-    if load_balancing_type == "centered_fsq_and_var":
-        loss = loss + _centered_fsq_variance_loss(
-            logits,
-            routing_map,
-            denom,
-            num_experts,
-            load_balance_ste_width,
-            load_balance_ste_rect_poistion,
-            reduce_group,
-        )
+        loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
+        if load_balancing_type == "centered_fsq_and_var":
+            loss = loss + _centered_fsq_hard_ste_variance_loss(
+                logits,
+                routing_map,
+                denom,
+                num_experts,
+                load_balance_ste_type,
+                load_balance_ste_width,
+                load_balance_tanh_ste_slope,
+                ste_rect_poistion,
+                reduce_group,
+            )
+    else:
+        loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
 
     gate = _direct_load_balance_gate(
         hard_load_frac,
