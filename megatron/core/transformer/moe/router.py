@@ -378,6 +378,10 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         routing_map: torch.Tensor,
         selection_routing_map: torch.Tensor,
+        aux_topk_indices: Optional[torch.Tensor] = None,
+        aux_topk_plus_one_indices: Optional[torch.Tensor] = None,
+        selection_topk_indices: Optional[torch.Tensor] = None,
+        selection_topk_plus_one_indices: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
     ):
         """Apply direct routed-load auxiliary losses for the given logits and routing map."""
@@ -397,6 +401,11 @@ class TopKRouter(Router):
             routing_map = selection_routing_map
             if padding_mask is not None:
                 routing_map = routing_map & ~padding_mask.unsqueeze(-1)
+            topk_indices = selection_topk_indices
+            topk_plus_one_indices = selection_topk_plus_one_indices
+        else:
+            topk_indices = aux_topk_indices
+            topk_plus_one_indices = aux_topk_plus_one_indices
 
         use_global_lb = getattr(self.config, "moe_use_global_lb", False)
         reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
@@ -435,6 +444,8 @@ class TopKRouter(Router):
                 load_balance_gate_metric=load_balance_gate_metric,
                 load_balance_gate_threshold=load_balance_gate_threshold,
                 reduce_group=reduce_group,
+                load_balance_topk_indices=topk_indices,
+                load_balance_topk_plus_one_indices=topk_plus_one_indices,
             )
             probs = self.attach_and_log_load_balancing_loss(
                 probs,
@@ -572,7 +583,7 @@ class TopKRouter(Router):
         ste_selected_count = tokens_per_expert.sum()
         ste_over_rect_count = torch.zeros_like(tokens_per_expert)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
-        if load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
+        if (not self.training) and load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
             # True margin: biased scores when selection biases are active, else logits.
             margin_input, _ = self._margin_input_for_ste(logits, detached=True)
             ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
@@ -905,11 +916,29 @@ class TopKRouter(Router):
         if learnable_bias is not None:
             selection_bias = learnable_bias
 
+        should_apply_aux_loss = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
+        direct_loss_enabled = should_apply_aux_loss and any(
+            self.get_aux_loss_coeff(load_balancing_type) > 0
+            for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
+        )
+        should_return_top_indices = direct_loss_enabled and not self.config.moe_router_fusion
+        load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
+        load_balance_ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
+        should_return_topk_plus_one_indices = (
+            should_return_top_indices
+            and load_balance_ste_type == "rect"
+            and load_balance_ste_width > 0.0
+            and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+        )
+        should_return_selection_top_indices = should_return_top_indices and selection_bias is not None
+        selection_topk_indices = None
+        selection_topk_plus_one_indices = None
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
-            probs, routing_map = topk_routing_with_score_function(
+            routing_output = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -920,7 +949,26 @@ class TopKRouter(Router):
                 expert_bias=selection_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                return_top_indices=should_return_selection_top_indices,
+                return_topk_plus_one_indices=(
+                    should_return_selection_top_indices and should_return_topk_plus_one_indices
+                ),
             )
+            if (
+                should_return_selection_top_indices
+                and should_return_topk_plus_one_indices
+                and len(routing_output) == 4
+            ):
+                (
+                    probs,
+                    routing_map,
+                    selection_topk_indices,
+                    selection_topk_plus_one_indices,
+                ) = routing_output
+            elif should_return_selection_top_indices:
+                probs, routing_map, selection_topk_indices = routing_output
+            else:
+                probs, routing_map = routing_output
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -932,6 +980,8 @@ class TopKRouter(Router):
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
+            selection_topk_indices = None
+            selection_topk_plus_one_indices = None
 
         # Pass the LM-loss gradient to learnable routing biases via the selection STE.
         if (
@@ -946,16 +996,36 @@ class TopKRouter(Router):
 
         routing_map_for_aux_loss = None
         scores_for_aux_loss = None
-        should_apply_aux_loss = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
+        aux_topk_indices = None
+        aux_topk_plus_one_indices = None
         should_track_router_metrics = self.layer_number is not None
         if should_apply_aux_loss or should_track_router_metrics:
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+            aux_routing_output = compute_routing_scores_for_aux_loss(
                 logits,
                 self.topk,
                 self.score_function,
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
+                return_top_indices=should_return_top_indices,
+                return_topk_plus_one_indices=(
+                    should_return_top_indices and should_return_topk_plus_one_indices
+                ),
             )
+            if (
+                should_return_top_indices
+                and should_return_topk_plus_one_indices
+                and len(aux_routing_output) == 4
+            ):
+                (
+                    routing_map_for_aux_loss,
+                    scores_for_aux_loss,
+                    aux_topk_indices,
+                    aux_topk_plus_one_indices,
+                ) = aux_routing_output
+            elif should_return_top_indices:
+                routing_map_for_aux_loss, scores_for_aux_loss, aux_topk_indices = aux_routing_output
+            else:
+                routing_map_for_aux_loss, scores_for_aux_loss = aux_routing_output
 
         if should_track_router_metrics:
             self._save_router_metrics(
@@ -979,6 +1049,10 @@ class TopKRouter(Router):
                 logits,
                 routing_map_for_aux_loss,
                 selection_routing_map=routing_map,
+                aux_topk_indices=aux_topk_indices,
+                aux_topk_plus_one_indices=aux_topk_plus_one_indices,
+                selection_topk_indices=selection_topk_indices,
+                selection_topk_plus_one_indices=selection_topk_plus_one_indices,
                 padding_mask=padding_mask,
             )
             probs = self._apply_seq_aux_loss(
