@@ -174,6 +174,44 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
         return grad_margin.to(dtype=margin.dtype), None
 
 
+class _LoadBalanceLoadSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        margin: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        forward_load: torch.Tensor,
+        ste_type: str,
+        bandwidth: float,
+        tanh_slope: float,
+    ) -> torch.Tensor:
+        ctx.ste_type = ste_type
+        ctx.bandwidth = float(bandwidth)
+        ctx.tanh_slope = float(tanh_slope)
+        ctx.save_for_backward(margin, valid_tokens)
+        return forward_load
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        margin, valid_tokens = ctx.saved_tensors
+        margin_float = margin.float()
+        valid_mask = valid_tokens.unsqueeze(-1)
+        if ctx.ste_type == "tanh":
+            slope = ctx.tanh_slope
+            k = max(1.0 / slope, 1.0)
+            tanh_value = torch.tanh(slope * margin_float)
+            ste_grad = k * slope * (1.0 - tanh_value.square())
+            ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
+        else:
+            half_width = ctx.bandwidth * 0.5
+            ste_grad = ((margin_float.abs() < half_width) & valid_mask).to(dtype=torch.float32)
+            ste_grad = ste_grad / ctx.bandwidth
+        grad_margin = grad_output.unsqueeze(0).float() * ste_grad
+        return grad_margin.to(dtype=margin.dtype), None, None, None, None, None
+
+
 class _TanhSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, margin: torch.Tensor, slope: float) -> torch.Tensor:
@@ -309,21 +347,33 @@ def _direct_load_balance_gate(
 
 
 def _load_balance_margin(
-    logits: torch.Tensor, routing_map: torch.Tensor, ste_rect_poistion: str = "topk"
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    ste_rect_poistion: str = "topk",
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     routing_map = routing_map.bool()
     valid_tokens = routing_map.any(dim=-1)
     logits = logits.float()
 
     if ste_rect_poistion in ("topk", "midpoint"):
-        selected_logits = logits.masked_fill(~routing_map, float('inf'))
+        if topk_indices is not None:
+            selected_logits = torch.gather(logits, dim=-1, index=topk_indices)
+        else:
+            selected_logits = logits.masked_fill(~routing_map, float('inf'))
         topk_threshold = selected_logits.min(dim=-1, keepdim=True).values
         topk_threshold = torch.where(
             valid_tokens.unsqueeze(-1), topk_threshold, torch.zeros_like(topk_threshold)
         )
     if ste_rect_poistion in ("topk_plus_one", "midpoint"):
-        unselected_logits = logits.masked_fill(routing_map, float('-inf'))
-        topk_plus_one_threshold = unselected_logits.max(dim=-1, keepdim=True).values
+        if topk_plus_one_indices is not None:
+            topk_plus_one_threshold = torch.gather(
+                logits, dim=-1, index=topk_plus_one_indices
+            )
+        else:
+            unselected_logits = logits.masked_fill(routing_map, float('-inf'))
+            topk_plus_one_threshold = unselected_logits.max(dim=-1, keepdim=True).values
 
     if ste_rect_poistion == "topk":
         threshold = topk_threshold
@@ -377,14 +427,41 @@ def _load_balance_ste_tokens_per_expert(
     return soft_mask.sum(dim=0)
 
 
-def _uniform_noisy_expected_indicator(
+def _load_balance_ste_load_surrogate(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
+    forward_load: torch.Tensor,
+    load_balance_ste_type: str,
     load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    margin, valid_tokens = _load_balance_margin(
+        logits,
+        routing_map,
+        ste_rect_poistion,
+        topk_indices=topk_indices,
+        topk_plus_one_indices=topk_plus_one_indices,
+    )
+    forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
+    ste_tokens_per_expert = _LoadBalanceLoadSTE.apply(
+        margin,
+        valid_tokens,
+        forward_load,
+        load_balance_ste_type,
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+    )
+    return ste_tokens_per_expert, margin, valid_tokens
+
+
+def _centered_fsq_expected_indicator(
+    margin: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    load_balance_ste_width: float,
 ) -> torch.Tensor:
-    """Expected top-k indicator under uniform noise matching the rect STE window."""
-    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     half_width = load_balance_ste_width * 0.5
     expected_indicator = torch.clamp((margin + half_width) / load_balance_ste_width, 0.0, 1.0)
     return expected_indicator * valid_tokens.unsqueeze(-1).to(dtype=expected_indicator.dtype)
@@ -402,30 +479,42 @@ def _centered_fsq_variance_loss_from_expected_indicator(
     return expected_indicator.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
 
 
-def _centered_fsq_hard_ste_variance_loss(
+def _centered_fsq_variance_loss(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
     denom: torch.Tensor,
     num_experts: int,
-    load_balance_ste_type: str,
     load_balance_ste_width: float,
-    load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
     reduce_group: Optional[torch.distributed.ProcessGroup],
+    margin: Optional[torch.Tensor] = None,
+    valid_tokens: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Hard variance term whose gradient flows through the load-balance STE."""
-    ste_mask = load_balance_ste_soft_mask(
-        logits,
-        routing_map,
-        load_balance_ste_type,
+    """Variance term from the uniformly noised centered-logit DLB objective."""
+    if load_balance_ste_width <= 0.0:
+        return logits.new_tensor(0.0)
+
+    if margin is None or valid_tokens is None:
+        margin, valid_tokens = _load_balance_margin(
+            logits,
+            routing_map,
+            ste_rect_poistion,
+            topk_indices=topk_indices,
+            topk_plus_one_indices=topk_plus_one_indices,
+        )
+    expected_indicator = _centered_fsq_expected_indicator(
+        margin,
+        valid_tokens,
         load_balance_ste_width,
-        load_balance_tanh_ste_slope,
-        ste_rect_poistion,
     )
-    variance_sum = (ste_mask * (1.0 - ste_mask)).sum()
-    if reduce_group is not None:
-        variance_sum = reduce_from_tensor_model_parallel_region(variance_sum, reduce_group)
-    return ste_mask.new_tensor(float(num_experts)) * variance_sum / torch.square(denom)
+    return _centered_fsq_variance_loss_from_expected_indicator(
+        expected_indicator,
+        denom,
+        num_experts,
+        reduce_group,
+    )
 
 
 def _noisy_centered_fsq_loss(
@@ -436,13 +525,21 @@ def _noisy_centered_fsq_loss(
     load_balance_ste_width: float,
     ste_rect_poistion: str,
     reduce_group: Optional[torch.distributed.ProcessGroup],
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Analytic uniformly noised centered-FSQ objective."""
-    expected_indicator = _uniform_noisy_expected_indicator(
+    margin, valid_tokens = _load_balance_margin(
         logits,
         routing_map,
-        load_balance_ste_width,
         ste_rect_poistion,
+        topk_indices=topk_indices,
+        topk_plus_one_indices=topk_plus_one_indices,
+    )
+    expected_indicator = _centered_fsq_expected_indicator(
+        margin,
+        valid_tokens,
+        load_balance_ste_width,
     )
     expected_tokens_per_expert = expected_indicator.sum(dim=0)
     if reduce_group is not None:
@@ -475,6 +572,8 @@ def direct_load_balancing_loss_func(
     load_balance_gate_metric: str = "none",
     load_balance_gate_threshold: float = 0.0,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    load_balance_topk_indices: Optional[torch.Tensor] = None,
+    load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
     if isinstance(total_num_tokens, torch.Tensor):
@@ -487,6 +586,11 @@ def direct_load_balancing_loss_func(
     denom = torch.clamp(total_num_tokens_tensor * float(topk), min=1.0)
     hard_load_frac = tokens_per_expert.float() / denom
     load_frac = hard_load_frac
+    ste_margin = None
+    ste_valid_tokens = None
+    ste_rect_poistion = (
+        load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
+    )
 
     if load_balancing_type == "noisy_centered_fsq":
         loss = _noisy_centered_fsq_loss(
@@ -497,41 +601,51 @@ def direct_load_balancing_loss_func(
             load_balance_ste_width,
             load_balance_ste_rect_poistion,
             reduce_group,
+            topk_indices=load_balance_topk_indices,
+            topk_plus_one_indices=load_balance_topk_plus_one_indices,
         )
-    elif load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
-        ste_rect_poistion = (
-            load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
-        )
-        ste_tokens_per_expert = _load_balance_ste_tokens_per_expert(
-            logits,
-            routing_map,
-            load_balance_ste_type,
-            load_balance_ste_width,
-            load_balance_tanh_ste_slope,
-            ste_rect_poistion,
-        )
-        if reduce_group is not None:
-            ste_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-                ste_tokens_per_expert, reduce_group
+    else:
+        if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
+            ste_forward_load = (
+                tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
             )
-        ste_load_frac = ste_tokens_per_expert.float() / denom
-        load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
+            ste_tokens_per_expert, ste_margin, ste_valid_tokens = (
+                _load_balance_ste_load_surrogate(
+                    logits,
+                    routing_map,
+                    ste_forward_load,
+                    load_balance_ste_type,
+                    load_balance_ste_width,
+                    load_balance_tanh_ste_slope,
+                    ste_rect_poistion,
+                    load_balance_topk_indices,
+                    load_balance_topk_plus_one_indices,
+                )
+            )
+            ste_load_frac = ste_tokens_per_expert.float() / denom
+            load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
 
         loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
         if load_balancing_type == "centered_fsq_and_var":
-            loss = loss + _centered_fsq_hard_ste_variance_loss(
+            reusable_margin = (
+                ste_margin if ste_rect_poistion == load_balance_ste_rect_poistion else None
+            )
+            reusable_valid_tokens = (
+                ste_valid_tokens if ste_rect_poistion == load_balance_ste_rect_poistion else None
+            )
+            loss = loss + _centered_fsq_variance_loss(
                 logits,
                 routing_map,
                 denom,
                 num_experts,
-                load_balance_ste_type,
                 load_balance_ste_width,
-                load_balance_tanh_ste_slope,
-                ste_rect_poistion,
+                load_balance_ste_rect_poistion,
                 reduce_group,
+                margin=reusable_margin,
+                valid_tokens=reusable_valid_tokens,
+                topk_indices=load_balance_topk_indices,
+                topk_plus_one_indices=load_balance_topk_plus_one_indices,
             )
-    else:
-        loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
 
     gate = _direct_load_balance_gate(
         hard_load_frac,
@@ -1081,7 +1195,13 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_top_indices: bool = False,
+    return_topk_plus_one_indices: bool = False,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
     Args:
@@ -1105,6 +1225,11 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        return_top_indices (bool, optional): If True, return top-k expert indices alongside the
+                                             sparse tensors. Defaults to False.
+        return_topk_plus_one_indices (bool, optional): If True, return the best unselected expert
+                                                       index when it can be computed from the same
+                                                       top-k operation. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1120,6 +1245,11 @@ def topk_routing_with_score_function(
                   probabilities for each token's top-k selected experts.
                 - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
                   selected for each token.
+            When return_top_indices=True:
+                - routing_probs
+                - routing_map
+                - top_indices
+                - topk_plus_one_indices, when return_topk_plus_one_indices=True
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
@@ -1128,6 +1258,8 @@ def topk_routing_with_score_function(
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
             )
+        if return_top_indices or return_topk_plus_one_indices:
+            raise ValueError("Returning top-k details is not supported with fused top-k routing.")
         if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
             raise ValueError(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
@@ -1174,7 +1306,8 @@ def topk_routing_with_score_function(
             )
         else:
             # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            sorted_topk = torch.is_grad_enabled() or can_return_topk_plus_one
+            return torch.topk(scores, k=topk, dim=1, sorted=sorted_topk)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
@@ -1185,6 +1318,25 @@ def topk_routing_with_score_function(
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
+
+    can_return_topk_plus_one = (
+        return_topk_plus_one_indices
+        and topk < num_experts
+        and group_topk is None
+        and router_replay is None
+    )
+    topk_count = topk + 1 if can_return_topk_plus_one else topk
+    topk_plus_one_indices = None
+
+    def _trim_topk_plus_one(
+        top_values: torch.Tensor, top_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nonlocal topk_plus_one_indices
+        if can_return_topk_plus_one:
+            topk_plus_one_indices = top_indices[:, topk : topk + 1]
+            top_values = top_values[:, :topk]
+            top_indices = top_indices[:, :topk]
+        return top_values, top_indices
 
     # Precision notes:
     # - Logits are converted to fp32 for score functions.
@@ -1197,13 +1349,18 @@ def topk_routing_with_score_function(
             # and use the un-biased softmax scores as the routing weights.
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            top_values, top_indices = compute_topk(
+                scores_for_routing, topk_count, num_groups, group_topk
+            )
+            _, top_indices = _trim_topk_plus_one(top_values, top_indices)
             probs = torch.gather(scores, dim=1, index=top_indices)
         elif use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            probs, top_indices = compute_topk(scores, topk_count, num_groups, group_topk)
+            probs, top_indices = _trim_topk_plus_one(probs, top_indices)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            scores, top_indices = compute_topk(logits, topk_count, num_groups, group_topk)
+            scores, top_indices = _trim_topk_plus_one(scores, top_indices)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
@@ -1212,10 +1369,14 @@ def topk_routing_with_score_function(
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            top_values, top_indices = compute_topk(
+                scores_for_routing, topk_count, num_groups, group_topk
+            )
+            _, top_indices = _trim_topk_plus_one(top_values, top_indices)
             scores = torch.gather(scores, dim=1, index=top_indices)
         else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            scores, top_indices = compute_topk(scores, topk_count, num_groups, group_topk)
+            scores, top_indices = _trim_topk_plus_one(scores, top_indices)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
@@ -1226,6 +1387,8 @@ def topk_routing_with_score_function(
     probs = probs.type_as(logits)
 
     if dense_output:
+        if return_topk_plus_one_indices:
+            return probs, top_indices, topk_plus_one_indices
         return probs, top_indices
 
     if torch.are_deterministic_algorithms_enabled():
@@ -1244,6 +1407,10 @@ def topk_routing_with_score_function(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
+    if return_top_indices:
+        if return_topk_plus_one_indices:
+            return routing_probs, routing_map, top_indices, topk_plus_one_indices
+        return routing_probs, routing_map, top_indices
     return routing_probs, routing_map
 
 
@@ -1253,7 +1420,13 @@ def compute_routing_scores_for_aux_loss(
     score_function: str,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_top_indices: bool = False,
+    return_topk_plus_one_indices: bool = False,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+]:
     """Compute routing scores based on the score function.
 
     Args:
@@ -1265,15 +1438,25 @@ def compute_routing_scores_for_aux_loss(
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
                                                False for padding tokens. Defaults to None.
+        return_top_indices (bool, optional): If True, return top-k expert indices alongside the
+                                             routing map and scores. Defaults to False.
+        return_topk_plus_one_indices (bool, optional): If True, return the best unselected expert
+                                                       index. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
+        If return_top_indices=True, returns routing map, scores, and top-k expert indices.
+        If return_topk_plus_one_indices=True, also returns top-k-plus-one expert indices.
     """
+    top_indices = None
+    topk_plus_one_indices = None
     if fused:
         if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
+        if return_top_indices or return_topk_plus_one_indices:
+            raise ValueError("Returning top-k details is not supported with fused aux score computation.")
         if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
             raise ValueError(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
@@ -1294,7 +1477,11 @@ def compute_routing_scores_for_aux_loss(
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        topk_count = topk + 1 if return_topk_plus_one_indices and topk < logits.size(1) else topk
+        _, top_indices = torch.topk(scores, k=topk_count, dim=1)
+        if return_topk_plus_one_indices and topk_count > topk:
+            topk_plus_one_indices = top_indices[:, topk : topk + 1]
+            top_indices = top_indices[:, :topk]
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     # Apply padding mask to scores if provided
@@ -1303,6 +1490,10 @@ def compute_routing_scores_for_aux_loss(
         valid_mask = (~padding_mask).unsqueeze(-1)
         routing_map = routing_map * valid_mask
         scores = scores * valid_mask
+    if return_top_indices:
+        if return_topk_plus_one_indices:
+            return routing_map, scores, top_indices, topk_plus_one_indices
+        return routing_map, scores, top_indices
     return routing_map, scores
 
 
