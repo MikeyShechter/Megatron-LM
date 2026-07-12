@@ -772,6 +772,10 @@ def _get_megatron_emerging_optimizer(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            if getattr(param, 'is_moe_learnable_bias_parameter', False):
+                param.moe_learnable_bias_use_sgd_optimizer = (
+                    config.moe_learnable_bias_use_sgd
+                )
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             # TODO(deyuf): support MLA
@@ -780,6 +784,11 @@ def _get_megatron_emerging_optimizer(
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if config.moe_learnable_bias_use_sgd:
+        moe_learnable_bias_key = ParamKey(attr='is_moe_learnable_bias_parameter')
+        moe_learnable_bias_override = dict(config_overrides.get(moe_learnable_bias_key, {}))
+        moe_learnable_bias_override['optimizer'] = 'sgd'
+        config_overrides[moe_learnable_bias_key] = moe_learnable_bias_override
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.

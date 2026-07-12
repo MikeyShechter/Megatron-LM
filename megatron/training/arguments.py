@@ -3273,6 +3273,11 @@ def _add_moe_args(parser):
                                          dest='tie_learnable_bias_lr_to_aux_loss_coeff',
                                          help='Set moe_learnable_bias_lr_mult to '
                                               'moe_aux_loss_coeff so both scales move together.')
+    group.add_argument('--moe-learnable-bias-use-sgd',
+                       action='store_true', default=False,
+                       dest='moe_learnable_bias_use_sgd',
+                       help='Optimize learnable MoE routing bias parameters with SGD '
+                            'instead of their default Muon/AdamW assignment.')
     group.add_argument('--moe-use-global-lb', '--use-global-lb',
                        action='store_true', default=False,
                        dest='moe_use_global_lb',

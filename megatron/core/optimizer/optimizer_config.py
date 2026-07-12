@@ -210,6 +210,10 @@ class OptimizerConfig:
     """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
     via config_overrides to use different optimizers for different parameters."""
 
+    moe_learnable_bias_use_sgd: bool = False
+    """If true, optimize learnable MoE routing bias parameters with SGD in mixed optimizer
+    setups such as Muon + AdamW."""
+
     ###############
     # Loss scaling
     ###############

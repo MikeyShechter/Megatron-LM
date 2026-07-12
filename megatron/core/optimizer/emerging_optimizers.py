@@ -127,6 +127,8 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 
 def _is_nonlinear_or_embedding(param):
     """True for parameters that should NOT use the emerging optimizer."""
+    if getattr(param, 'moe_learnable_bias_use_sgd_optimizer', False):
+        return False
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
