@@ -94,7 +94,14 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+param_group_identifier_keys = (
+    'wd_mult',
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+    'max_lr',
+    'min_lr',
+)
 
 
 class MegatronOptimizer(ABC):
@@ -413,7 +420,7 @@ class MegatronOptimizer(ABC):
     ) -> List[Dict]:
         """Filter and reorder state_dict parameter groups to match current optimizer groups.
         Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr, max_lr, min_lr)
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.

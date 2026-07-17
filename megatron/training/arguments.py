@@ -3238,18 +3238,25 @@ def _add_moe_args(parser):
                        dest='moe_load_balance_gate_threshold',
                        help='Threshold for moe_load_balance_gate_metric.')
     group.add_argument('--moe-learnable-bias-type',
-                       type=str, choices=['none', 'expert_bias', 'per_token_bias'],
+                       type=str, choices=[
+                           'none',
+                           'expert_bias',
+                           'per_token_bias',
+                           'per_token_expert_bias',
+                       ],
                        default='none',
                        dest='moe_learnable_bias_type',
                        help='Learnable routing biases added to the scores for top-k selection '
                             '(DeepSeek-style; gating weights stay unbiased), trained by the '
                             'direct routed-load (STE) losses. "expert_bias": one bias per '
                             'expert; "per_token_bias": per-token biases from a linear layer '
-                            'like the router gate. Works with any direct load balancing type.')
+                            'like the router gate; "per_token_expert_bias": per-token biases '
+                            'from a linear layer plus one bias per expert. Works with any '
+                            'direct load balancing type.')
     group.add_argument('--moe-learnable-bias-pass-grad-through-scores',
                        action='store_true', default=False,
                        dest='moe_learnable_bias_pass_grad_through_scores',
-                       help='For learnable_expert_biases/learnable_per_token_biases load '
+                       help='For learnable MoE routing biases load '
                             'balancing: pass the STE gradient of the LB loss through the '
                             'routing scores p as well as the biases. If unset, only the '
                             'biases receive gradient.')
@@ -3265,9 +3272,8 @@ def _add_moe_args(parser):
     learnable_bias_lr_group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,
                                          dest='moe_learnable_bias_lr_mult',
                                          help='Learning-rate multiplier for learnable MoE '
-                                              'routing bias parameters. Applies to both '
-                                              'expert_bias and per_token_bias while preserving '
-                                              'their optimizer assignment.')
+                                              'routing bias parameters while preserving their '
+                                              'optimizer assignment.')
     learnable_bias_lr_group.add_argument('--tie-learnable-bias-lr-to-aux-loss-coeff',
                                          action='store_true', default=False,
                                          dest='tie_learnable_bias_lr_to_aux_loss_coeff',

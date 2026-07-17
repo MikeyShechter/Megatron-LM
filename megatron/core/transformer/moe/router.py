@@ -228,7 +228,11 @@ class TopKRouter(Router):
         self.learnable_bias_weight = None
         self._per_token_bias = None
         if self.learnable_bias_type != "none":
-            assert self.learnable_bias_type in ("expert_bias", "per_token_bias"), (
+            assert self.learnable_bias_type in (
+                "expert_bias",
+                "per_token_bias",
+                "per_token_expert_bias",
+            ), (
                 f"Invalid moe_learnable_bias_type: {self.learnable_bias_type}"
             )
             assert not self.enable_expert_bias, (
@@ -237,12 +241,12 @@ class TopKRouter(Router):
             assert not self.config.moe_router_fusion, (
                 "learnable routing biases are not supported with moe_router_fusion"
             )
-        if self.learnable_bias_type == "expert_bias":
+        if self.learnable_bias_type in ("expert_bias", "per_token_expert_bias"):
             self.learnable_expert_biases = torch.nn.Parameter(
                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
             )
             setattr(self.learnable_expert_biases, 'is_moe_learnable_bias_parameter', True)
-        if self.learnable_bias_type == "per_token_bias":
+        if self.learnable_bias_type in ("per_token_bias", "per_token_expert_bias"):
             self.learnable_bias_weight = torch.nn.Parameter(
                 torch.empty(
                     (self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32
@@ -464,11 +468,13 @@ class TopKRouter(Router):
 
     def _get_learnable_routing_bias(self):
         """Return the learnable routing bias ([num_experts] or [num_tokens, num_experts])."""
-        if self.learnable_expert_biases is not None:
-            return self.learnable_expert_biases.float()
+        bias = None
         if self._per_token_bias is not None:
-            return self._per_token_bias.view(-1, self.config.num_moe_experts)
-        return None
+            bias = self._per_token_bias.view(-1, self.config.num_moe_experts).float()
+        if self.learnable_expert_biases is not None:
+            expert_bias = self.learnable_expert_biases.float()
+            bias = expert_bias if bias is None else bias + expert_bias
+        return bias
 
     def _compute_selection_scores(self, logits: torch.Tensor) -> torch.Tensor:
         """Scores p = activation(logits), matching what top-k selection uses."""
