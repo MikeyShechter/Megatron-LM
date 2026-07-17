@@ -79,7 +79,10 @@ class Router(ABC, MegatronModule):
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:
-            self.config.init_method(self.weight)
+            if self.config.init_moe_router_zero:
+                torch.nn.init.zeros_(self.weight)
+            else:
+                self.config.init_method(self.weight)
             if self.bias is not None:
                 self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
@@ -245,8 +248,9 @@ class TopKRouter(Router):
                     (self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32
                 )
             )
-            if self.config.perform_initialization:
-                self.config.init_method(self.learnable_bias_weight)
+            torch.nn.init.zeros_(self.learnable_bias_weight)
+            # if self.config.perform_initialization:
+            #     self.config.init_method(self.learnable_bias_weight)
             self.learnable_bias_weight.data = self.learnable_bias_weight.data.to(
                 dtype=self.config.params_dtype
             )
@@ -953,6 +957,7 @@ class TopKRouter(Router):
                 return_topk_plus_one_indices=(
                     should_return_selection_top_indices and should_return_topk_plus_one_indices
                 ),
+                random_tie_breaking=self.config.init_moe_router_zero,
             )
             if (
                 should_return_selection_top_indices

@@ -1197,6 +1197,7 @@ def topk_routing_with_score_function(
     dense_output: bool = False,
     return_top_indices: bool = False,
     return_topk_plus_one_indices: bool = False,
+    random_tie_breaking: bool = False,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1230,6 +1231,8 @@ def topk_routing_with_score_function(
         return_topk_plus_one_indices (bool, optional): If True, return the best unselected expert
                                                        index when it can be computed from the same
                                                        top-k operation. Defaults to False.
+        random_tie_breaking (bool, optional): If True, add tiny random routing-only noise before
+                                              top-k to break exact ties. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1295,9 +1298,14 @@ def topk_routing_with_score_function(
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The top-k indices and the top-k scores.
         """
+        scores_for_topk = scores
+        if random_tie_breaking:
+            scores_for_topk = (
+                scores.float() + torch.rand_like(scores, dtype=torch.float32) * 1e-7
+            )
         if group_topk:
-            return group_limited_topk(
-                scores=scores,
+            _, top_indices = group_limited_topk(
+                scores=scores_for_topk,
                 topk=topk,
                 num_tokens=num_tokens,
                 num_experts=num_experts,
@@ -1307,7 +1315,9 @@ def topk_routing_with_score_function(
         else:
             # Sorting top-k turned off during inference
             sorted_topk = torch.is_grad_enabled() or can_return_topk_plus_one
-            return torch.topk(scores, k=topk, dim=1, sorted=sorted_topk)
+            _, top_indices = torch.topk(scores_for_topk, k=topk, dim=1, sorted=sorted_topk)
+        top_values = torch.gather(scores, dim=1, index=top_indices)
+        return top_values, top_indices
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
