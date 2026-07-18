@@ -466,14 +466,27 @@ class TopKRouter(Router):
             )
         return probs
 
-    def _get_learnable_routing_bias(self):
-        """Return the learnable routing bias ([num_experts] or [num_tokens, num_experts])."""
-        bias = None
+    def _get_raw_learnable_routing_bias_components(self):
+        """Return raw expert, per-token, and combined learnable routing biases."""
+        expert_bias = None
+        token_bias = None
         if self._per_token_bias is not None:
-            bias = self._per_token_bias.view(-1, self.config.num_moe_experts).float()
+            token_bias = self._per_token_bias.view(-1, self.config.num_moe_experts).float()
         if self.learnable_expert_biases is not None:
             expert_bias = self.learnable_expert_biases.float()
-            bias = expert_bias if bias is None else bias + expert_bias
+        if token_bias is None:
+            combined_bias = expert_bias
+        elif expert_bias is None:
+            combined_bias = token_bias
+        else:
+            combined_bias = token_bias + expert_bias
+        return expert_bias, token_bias, combined_bias
+
+    def _get_learnable_routing_bias(self):
+        """Return the learnable routing bias ([num_experts] or [num_tokens, num_experts])."""
+        _, _, bias = self._get_raw_learnable_routing_bias_components()
+        if bias is not None and getattr(self.config, "moe_learnable_bias_sqrtsoftplus", False):
+            bias = torch.nn.functional.softplus(bias.float()).sqrt()
         return bias
 
     def _compute_selection_scores(self, logits: torch.Tensor) -> torch.Tensor:
@@ -629,6 +642,83 @@ class TopKRouter(Router):
         )
         save_to_router_metrics_tracker(
             "ste_over_rect_count", ste_over_rect_count, layer_number, num_layers
+        )
+
+        if not self.training:
+            self._save_pre_activation_value_metrics(
+                "router_logits", logits, valid_tokens, token_count, layer_number, num_layers
+            )
+            expert_bias, token_bias, combined_bias = (
+                self._get_raw_learnable_routing_bias_components()
+            )
+            if expert_bias is not None:
+                self._save_pre_activation_value_metrics(
+                    "learnable_expert_bias",
+                    expert_bias,
+                    valid_tokens,
+                    token_count,
+                    layer_number,
+                    num_layers,
+                )
+            if token_bias is not None:
+                self._save_pre_activation_value_metrics(
+                    "learnable_token_bias",
+                    token_bias,
+                    valid_tokens,
+                    token_count,
+                    layer_number,
+                    num_layers,
+                )
+            if expert_bias is not None and token_bias is not None:
+                self._save_pre_activation_value_metrics(
+                    "learnable_both_bias",
+                    combined_bias,
+                    valid_tokens,
+                    token_count,
+                    layer_number,
+                    num_layers,
+                )
+
+    def _save_pre_activation_value_metrics(
+        self,
+        name: str,
+        values: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        token_count: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+    ) -> None:
+        """Save validation-only pre-activation top1/top2/mean summaries."""
+        values = values.detach().float()
+        if values.dim() == 1:
+            top_values = torch.topk(values, k=min(2, values.size(0)), dim=0).values
+            top1_sum = top_values[0] * token_count
+            top2_sum = top_values[1] * token_count if top_values.numel() > 1 else top1_sum
+            value_sum = values.sum() * token_count
+            value_count = token_count * values.new_tensor(values.numel())
+            top_count = token_count
+        else:
+            values = values.view(-1, self.config.num_moe_experts)
+            values = values[valid_tokens]
+            top_values = torch.topk(values, k=min(2, values.size(-1)), dim=-1).values
+            top1_sum = top_values[:, 0].sum()
+            top2_sum = top_values[:, 1].sum() if top_values.size(-1) > 1 else top1_sum
+            value_sum = values.sum()
+            value_count = values.new_tensor(values.numel())
+            top_count = values.new_tensor(values.size(0))
+
+        save_to_router_metrics_tracker(
+            f"{name}_top1_pre_activation_sum", top1_sum, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            f"{name}_top2_pre_activation_sum", top2_sum, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            f"{name}_pre_activation_sum", value_sum, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(f"{name}_top_count", top_count, layer_number, num_layers)
+        save_to_router_metrics_tracker(
+            f"{name}_value_count", value_count, layer_number, num_layers
         )
 
     def _apply_seq_aux_loss(

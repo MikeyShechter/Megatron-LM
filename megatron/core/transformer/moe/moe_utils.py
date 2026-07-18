@@ -67,6 +67,29 @@ _MOE_ROUTER_METRIC_SPECS = {
     "ste_over_rect_count": "expert",
 }
 
+for _pre_activation_metric_name in (
+    "router_logits",
+    "learnable_expert_bias",
+    "learnable_token_bias",
+    "learnable_both_bias",
+):
+    _MOE_ROUTER_METRIC_SPECS.update(
+        {
+            f"{_pre_activation_metric_name}_top1_pre_activation_sum": "scalar",
+            f"{_pre_activation_metric_name}_top2_pre_activation_sum": "scalar",
+            f"{_pre_activation_metric_name}_pre_activation_sum": "scalar",
+            f"{_pre_activation_metric_name}_top_count": "scalar",
+            f"{_pre_activation_metric_name}_value_count": "scalar",
+        }
+    )
+
+_PRE_ACTIVATION_METRIC_LOG_NAMES = {
+    "router_logits": "router_logits",
+    "learnable_expert_bias": "router_bias/expert",
+    "learnable_token_bias": "router_bias/token",
+    "learnable_both_bias": "router_bias/both",
+}
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -1715,6 +1738,32 @@ def _validation_metric_prefixes(prefix: str, metric_root: str) -> List[str]:
     return [f"{metric_root}/{validation_name}"]
 
 
+def _add_pre_activation_metric_logs(
+    log: dict[str, float],
+    metrics: dict[str, torch.Tensor],
+    effective_prefix: str,
+) -> None:
+    """Add validation pre-activation router/bias summaries to the log dict."""
+    for metric_name, log_name in _PRE_ACTIVATION_METRIC_LOG_NAMES.items():
+        top_count = metrics[f"{metric_name}_top_count"].float().sum()
+        value_count = metrics[f"{metric_name}_value_count"].float().sum()
+        if top_count.item() <= 0 or value_count.item() <= 0:
+            continue
+
+        top1_sum = metrics[f"{metric_name}_top1_pre_activation_sum"].float().sum()
+        top2_sum = metrics[f"{metric_name}_top2_pre_activation_sum"].float().sum()
+        value_sum = metrics[f"{metric_name}_pre_activation_sum"].float().sum()
+        log[f"{effective_prefix}/{log_name}/top1_pre_activation"] = float(
+            (top1_sum / top_count).item()
+        )
+        log[f"{effective_prefix}/{log_name}/top2_pre_activation"] = float(
+            (top2_sum / top_count).item()
+        )
+        log[f"{effective_prefix}/{log_name}/avg_pre_activation"] = float(
+            (value_sum / value_count).item()
+        )
+
+
 def _build_moe_router_metrics_log(
     metrics: dict[str, torch.Tensor],
     prefix: str,
@@ -1751,6 +1800,9 @@ def _build_moe_router_metrics_log(
     mean_entropy = float(_mean_active(entropy_per_layer, active_layers).item())
 
     log: dict[str, float] = {}
+    if prefix == "val" or prefix.startswith("val/"):
+        _add_pre_activation_metric_logs(log, metrics, effective_prefix)
+
     if task_specific_validation:
         task_name = prefix.split("/", 1)[1]
         log[f"task_entropy/{task_name}"] = mean_entropy
