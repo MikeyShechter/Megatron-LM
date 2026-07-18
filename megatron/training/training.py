@@ -208,6 +208,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import (
+    MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY,
     clear_aux_losses_tracker,
     clear_moe_router_metrics_tracker,
     get_load_balance_ste_params,
@@ -2072,6 +2073,98 @@ def _get_num_moe_logging_layers(args):
     return args.num_layers
 
 
+def _shift_moe_aux_loss_coeff(coeff, delta):
+    if isinstance(coeff, list):
+        return [value + delta for value in coeff]
+    return coeff + delta
+
+
+def _log_moe_aux_loss_coeff_to_wandb(wandb_writer, coeff, iteration):
+    if not wandb_writer:
+        return
+
+    if isinstance(coeff, list):
+        wandb_writer.log(
+            {f"train/moe_aux_loss_coeff/{idx}": value for idx, value in enumerate(coeff)},
+            iteration,
+        )
+    else:
+        wandb_writer.log({"train/moe_aux_loss_coeff": coeff}, iteration)
+
+
+def _param_group_matches_tied_moe_learnable_bias_lr(param_group, old_max_lr, old_min_lr):
+    if param_group.get('default_config', True) or param_group.get('is_decoupled_lr', False):
+        return False
+
+    group_max_lr = param_group.get('max_lr')
+    if group_max_lr is None or not math.isclose(float(group_max_lr), old_max_lr):
+        return False
+
+    group_min_lr = param_group.get('min_lr')
+    if old_min_lr is None:
+        return group_min_lr is None
+    return group_min_lr is not None and math.isclose(float(group_min_lr), old_min_lr)
+
+
+def _update_tied_moe_learnable_bias_lr(
+    args, optimizer, opt_param_scheduler, old_coeff, new_coeff
+):
+    if (
+        optimizer is None
+        or opt_param_scheduler is None
+        or isinstance(old_coeff, list)
+        or isinstance(new_coeff, list)
+    ):
+        return
+
+    old_max_lr = args.lr * old_coeff
+    new_max_lr = args.lr * new_coeff
+    old_min_lr = args.min_lr * old_coeff if args.min_lr is not None else None
+    new_min_lr = args.min_lr * new_coeff if args.min_lr is not None else None
+
+    for param_group in optimizer.param_groups:
+        has_learnable_bias_param = any(
+            getattr(param, 'is_moe_learnable_bias_parameter', False)
+            for param in param_group.get('params', [])
+        )
+        if (
+            not has_learnable_bias_param
+            and not _param_group_matches_tied_moe_learnable_bias_lr(
+                param_group, old_max_lr, old_min_lr
+            )
+        ):
+            continue
+
+        param_group['max_lr'] = new_max_lr
+        if args.min_lr is not None:
+            param_group['min_lr'] = new_min_lr
+
+        lr = opt_param_scheduler.get_lr(param_group)
+        if isinstance(param_group.get('lr'), torch.Tensor):
+            param_group['lr'].fill_(lr)
+        else:
+            param_group['lr'] = lr
+
+
+def _maybe_update_moe_aux_loss_coeff_from_vio(
+    args, model_config, optimizer, opt_param_scheduler, current_vio
+):
+    update_rate = getattr(args, 'moe_aux_loss_coeff_update_rate', 0.0)
+    target_vio = getattr(args, 'moe_aux_loss_coeff_target_vio', 0.0)
+    delta = update_rate if current_vio > target_vio else -update_rate
+    old_coeff = args.moe_aux_loss_coeff
+    new_coeff = _shift_moe_aux_loss_coeff(old_coeff, delta)
+
+    args.moe_aux_loss_coeff = new_coeff
+    if model_config is not None:
+        model_config.moe_aux_loss_coeff = new_coeff
+    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+        args.moe_learnable_bias_lr_mult = new_coeff
+        _update_tied_moe_learnable_bias_lr(
+            args, optimizer, opt_param_scheduler, old_coeff, new_coeff
+        )
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -2087,6 +2180,9 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    model_config=None,
+    optimizer=None,
+    opt_param_scheduler=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2320,7 +2416,10 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
-        track_moe_router_metrics(
+        should_update_moe_aux_loss_coeff = (
+            getattr(args, 'moe_aux_loss_coeff_update_rate', 0.0) != 0.0 and not skipped_iter
+        )
+        router_metrics_log = track_moe_router_metrics(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
@@ -2331,7 +2430,14 @@ def training_log(
             num_experts=args.num_experts,
             moe_router_load_balancing_type=args.moe_router_load_balancing_type,
             pg_collection=pg_collection,
+            return_current_max_vio_global=should_update_moe_aux_loss_coeff,
         )
+        current_vio = router_metrics_log.get(MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY)
+        if should_update_moe_aux_loss_coeff and current_vio is not None:
+            _maybe_update_moe_aux_loss_coeff_from_vio(
+                args, model_config, optimizer, opt_param_scheduler, current_vio
+            )
+        _log_moe_aux_loss_coeff_to_wandb(wandb_writer, args.moe_aux_loss_coeff, iteration)
         if wandb_writer:
             _, ste_bandwidth, _ = get_load_balance_ste_params(args)
             wandb_writer.log({"train/ste_bandwidth": ste_bandwidth}, iteration)
@@ -3376,6 +3482,9 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            model_config=config,
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
         )
         is_first_iteration = False
 

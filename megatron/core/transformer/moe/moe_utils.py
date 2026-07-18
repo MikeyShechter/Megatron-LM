@@ -55,6 +55,7 @@ else:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 _MOE_ROUTER_METRICS_TRACKER: dict = {}
+MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY = "_current/MaxVioGlobal"
 
 _MOE_ROUTER_METRIC_SPECS = {
     "tokens_per_expert": "expert",
@@ -1723,6 +1724,24 @@ def _mean_active(values: torch.Tensor, active_layers: torch.Tensor) -> torch.Ten
     return values.new_tensor(0.0)
 
 
+def _compute_moe_router_max_vio_global(
+    metrics: dict[str, torch.Tensor], num_experts: int
+) -> Optional[float]:
+    if not metrics:
+        return None
+
+    tokens_per_expert = metrics["tokens_per_expert"].float()
+    assignment_count = tokens_per_expert.sum(dim=-1)
+    active_layers = assignment_count > 0
+    if not active_layers.any():
+        return None
+
+    target = tokens_per_expert.new_tensor(1.0 / num_experts)
+    load_frac = tokens_per_expert / assignment_count.clamp(min=1.0).unsqueeze(-1)
+    max_vio_per_layer = (load_frac.max(dim=-1).values - target) / target
+    return float(max_vio_per_layer[active_layers].mean().item())
+
+
 def _validation_metric_prefixes(prefix: str, metric_root: str) -> List[str]:
     if prefix == "val":
         return [metric_root]
@@ -1883,6 +1902,7 @@ def track_moe_router_metrics(
     num_experts: Optional[int] = None,
     moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss",
     pg_collection: Optional[ProcessGroupCollection] = None,
+    return_current_max_vio_global: bool = False,
 ) -> dict[str, float]:
     """Reduce and log accumulated MoE router diagnostics."""
     tracker = get_moe_router_metrics_tracker()
@@ -1893,6 +1913,9 @@ def track_moe_router_metrics(
         _initialize_router_metrics_tracker(num_layers, num_experts, device)
 
     reduce_moe_router_metrics_tracker_across_ranks(pg_collection=pg_collection)
+    current_max_vio_global = None
+    if return_current_max_vio_global:
+        current_max_vio_global = _compute_moe_router_max_vio_global(tracker, num_experts)
     log = _build_moe_router_metrics_log(
         tracker,
         prefix=prefix,
@@ -1906,6 +1929,9 @@ def track_moe_router_metrics(
             writer.add_scalar(key, value, iteration)
     if wandb_writer and log:
         wandb_writer.log(log, iteration)
+
+    if current_max_vio_global is not None:
+        log[MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY] = current_max_vio_global
 
     clear_moe_router_metrics_tracker()
     return log
