@@ -2075,8 +2075,8 @@ def _get_num_moe_logging_layers(args):
 
 def _shift_moe_aux_loss_coeff(coeff, delta):
     if isinstance(coeff, list):
-        return [value + delta for value in coeff]
-    return coeff + delta
+        return [max(0.0, value + delta) for value in coeff]
+    return max(0.0, coeff + delta)
 
 
 def _log_moe_aux_loss_coeff_to_wandb(wandb_writer, coeff, iteration):
