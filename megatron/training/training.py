@@ -173,6 +173,7 @@ from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
     load_checkpoint,
+    load_moe_aux_loss_coeff_from_checkpoint,
     save_checkpoint,
     save_grads,
     should_save_pre_decay_checkpoint,
@@ -1697,6 +1698,15 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
+    load_optimizer = (
+        not skip_optimizer
+        and args.load is not None
+        and not args.finetune
+        and not args.no_load_optim
+    )
+    restored_moe_aux_loss_coeff = _restore_tied_moe_aux_loss_coeff_for_resume(
+        args, checkpointing_context, load_optimizer
+    )
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
@@ -1797,6 +1807,14 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        if restored_moe_aux_loss_coeff is not None:
+            _clamp_restored_moe_aux_loss_coeff_after_load(
+                args,
+                unwrapped_model,
+                optimizer,
+                opt_param_scheduler,
+                restored_moe_aux_loss_coeff,
+            )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -2073,10 +2091,71 @@ def _get_num_moe_logging_layers(args):
     return args.num_layers
 
 
+def _clamp_moe_aux_loss_coeff(coeff):
+    if isinstance(coeff, list):
+        return [max(0.0, value) for value in coeff]
+    return max(0.0, coeff)
+
+
 def _shift_moe_aux_loss_coeff(coeff, delta):
     if isinstance(coeff, list):
-        return [max(0.0, value + delta) for value in coeff]
-    return max(0.0, coeff + delta)
+        return _clamp_moe_aux_loss_coeff([value + delta for value in coeff])
+    return _clamp_moe_aux_loss_coeff(coeff + delta)
+
+
+def _set_moe_aux_loss_coeff(args, coeff):
+    args.moe_aux_loss_coeff = coeff
+    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+        args.moe_learnable_bias_lr_mult = coeff
+
+
+def _restore_tied_moe_aux_loss_coeff_for_resume(
+    args, checkpointing_context, load_optimizer
+):
+    if (
+        not getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False)
+        or args.load is None
+        or args.moe_use_upcycling
+        or args.finetune
+    ):
+        return None
+
+    checkpoint_coeff = load_moe_aux_loss_coeff_from_checkpoint(
+        args, checkpointing_context=checkpointing_context
+    )
+    if checkpoint_coeff is None:
+        return None
+
+    setup_coeff = (
+        checkpoint_coeff if load_optimizer else _clamp_moe_aux_loss_coeff(checkpoint_coeff)
+    )
+    _set_moe_aux_loss_coeff(args, setup_coeff)
+    print_rank_0(
+        f"Restored moe_aux_loss_coeff={setup_coeff} from checkpoint before "
+        "building tied learnable-bias LR groups"
+    )
+    return checkpoint_coeff
+
+
+def _clamp_restored_moe_aux_loss_coeff_after_load(
+    args, unwrapped_model, optimizer, opt_param_scheduler, restored_coeff
+):
+    clamped_coeff = _clamp_moe_aux_loss_coeff(restored_coeff)
+    if clamped_coeff == restored_coeff:
+        return
+
+    _set_moe_aux_loss_coeff(args, clamped_coeff)
+    model_config_source = (
+        unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
+    )
+    get_model_config(model_config_source).moe_aux_loss_coeff = clamped_coeff
+    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+        _update_tied_moe_learnable_bias_lr(
+            args, optimizer, opt_param_scheduler, restored_coeff, clamped_coeff
+        )
+    print_rank_0(
+        f"Clamped restored moe_aux_loss_coeff from {restored_coeff} to {clamped_coeff}"
+    )
 
 
 def _log_moe_aux_loss_coeff_to_wandb(wandb_writer, coeff, iteration):

@@ -1692,6 +1692,30 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def load_moe_aux_loss_coeff_from_checkpoint(
+    args, load_arg='load', checkpointing_context=None
+):
+    """Return checkpointed moe_aux_loss_coeff from common checkpoint metadata."""
+    load_dir = getattr(args, load_arg)
+    if load_dir is None:
+        return None
+
+    state_dict, _, _, _ = _load_base_checkpoint(
+        load_dir,
+        args,
+        rank0=True,
+        checkpointing_context=checkpointing_context,
+    )
+    if not state_dict:
+        return None
+
+    checkpoint_args = state_dict.get('args')
+    if checkpoint_args is None:
+        return None
+
+    return getattr(checkpoint_args, 'moe_aux_loss_coeff', None)
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.
