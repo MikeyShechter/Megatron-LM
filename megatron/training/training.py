@@ -2171,6 +2171,11 @@ def _log_moe_aux_loss_coeff_to_wandb(wandb_writer, coeff, iteration):
         wandb_writer.log({"train/moe_aux_loss_coeff": coeff}, iteration)
 
 
+def _log_moe_router_bias_update_rate_to_wandb(wandb_writer, update_rate, iteration):
+    if wandb_writer:
+        wandb_writer.log({"train/moe_router_bias_update_rate": update_rate}, iteration)
+
+
 def _param_group_matches_tied_moe_learnable_bias_lr(param_group, old_max_lr, old_min_lr):
     if param_group.get('default_config', True) or param_group.get('is_decoupled_lr', False):
         return False
@@ -2225,20 +2230,27 @@ def _update_tied_moe_learnable_bias_lr(
             param_group['lr'] = lr
 
 
-def _maybe_update_moe_aux_loss_coeff_from_vio(
+def _maybe_update_moe_balance_control_from_vio(
     args, model_config, optimizer, opt_param_scheduler, current_vio
 ):
-    update_rate = getattr(args, 'moe_aux_loss_coeff_update_rate', 0.0)
-    target_vio = getattr(args, 'moe_aux_loss_coeff_target_vio', 0.0)
+    update_rate = getattr(args, 'moe_balance_update_rate', 0.0)
+    target_vio = getattr(args, 'moe_balance_target_vio', 0.0)
     delta = update_rate if current_vio > target_vio else -update_rate
+
+    if getattr(args, 'moe_router_enable_expert_bias', False):
+        new_update_rate = max(0.0, args.moe_router_bias_update_rate + delta)
+        args.moe_router_bias_update_rate = new_update_rate
+        if model_config is not None:
+            model_config.moe_router_bias_update_rate = new_update_rate
+        return
+
     old_coeff = args.moe_aux_loss_coeff
     new_coeff = _shift_moe_aux_loss_coeff(old_coeff, delta)
 
-    args.moe_aux_loss_coeff = new_coeff
+    _set_moe_aux_loss_coeff(args, new_coeff)
     if model_config is not None:
         model_config.moe_aux_loss_coeff = new_coeff
     if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
-        args.moe_learnable_bias_lr_mult = new_coeff
         _update_tied_moe_learnable_bias_lr(
             args, optimizer, opt_param_scheduler, old_coeff, new_coeff
         )
@@ -2495,8 +2507,8 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
-        should_update_moe_aux_loss_coeff = (
-            getattr(args, 'moe_aux_loss_coeff_update_rate', 0.0) != 0.0 and not skipped_iter
+        should_update_moe_balance_control = (
+            getattr(args, 'moe_balance_update_rate', 0.0) != 0.0 and not skipped_iter
         )
         router_metrics_log = track_moe_router_metrics(
             loss_scale=moe_loss_scale,
@@ -2509,14 +2521,18 @@ def training_log(
             num_experts=args.num_experts,
             moe_router_load_balancing_type=args.moe_router_load_balancing_type,
             pg_collection=pg_collection,
-            return_current_max_vio_global=should_update_moe_aux_loss_coeff,
+            return_current_max_vio_global=should_update_moe_balance_control,
         )
         current_vio = router_metrics_log.get(MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY)
-        if should_update_moe_aux_loss_coeff and current_vio is not None:
-            _maybe_update_moe_aux_loss_coeff_from_vio(
+        if should_update_moe_balance_control and current_vio is not None:
+            _maybe_update_moe_balance_control_from_vio(
                 args, model_config, optimizer, opt_param_scheduler, current_vio
             )
         _log_moe_aux_loss_coeff_to_wandb(wandb_writer, args.moe_aux_loss_coeff, iteration)
+        if getattr(args, 'moe_router_enable_expert_bias', False):
+            _log_moe_router_bias_update_rate_to_wandb(
+                wandb_writer, args.moe_router_bias_update_rate, iteration
+            )
         if wandb_writer:
             _, ste_bandwidth, _ = get_load_balance_ste_params(args)
             wandb_writer.log({"train/ste_bandwidth": ste_bandwidth}, iteration)
