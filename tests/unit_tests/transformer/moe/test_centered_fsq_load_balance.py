@@ -31,6 +31,14 @@ def _topk_plus_one_indices(logits, topk):
     return topk_plus_one[:, topk : topk + 1]
 
 
+def _router_activation(logits, score_function):
+    if score_function == "sigmoid":
+        return torch.sigmoid(logits.float())
+    if score_function == "sqrtsoftplus":
+        return torch.nn.functional.softplus(logits.float()).sqrt()
+    raise ValueError(f"Unsupported test score function: {score_function}")
+
+
 def _reference_direct_load_balance_from_load(load_frac, num_experts, load_balancing_type):
     expected_frac = load_frac.new_tensor(1.0 / num_experts)
     num_experts_tensor = load_frac.new_tensor(float(num_experts))
@@ -553,6 +561,61 @@ def test_topk_routing_returns_sorted_topk_plus_one_indices_under_no_grad():
         )
 
     assert torch.equal(topk_plus_one_indices, expected_topk_plus_one)
+
+
+@pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("topk", [1, 2])
+def test_sigmoid_like_topk_routing_weights_are_normalized(score_function, topk):
+    logits = torch.tensor(
+        [
+            [2.0, -1.0, 0.5, -2.0],
+            [-0.7, 1.4, 0.3, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    activated_scores = _router_activation(logits, score_function)
+    top_indices = torch.topk(activated_scores, k=topk, dim=-1).indices
+    top_scores = torch.gather(activated_scores, dim=-1, index=top_indices)
+    top_probs = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
+    expected_probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
+
+    routing_probs, routing_map = topk_routing_with_score_function(
+        logits,
+        topk=topk,
+        score_function=score_function,
+    )
+
+    torch.testing.assert_close(routing_probs, expected_probs)
+    torch.testing.assert_close(routing_probs.sum(dim=-1), torch.ones(logits.size(0)))
+    assert torch.equal(routing_map, expected_probs.bool())
+
+
+@pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
+def test_aux_routing_scores_use_normalized_sigmoid_like_activation_for_pe(score_function):
+    logits = torch.tensor(
+        [
+            [2.0, -1.0, 0.5, -2.0],
+            [-0.7, 1.4, 0.3, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    activated_scores = _router_activation(logits, score_function)
+    expected_scores = activated_scores / (activated_scores.sum(dim=-1, keepdim=True) + 1e-20)
+    expected_top_indices = torch.topk(expected_scores, k=2, dim=-1).indices
+    expected_routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+        1, expected_top_indices, True
+    )
+    expected_pe = expected_scores.sum(dim=0)
+
+    routing_map, scores = compute_routing_scores_for_aux_loss(
+        logits,
+        topk=2,
+        score_function=score_function,
+    )
+
+    torch.testing.assert_close(scores, expected_scores)
+    torch.testing.assert_close(scores.sum(dim=0), expected_pe)
+    assert torch.equal(routing_map, expected_routing_map)
 
 
 def test_aux_routing_scores_return_topk_plus_one_indices():
