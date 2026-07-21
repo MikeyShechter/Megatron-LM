@@ -39,16 +39,16 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["centered_fsq"]
-  moe_aux_loss_coeff: [0.0]
+  moe_router_load_balancing_type: ["centered_fsq_and_var", "noisy_centered_fsq"]
+  moe_aux_loss_coeff: [0.01]
 
   load_balance_ste_width: [0.1]
   load_balance_ste_type: ["rect"]
   # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
   moe_router_score_function: ["sqrtsoftplus"]
   # moe_learnable_bias_lr_mult: [0.1]
-  moe_learnable_bias_type: ['expert_bias']
-  moe_lm_loss_ste: [true,false]
+  # moe_learnable_bias_type: ['expert_bias']
+  # moe_lm_loss_ste: [true,false]
   # moe_learnable_bias_type: ['expert_bias','per_token_bias']
   # moe_learnable_bias_pass_grad_through_scores: [true, false]
 

@@ -1,5 +1,5 @@
 job_details:
-  name: test_learnable_bias_activation
+  name: sweep_target_maxvio
   output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
@@ -39,29 +39,46 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["centered_fsq"]
-  moe_aux_loss_coeff: [0.1]
-  # init_moe_router_zero: [true]
+
+  LIST_LB:
+    - moe_router_load_balancing_type: ["none"] # DeepSeek loss free
+      moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_rate: [0.0001]
+      moe_aux_loss_coeff: [0.0]
+      load_balance_ste_width: [0.0]
+      moe_learnable_bias_type: ['none']
+    - moe_router_load_balancing_type: ["aux_loss"] # standard global aux loss
+      moe_router_score_function: ["softmax"]
+      moe_router_enable_expert_bias: [false]
+      moe_router_bias_update_rate: [0.0]
+      moe_aux_loss_coeff: [0.001]
+      load_balance_ste_width: [0.0]
+      moe_learnable_bias_type: ['none']
+    - moe_router_load_balancing_type: ["centered_fsq"] # STE variants
+      moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_enable_expert_bias: [false]
+      moe_router_bias_update_rate: [0.0]
+      moe_aux_loss_coeff: [0.001]
+      load_balance_ste_width: [0.1]
+      moe_learnable_bias_type: ['none', 'expert_bias', 'per_token_bias']
   
   load_balance_ste_type: ["rect"]
-  # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
-  moe_router_score_function: ["sqrtsoftplus"]
-  moe_learnable_bias_pass_grad_through_scores: [true]
-  moe_learnable_bias_type: ['expert_bias']  # 'per_token_expert_bias'
-  load_balance_ste_width: [0.1]
-  moe_learnable_bias_sqrtsoftplus: [true]
 
   tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  moe_learnable_bias_pass_grad_through_scores: [true]  # , false
+
+  # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
+  # moe_learnable_bias_sqrtsoftplus: [true]
+
+  moe_balance_update_rate: [0.00001]
+  moe_balance_target_vio: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
 
   # moe_load_balance_gate_metric: ['maxvio'] # TODO, try with totalvio later
   # moe_load_balance_gate_threshold: [0.1, 0.3, 0.5, 0.7, 1.0]
 
   
   # moe_lm_loss_ste: [true]
-
-  # moe_router_enable_expert_bias: [true]
-  # moe_router_bias_update_rate: [0.0001]
-
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
   optimizer: ["muon"]

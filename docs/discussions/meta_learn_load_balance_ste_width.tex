@@ -1,0 +1,410 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bbm}
+\usepackage[margin=1in]{geometry}
+
+% Notation copied from the thesis proposal source in resources/PhD_thesis_proposal_Mikey/macros.tex.
+\newcommand{\indic}[1]{\mathbbm{1}_{\!\left\{#1\right\}}}
+\newcommand{\totalexperts}{E}
+\newcommand{\activeexperts}{K}
+\newcommand{\batchsize}{T}
+\newcommand{\routinglogits}{r}
+\newcommand{\assignmentfraction}{f}
+\newcommand{\modelparams}{\theta}
+\newcommand{\kthlargest}{m}
+\newcommand{\lbcoef}{\alpha}
+\newcommand{\bandwidth}{h}
+\newcommand{\rect}{\operatorname{Rect}}
+\newcommand{\dlbloss}{\mathcal{L}_{\mathrm{DLB}}}
+\newcommand{\TopK}{\operatorname{TopK}}
+\newcommand{\abs}[1]{\left\vert#1\right\vert}
+
+\title{One-step Meta-gradient for the DLB STE Bandwidth}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Setup}
+
+Let $\modelparams$ denote the model parameters, $\totalexperts$ the number of
+experts, $\activeexperts$ the number of active experts per token,
+$\batchsize$ the number of tokens, $\lbcoef$ the load-balance coefficient,
+and $\bandwidth>0$ the rectangular STE bandwidth.
+For token $t$ and expert $e$, define the top-$\activeexperts$ centered logit
+\[
+  z_e^{(t)}(\modelparams)
+  =
+  \routinglogits_e^{(t)}(\modelparams)
+  -
+  \kthlargest(\mathbf r^{(t)}(\modelparams)).
+\]
+The hard assignment fraction is
+\[
+  \assignmentfraction_e(\modelparams)
+  =
+  \frac{1}{\batchsize}
+  \sum_{t=1}^{\batchsize}
+  \indic{z_e^{(t)}(\modelparams)\geq 0}.
+\]
+
+\section{DLB Objective}
+
+\[
+  \dlbloss(\modelparams)
+  =
+  \lbcoef \cdot \totalexperts
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)^2.
+\]
+
+\section{STE Gradient}
+
+Define
+\[
+  \rect(u)=\indic{\abs{u}<0.5}.
+\]
+The STE estimate of the assignment-fraction gradient is
+\[
+  \widetilde{\nabla_{\modelparams}\assignmentfraction_e}
+  (\modelparams,\bandwidth)
+  =
+  \frac{1}{\batchsize}
+  \sum_{t=1}^{\batchsize}
+  \frac{1}{\bandwidth}
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  \nabla_{\modelparams} z_e^{(t)}(\modelparams).
+\]
+Therefore
+\[
+\begin{aligned}
+  \widetilde{\nabla_{\modelparams}\dlbloss}
+  (\modelparams,\bandwidth)
+  &=
+  \frac{2\lbcoef \cdot \totalexperts}{\batchsize}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \frac{1}{\bandwidth}
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  \nabla_{\modelparams} z_e^{(t)}(\modelparams).
+\end{aligned}
+\]
+
+\section{Meta Objective}
+
+Using one SGD inner step,
+\[
+  \modelparams^+(\bandwidth)
+  =
+  \modelparams
+  -
+  \eta
+  \left[
+    \nabla_{\modelparams} L_{\mathrm{LM}}(\modelparams)
+    +
+    \widetilde{\nabla_{\modelparams}\dlbloss}
+    (\modelparams,\bandwidth)
+  \right].
+\]
+Thus
+\[
+\begin{aligned}
+  L_{\mathrm{meta}}(\bandwidth)
+  &=
+  L_{\mathrm{LM}}(\modelparams^+(\bandwidth)) \\
+  &=
+  L_{\mathrm{LM}}
+  \left(
+    \modelparams
+    -
+    \eta
+    \left[
+      \nabla_{\modelparams} L_{\mathrm{LM}}(\modelparams)
+      +
+      \frac{2\lbcoef \cdot \totalexperts}{\batchsize}
+      \sum_{e=1}^{\totalexperts}
+      \left(
+        \assignmentfraction_e(\modelparams)
+        -
+        \frac{\activeexperts}{\totalexperts}
+      \right)
+      \sum_{t=1}^{\batchsize}
+      \frac{1}{\bandwidth}
+      \rect\!\left(
+        \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+      \right)
+      \nabla_{\modelparams} z_e^{(t)}(\modelparams)
+    \right]
+  \right).
+\end{aligned}
+\]
+
+\section{Hypergradient}
+
+Let
+\[
+  v =
+  \nabla_{\modelparams}L_{\mathrm{LM}}(\modelparams^+(\bandwidth)).
+\]
+Then
+\[
+\begin{aligned}
+  \frac{dL_{\mathrm{meta}}}{d\bandwidth}
+  &=
+  -\frac{2\eta\lbcoef \cdot \totalexperts}{\batchsize}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \frac{\partial}{\partial\bandwidth}
+  \left[
+    \frac{1}{\bandwidth}
+    \rect\!\left(
+      \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+    \right)
+  \right] \\
+  &=
+  -\frac{2\eta\lbcoef \cdot \totalexperts}{\batchsize}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \left[
+    -\frac{1}{\bandwidth^2}
+    \rect\!\left(
+      \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+    \right)
+    +
+    \frac{1}{\bandwidth}
+    \frac{\partial}{\partial\bandwidth}
+    \rect\!\left(
+      \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+    \right)
+  \right].
+\end{aligned}
+\]
+The $\bandwidth$ outside $\rect(\cdot)$ is the rectangle height.  The
+$\bandwidth$ inside $\rect(\cdot)$ is the rectangle width, but with the hard
+indicator,
+\[
+  \frac{\partial}{\partial\bandwidth}
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  =
+  0.
+\]
+So the hard-indicator hypergradient is
+\[
+\begin{aligned}
+  \frac{dL_{\mathrm{meta}}}{d\bandwidth}
+  =
+  \frac{2\eta\lbcoef \cdot \totalexperts}
+       {\batchsize\bandwidth^2}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right).
+\end{aligned}
+\]
+
+\section{STE for the Width Term}
+
+We can also apply a rect STE to the width term.  For each token--expert pair,
+write
+\[
+  u_e^{(t)}(\modelparams,\bandwidth)
+  =
+  \frac{\bandwidth}{2}
+  -
+  \abs{z_e^{(t)}(\modelparams)}.
+\]
+Then the rect term can be written explicitly as an indicator:
+\[
+\begin{aligned}
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  &=
+  \indic{
+    \abs{z_e^{(t)}(\modelparams) / \bandwidth}<0.5
+  } \\
+  &=
+  \indic{
+    \abs{z_e^{(t)}(\modelparams)}<\bandwidth/2
+  } \\
+  &=
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  }.
+\end{aligned}
+\]
+Therefore
+\[
+\begin{aligned}
+  \frac{\partial}{\partial\bandwidth}
+  \left[
+    \frac{1}{\bandwidth}
+    \rect\!\left(
+      \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+    \right)
+  \right]
+  &=
+  -\frac{1}{\bandwidth^2}
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  }
+  +
+  \frac{1}{\bandwidth}
+  \frac{\partial}{\partial\bandwidth}
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  } \\
+  &=
+  -\frac{1}{\bandwidth^2}
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  }
+  +
+  \frac{1}{2\bandwidth}
+  \frac{\partial}{\partial u_e^{(t)}}
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  }.
+\end{aligned}
+\]
+Only the derivative of the indicator is replaced by an STE:
+\[
+  \frac{\partial}{\partial u}
+  \indic{u>0}
+  \approx
+  \frac{1}{\rho}
+  \rect\!\left(\frac{u}{\rho}\right),
+  \qquad
+  \rho>0.
+\]
+Thus
+\[
+\begin{aligned}
+  \frac{\partial}{\partial\bandwidth}
+  \left[
+    \frac{1}{\bandwidth}
+    \rect\!\left(
+      \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+    \right)
+  \right]
+  &\approx
+  -\frac{1}{\bandwidth^2}
+  \indic{
+    u_e^{(t)}(\modelparams,\bandwidth)>0
+  }
+  +
+  \frac{1}{2\bandwidth\rho}
+  \rect\!\left(
+    \frac{u_e^{(t)}(\modelparams,\bandwidth)}{\rho}
+  \right) \\
+  &=
+  -\frac{1}{\bandwidth^2}
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  +
+  \frac{1}{2\bandwidth\rho}
+  \rect\!\left(
+    \frac{\bandwidth/2-\abs{z_e^{(t)}(\modelparams)}}{\rho}
+  \right).
+\end{aligned}
+\]
+The final rect term is itself the indicator
+\[
+  \rect\!\left(
+    \frac{\bandwidth/2-\abs{z_e^{(t)}(\modelparams)}}{\rho}
+  \right)
+  =
+  \indic{
+    \abs{\bandwidth/2-\abs{z_e^{(t)}(\modelparams)}}<\rho/2
+  }.
+\]
+Substituting into the hypergradient gives
+\[
+\begin{aligned}
+  \frac{dL_{\mathrm{meta}}}{d\bandwidth}
+  &\approx
+  \frac{2\eta\lbcoef \cdot \totalexperts}
+       {\batchsize\bandwidth^2}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \rect\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right) \\
+  &\quad
+  -
+  \frac{\eta\lbcoef \cdot \totalexperts}
+       {\batchsize\bandwidth\rho}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \rect\!\left(
+    \frac{\bandwidth/2-\abs{z_e^{(t)}(\modelparams)}}{\rho}
+  \right).
+\end{aligned}
+\]
+
+\end{document}
