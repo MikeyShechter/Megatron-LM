@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
     load_balance_ste_soft_mask,
+    qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
     save_to_router_metrics_tracker,
@@ -221,6 +222,40 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
+        # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
+        # `qb_beta_accum`/`qb_beta_count` collect microbatch quantiles for the global-batch update.
+        if self.routing_type == "quantile_balancing":
+            assert not self.is_aux_loss_enabled(), (
+                "Quantile balancing handles load balance via the bias update; "
+                "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
+            )
+            self.register_buffer(
+                'qb_beta',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+            self.register_buffer(
+                'qb_beta_accum',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_beta_count',
+                torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.qb_beta = None
+            self.qb_beta_accum = None
+            self.qb_beta_count = None
+
         # Learnable routing biases (rect/tanh-STE trained, DeepSeek-style selection).
         self.learnable_bias_type = getattr(self.config, "moe_learnable_bias_type", "none")
         self.lm_loss_ste = getattr(self.config, "moe_lm_loss_ste", False)
@@ -275,6 +310,12 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'qb_beta') and self.qb_beta is not None:
+            if self.qb_beta.dtype != torch.float32:
+                self.qb_beta.data = self.qb_beta.data.to(torch.float32)
+        if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
+            if self.qb_beta_accum.dtype != torch.float32:
+                self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -308,6 +349,61 @@ class TopKRouter(Router):
         map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
         scores = logits * map
         return scores, map
+
+    def quantile_balancing(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply quantile-balancing (QB) routing to the logits tensor."""
+        assert (
+            not self.config.moe_router_fusion
+        ), "Quantile balancing routing does not support moe_router_fusion."
+        assert (
+            self.config.moe_router_num_groups is None and self.config.moe_router_group_topk is None
+        ), "Quantile balancing routing does not support group-limited routing."
+
+        local_num_tokens = logits.shape[0]
+        gather_group = self.tp_cp_group
+        gather_size = gather_group.size() if gather_group is not None else 1
+        should_update_beta = self.training and torch.is_grad_enabled()
+
+        with torch.no_grad():
+            logits_fp32 = logits.detach().to(dtype=torch.float32)
+
+            if gather_size > 1:
+                full_logits = torch.empty(
+                    (local_num_tokens * gather_size, self.config.num_moe_experts),
+                    dtype=logits_fp32.dtype,
+                    device=logits_fp32.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    full_logits, logits_fp32.contiguous(), group=gather_group
+                )
+                gather_rank = torch.distributed.get_rank(group=gather_group)
+            else:
+                full_logits = logits_fp32
+                gather_rank = 0
+
+            full_indices, beta_local = qb_dual_update(
+                full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
+            )
+            if should_update_beta:
+                self.qb_beta_accum.add_(beta_local)
+                self.qb_beta_count.add_(1)
+
+            if gather_size > 1:
+                indices = full_indices[
+                    gather_rank * local_num_tokens : (gather_rank + 1) * local_num_tokens
+                ].contiguous()
+            else:
+                indices = full_indices
+
+        return topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            fused=self.config.moe_router_fusion,
+            precomputed_indices=indices,
+        )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -1037,6 +1133,11 @@ class TopKRouter(Router):
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
+        elif self.routing_type == "quantile_balancing":
+            assert (
+                padding_mask is None
+            ), "Quantile balancing routing does not support padding masks yet."
+            probs, routing_map = self.quantile_balancing(logits)
         else:
             routing_output = topk_routing_with_score_function(
                 logits,
@@ -1284,6 +1385,7 @@ class InferenceTopKRouter(TopKRouter):
         fused,
         router_replay,
         dense_output,
+        precomputed_indices,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1297,10 +1399,15 @@ class InferenceTopKRouter(TopKRouter):
             fused=fused,
             router_replay=router_replay,
             dense_output=dense_output,
+            precomputed_indices=precomputed_indices,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        precomputed_indices = None
+        if self.qb_beta is not None:
+            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
 
         probs, top_indices = self._compiled_topk_routing(
             logits,
@@ -1314,6 +1421,7 @@ class InferenceTopKRouter(TopKRouter):
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
             dense_output=True,
+            precomputed_indices=precomputed_indices,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

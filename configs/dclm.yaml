@@ -1,5 +1,5 @@
 job_details:
-  name: aux_loss_different_activations
+  name: quantile_balancing_baseline
   output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
@@ -39,11 +39,11 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["aux_loss"]
-  moe_aux_loss_coeff: [0.1, 0.01, 0.001]  # 0.1, 0.01, 0.001
+  moe_router_load_balancing_type: ["quantile_balancing"]
+  # moe_aux_loss_coeff: [0.1, 0.01, 0.001]  # 0.1, 0.01, 0.001
   # init_moe_router_zero: [true]
   
-  load_balance_ste_type: ["rect"]
+  # load_balance_ste_type: ["rect"]
   # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
   moe_router_score_function: ["sigmoid", "sqrtsoftplus"]
   # moe_learnable_bias_pass_grad_through_scores: [true]

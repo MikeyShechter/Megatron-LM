@@ -738,6 +738,33 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
     return d1 * cost * d0.unsqueeze(1)
 
 
+def qb_dual_update(
+    scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual coordinate-descent quantile-balancing routing assignment.
+
+    Picks the top-k experts per token from ``scores - beta``. When ``update_beta`` is
+    True, also returns the raw column quantile of ``scores`` that drives each expert
+    toward ``m * k / n`` tokens.
+    """
+    num_tokens, num_experts = scores.shape
+
+    topk_result = (scores - beta).topk(k + 1, dim=1)
+    indices = topk_result.indices[:, :-1]
+
+    if not update_beta:
+        return indices, beta
+
+    assert (num_tokens * k) % num_experts == 0, (
+        "Quantile balancing requires the number of routed assignments "
+        f"({num_tokens} tokens * top-{k}) to be divisible by {num_experts} experts."
+    )
+    col_target = num_tokens * k // num_experts
+    alpha = topk_result.values[:, -1:]
+    beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    return indices, beta_local
+
+
 def get_capacity(
     num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
 ) -> int:
@@ -1219,6 +1246,7 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    precomputed_indices: Optional[torch.Tensor] = None,
     return_top_indices: bool = False,
     return_topk_plus_one_indices: bool = False,
     random_tie_breaking: bool = False,
@@ -1250,6 +1278,10 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        precomputed_indices (torch.Tensor, optional): Top-k indices [num_tokens, topk]
+                                       selected by the caller. When given, the score function's
+                                       own top-k is bypassed and probs are computed at these
+                                       indices (e.g. for quantile balancing). Defaults to None.
         return_top_indices (bool, optional): If True, return top-k expert indices alongside the
                                              sparse tensors. Defaults to False.
         return_topk_plus_one_indices (bool, optional): If True, return the best unselected expert
@@ -1280,6 +1312,9 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    assert not (
+        fused and precomputed_indices is not None
+    ), "precomputed_indices is not supported with the fused top-k score function."
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -1358,6 +1393,7 @@ def topk_routing_with_score_function(
         and topk < num_experts
         and group_topk is None
         and router_replay is None
+        and precomputed_indices is None
     )
     topk_count = topk + 1 if can_return_topk_plus_one else topk
     topk_plus_one_indices = None
@@ -1382,26 +1418,40 @@ def topk_routing_with_score_function(
             # per-expert scores, add the per-expert bias for top-k selection only,
             # and use the un-biased softmax scores as the routing weights.
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            scores_for_routing = scores + expert_bias.float()
-            top_values, top_indices = compute_topk(
-                scores_for_routing, topk_count, num_groups, group_topk
-            )
-            _, top_indices = _trim_topk_plus_one(top_values, top_indices)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+            else:
+                scores_for_routing = scores + expert_bias.float()
+                top_values, top_indices = compute_topk(
+                    scores_for_routing, topk_count, num_groups, group_topk
+                )
+                _, top_indices = _trim_topk_plus_one(top_values, top_indices)
             probs = torch.gather(scores, dim=1, index=top_indices)
         elif use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs, top_indices = compute_topk(scores, topk_count, num_groups, group_topk)
-            probs, top_indices = _trim_topk_plus_one(probs, top_indices)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                probs, top_indices = compute_topk(scores, topk_count, num_groups, group_topk)
+                probs, top_indices = _trim_topk_plus_one(probs, top_indices)
         else:
-            scores, top_indices = compute_topk(logits, topk_count, num_groups, group_topk)
-            scores, top_indices = _trim_topk_plus_one(scores, top_indices)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                scores = torch.gather(logits, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(logits, topk_count, num_groups, group_topk)
+                scores, top_indices = _trim_topk_plus_one(scores, top_indices)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
+        if precomputed_indices is not None:
+            top_indices = precomputed_indices
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        elif expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
             top_values, top_indices = compute_topk(
                 scores_for_routing, topk_count, num_groups, group_topk

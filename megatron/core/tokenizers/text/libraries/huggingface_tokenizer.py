@@ -7,8 +7,11 @@ try:
     from transformers import AutoTokenizer
 
     HAVE_TRANSFORMERS = True
-except ModuleNotFoundError:
+    TRANSFORMERS_IMPORT_ERROR = None
+except ImportError as e:
+    AutoTokenizer = None
     HAVE_TRANSFORMERS = False
+    TRANSFORMERS_IMPORT_ERROR = e
 
 from megatron.core.utils import log_single_rank
 
@@ -63,6 +66,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             include_special_tokens: when True, converting text to ids will include special
                 tokens / prompt tokens (if any), yielding self.tokenizer(text).input_ids
         """
+
+        if not HAVE_TRANSFORMERS:
+            raise ImportError("transformers library is required for HuggingFaceTokenizer") from (
+                TRANSFORMERS_IMPORT_ERROR
+            )
 
         try:
             # this logic deals with different huggingface tokenizers having different args

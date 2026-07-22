@@ -652,6 +652,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "quantile_balancing": Dual coordinate-descent quantile balancing. Load balance is
+    handled by an internal per-expert bias update; auxiliary losses must be disabled
+    (`moe_aux_loss_coeff` = 0) when QB is selected.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -729,6 +732,12 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_quantile_balancing_ema: float = 0.0
+    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
+    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
+    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
+    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1361,13 +1370,14 @@ class TransformerConfig(ModelParallelConfig):
                         "totalvio",
                         "seq_aux_loss",
                         "global_aux_loss",
+                        "quantile_balancing",
                         "none",
                     ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
                             "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, "
-                            "maxvio, maxviosq, totalvio, seq_aux_loss, global_aux_loss or none "
-                            "load balancing"
+                            "maxvio, maxviosq, totalvio, seq_aux_loss, global_aux_loss, "
+                            "quantile_balancing or none load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
@@ -1380,12 +1390,14 @@ class TransformerConfig(ModelParallelConfig):
                 "totalvio",
                 "seq_aux_loss",
                 "global_aux_loss",
+                "quantile_balancing",
                 "none",
             ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
                     "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, maxvio, "
-                    "maxviosq, totalvio, seq_aux_loss, global_aux_loss or none load balancing"
+                    "maxviosq, totalvio, seq_aux_loss, global_aux_loss, quantile_balancing or "
+                    "none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:
