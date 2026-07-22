@@ -200,7 +200,7 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
 
 def _triangle_ste_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
     normalized_margin = margin / bandwidth
-    return 2.0 * torch.clamp(1.0 - normalized_margin.abs(), min=0.0) / bandwidth
+    return torch.clamp(1.0 - normalized_margin.abs(), min=0.0) / bandwidth
 
 
 class _TriangleSTE(torch.autograd.Function):

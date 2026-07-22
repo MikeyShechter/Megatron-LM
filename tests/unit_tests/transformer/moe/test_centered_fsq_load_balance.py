@@ -215,7 +215,7 @@ def test_triangle_ste_uses_piecewise_second_order_gradient():
     grad = torch.autograd.grad(soft_mask.sum(), margin)[0]
 
     expected_forward = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
-    expected_grad = torch.tensor([0.0, 0.0, 0.5, 1.0, 0.5, 0.0, 0.0])
+    expected_grad = torch.tensor([0.0, 0.0, 0.25, 0.5, 0.25, 0.0, 0.0])
     torch.testing.assert_close(soft_mask, expected_forward)
     torch.testing.assert_close(grad, expected_grad)
 
