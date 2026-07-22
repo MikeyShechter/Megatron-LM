@@ -769,7 +769,7 @@ class TransformerConfig(ModelParallelConfig):
             }
         },
     )
-    """Constant width of the rectangular STE window used by direct routed-load balancing losses."""
+    """Constant width of finite-window STEs used by direct routed-load balancing losses."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""

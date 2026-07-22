@@ -10,6 +10,7 @@ from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_para
 from megatron.core.transformer.moe.moe_utils import (
     _RectangularIndicatorSTE,
     _TanhSTE,
+    _TriangleSTE,
     _load_balance_margin,
     direct_load_balancing_loss_func,
 )
@@ -49,11 +50,15 @@ def _reference_centered_fsq_loss(
     hard_load_frac = tokens_per_expert.float() / denom
 
     ste_rect_poistion = (
-        load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
+        load_balance_ste_rect_poistion
+        if load_balance_ste_type in ("rect", "triangle")
+        else "topk"
     )
     margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+    elif load_balance_ste_type == "triangle":
+        soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
     else:
         soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
     soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
@@ -134,7 +139,7 @@ def main():
         choices=("centered_fsq", "centered_fsq_and_var", "fsq"),
         default="centered_fsq",
     )
-    parser.add_argument("--ste-type", choices=("rect", "tanh"), default="rect")
+    parser.add_argument("--ste-type", choices=("rect", "tanh", "triangle"), default="rect")
     parser.add_argument(
         "--rect-position",
         choices=("topk", "topk_plus_one", "midpoint"),

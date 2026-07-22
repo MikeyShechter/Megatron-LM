@@ -3218,7 +3218,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-balance-target-vio', type=float, default=0.0,
                        help='Target MaxVioGlobal for moe_balance_update_rate.')
     group.add_argument('--moe-load-balance-ste-type', '--load-balance-ste-type',
-                       type=str, choices=['rect', 'tanh'], default='rect',
+                       type=str, choices=['rect', 'tanh', 'triangle'], default='rect',
                        help='Surrogate gradient operator for direct routed-load balancing losses.')
     group.add_argument('--moe-load-balance-ste-schedule', '--load-balance-ste-schedule',
                        type=str, choices=['constant', 'linear', 'cosine', 'exponential'],
@@ -3233,7 +3233,7 @@ def _add_moe_args(parser):
                        type=str, choices=['topk', 'topk_plus_one', 'midpoint'],
                        default='topk',
                        dest='moe_ste_rect_poistion',
-                       help='Center location for the rectangular STE window used by direct '
+                       help='Center location for the finite STE window used by direct '
                             'routed-load balancing losses.')
     group.add_argument('--moe-load-balance-gate-metric', '--load-balance-gate-metric',
                        type=str, choices=['none', 'maxvio', 'totalvio'],
@@ -3272,10 +3272,10 @@ def _add_moe_args(parser):
     group.add_argument('--moe-lm-loss-ste',
                        action='store_true', default=False,
                        dest='moe_lm_loss_ste',
-                       help='Apply the rect/tanh STE on the top-k selection so the LM loss '
+                       help='Apply the STE on the top-k selection so the LM loss '
                             'also trains the learnable routing biases (moe_learnable_bias_type), '
                             'letting moe_aux_loss_coeff balance LB vs LM pressure on the biases. '
-                            'Requires moe_learnable_bias_type != none and (for rect) '
+                            'Requires moe_learnable_bias_type != none and (for rect/triangle) '
                             'moe_load_balance_ste_width > 0.')
     learnable_bias_lr_group = group.add_mutually_exclusive_group()
     learnable_bias_lr_group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,

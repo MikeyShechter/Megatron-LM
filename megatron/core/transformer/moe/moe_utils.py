@@ -198,6 +198,27 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
         return grad_margin.to(dtype=margin.dtype), None
 
 
+def _triangle_ste_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+    normalized_margin = margin / bandwidth
+    return 2.0 * torch.clamp(1.0 - normalized_margin.abs(), min=0.0) / bandwidth
+
+
+class _TriangleSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+        ctx.bandwidth = float(bandwidth)
+        ctx.save_for_backward(margin)
+        return (margin >= 0).to(dtype=margin.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (margin,) = ctx.saved_tensors
+        grad_margin = grad_output.float() * _triangle_ste_grad(
+            margin.float(), ctx.bandwidth
+        )
+        return grad_margin.to(dtype=margin.dtype), None
+
+
 class _LoadBalanceLoadSTE(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -227,6 +248,9 @@ class _LoadBalanceLoadSTE(torch.autograd.Function):
             k = max(1.0 / slope, 1.0)
             tanh_value = torch.tanh(slope * margin_float)
             ste_grad = k * slope * (1.0 - tanh_value.square())
+            ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
+        elif ctx.ste_type == "triangle":
+            ste_grad = _triangle_ste_grad(margin_float, ctx.bandwidth)
             ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
         else:
             half_width = ctx.bandwidth * 0.5
@@ -419,7 +443,7 @@ def load_balance_ste_soft_mask(
     load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
 ) -> torch.Tensor:
-    """Per-token soft selection mask from the load-balance STE (rect or tanh).
+    """Per-token soft selection mask from the load-balance STE.
 
     The forward value matches the hard ``routing_map`` while the backward pass
     routes gradient through the selection margin. Shape [num_tokens, num_experts].
@@ -427,6 +451,8 @@ def load_balance_ste_soft_mask(
     margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+    elif load_balance_ste_type == "triangle":
+        soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
     else:
         soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
     return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
@@ -613,7 +639,9 @@ def direct_load_balancing_loss_func(
     ste_margin = None
     ste_valid_tokens = None
     ste_rect_poistion = (
-        load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
+        load_balance_ste_rect_poistion
+        if load_balance_ste_type in ("rect", "triangle")
+        else "topk"
     )
 
     if load_balancing_type == "noisy_centered_fsq":

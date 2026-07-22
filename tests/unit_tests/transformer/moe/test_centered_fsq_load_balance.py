@@ -9,6 +9,7 @@ from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_para
 from megatron.core.transformer.moe.moe_utils import (
     _RectangularIndicatorSTE,
     _TanhSTE,
+    _TriangleSTE,
     _load_balance_margin,
     compute_routing_scores_for_aux_loss,
     direct_load_balancing_loss_func,
@@ -80,11 +81,15 @@ def _reference_centered_fsq_loss(
 
     if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
         ste_rect_poistion = (
-            load_balance_ste_rect_poistion if load_balance_ste_type == "rect" else "topk"
+            load_balance_ste_rect_poistion
+            if load_balance_ste_type in ("rect", "triangle")
+            else "topk"
         )
         margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
         if load_balance_ste_type == "tanh":
             soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+        elif load_balance_ste_type == "triangle":
+            soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
         else:
             soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
         soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
@@ -196,6 +201,23 @@ def test_centered_fsq_ste_updates_overloaded_and_near_boundary_underloaded_exper
     assert grad[1].abs() < 1e-6
     assert grad[2] < -1e-4
     assert grad[3].abs() < 1e-7
+
+
+def test_triangle_ste_uses_piecewise_second_order_gradient():
+    bandwidth = 2.0
+    margin = torch.tensor(
+        [-2.5, -2.0, -1.0, 0.0, 1.0, 2.0, 2.5],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    soft_mask = _TriangleSTE.apply(margin, bandwidth)
+    grad = torch.autograd.grad(soft_mask.sum(), margin)[0]
+
+    expected_forward = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    expected_grad = torch.tensor([0.0, 0.0, 0.5, 1.0, 0.5, 0.0, 0.0])
+    torch.testing.assert_close(soft_mask, expected_forward)
+    torch.testing.assert_close(grad, expected_grad)
 
 
 def test_centered_fsq_forward_value_for_arbitrary_load():
@@ -378,6 +400,9 @@ def test_centered_fsq_topk_threshold_reuse_closely_matches_reference_global_coun
         ("rect", "topk", 1.0),
         ("rect", "topk_plus_one", 1.0),
         ("rect", "midpoint", 1.0),
+        ("triangle", "topk", 1.0),
+        ("triangle", "topk_plus_one", 1.0),
+        ("triangle", "midpoint", 1.0),
         ("tanh", "topk", 1.7),
     ),
 )
@@ -451,6 +476,9 @@ def test_centered_fsq_surrogate_matches_reference_for_ste_variants(
         ("rect", "topk", 1.0),
         ("rect", "topk_plus_one", 1.0),
         ("rect", "midpoint", 1.0),
+        ("triangle", "topk", 1.0),
+        ("triangle", "topk_plus_one", 1.0),
+        ("triangle", "midpoint", 1.0),
         ("tanh", "topk", 1.7),
     ),
 )

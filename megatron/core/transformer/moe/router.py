@@ -256,7 +256,7 @@ class TopKRouter(Router):
             self.qb_beta_accum = None
             self.qb_beta_count = None
 
-        # Learnable routing biases (rect/tanh-STE trained, DeepSeek-style selection).
+        # Learnable routing biases (STE-trained, DeepSeek-style selection).
         self.learnable_bias_type = getattr(self.config, "moe_learnable_bias_type", "none")
         self.lm_loss_ste = getattr(self.config, "moe_lm_loss_ste", False)
         self.learnable_expert_biases = None
@@ -633,7 +633,7 @@ class TopKRouter(Router):
         """Route the LM-loss gradient to the learnable routing biases via the STE.
 
         Top-k selection is non-differentiable, so the LM loss cannot train the
-        learnable bias b on its own. Here probs are scaled by the rect/tanh STE soft
+        learnable bias b on its own. Here probs are scaled by the STE soft
         selection mask (the same one the LB loss uses), whose forward value matches the
         hard routing map (so probs, and therefore the MoE output, are unchanged) while
         its backward pass flows gradient through the biased selection margin to b.
@@ -1122,7 +1122,7 @@ class TopKRouter(Router):
         load_balance_ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
         should_return_topk_plus_one_indices = (
             should_return_top_indices
-            and load_balance_ste_type == "rect"
+            and load_balance_ste_type in ("rect", "triangle")
             and load_balance_ste_width > 0.0
             and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
         )
