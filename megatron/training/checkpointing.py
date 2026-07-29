@@ -39,6 +39,11 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.moe.moe_utils import (
+    get_moe_metagrad_checkpoint_state,
+    load_moe_metagrad_checkpoint_state,
+    moe_metagrad_enabled,
+)
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
@@ -1059,6 +1064,41 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
+def _shard_moe_metagrad_state(metagrad_state):
+    """Shard dense and expert metagrad sensitivities over their model layouts."""
+    dense_prev = metagrad_state.pop("dense_prev")
+    expert_prev = metagrad_state.pop("expert_prev")
+    metagrad_state["dense_prev"] = ShardedObject(
+        "moe_metagrad_dense_prev",
+        dense_prev,
+        (
+            mpu.get_pipeline_model_parallel_world_size(),
+            mpu.get_tensor_model_parallel_world_size(),
+        ),
+        (
+            mpu.get_pipeline_model_parallel_rank(),
+            mpu.get_tensor_model_parallel_rank(),
+        ),
+        replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
+    )
+    metagrad_state["expert_prev"] = ShardedObject(
+        "moe_metagrad_expert_prev",
+        expert_prev,
+        (
+            mpu.get_pipeline_model_parallel_world_size(),
+            mpu.get_expert_tensor_parallel_world_size(),
+            mpu.get_expert_model_parallel_world_size(),
+        ),
+        (
+            mpu.get_pipeline_model_parallel_rank(),
+            mpu.get_expert_tensor_parallel_rank(),
+            mpu.get_expert_model_parallel_rank(),
+        ),
+        replica_id=mpu.get_expert_data_parallel_rank(),
+    )
+    return metagrad_state
+
+
 def generate_state_dict(
     args,
     model,
@@ -1129,6 +1169,14 @@ def generate_state_dict(
     # Rerun state
     if rerun_state:
         state_dict['rerun_state_machine'] = rerun_state
+
+    if moe_metagrad_enabled(args):
+        metagrad_state = get_moe_metagrad_checkpoint_state(model)
+        if args.no_save_optim:
+            metagrad_state["scalar_optimizer"] = None
+        if args.ckpt_format == "torch_dist":
+            metagrad_state = _shard_moe_metagrad_state(metagrad_state)
+        state_dict["moe_metagrad"] = metagrad_state
 
     # RNG states.
     if not args.no_save_rng and rng_state:
@@ -2020,6 +2068,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
+
+    if moe_metagrad_enabled(args) and not release and not args.finetune:
+        metagrad_state = state_dict.get("moe_metagrad")
+        if metagrad_state is not None and args.no_load_optim:
+            metagrad_state = {
+                "dense_prev": {},
+                "expert_prev": {},
+                "scalar_params": metagrad_state.get("scalar_params", {}),
+                "scalar_optimizer": None,
+            }
+        load_moe_metagrad_checkpoint_state(metagrad_state, model, args=args)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:

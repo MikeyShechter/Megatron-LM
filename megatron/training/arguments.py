@@ -1826,6 +1826,8 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_ste_rect_poistion",
         "moe_load_balance_gate_metric",
         "moe_load_balance_gate_threshold",
+        "metagrad_params",
+        "metagrad_lr",
         "moe_use_global_lb",
         "moe_learnable_bias_type",
         "moe_learnable_bias_pass_grad_through_scores",
@@ -2068,6 +2070,8 @@ def _add_network_size_args(parser):
         "linear_attention_freq",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
+        "metagrad_params",
+        "metagrad_lr",
         "cp_comm_type",
         "cuda_graph_scope",
         # no CLI argument exists for these
@@ -3246,6 +3250,14 @@ def _add_moe_args(parser):
                        type=float, default=0.0,
                        dest='moe_load_balance_gate_threshold',
                        help='Threshold for moe_load_balance_gate_metric.')
+    group.add_argument('--metagrad-params',
+                       type=str, choices=['none', 'width', 'coeff', 'width_and_coeff'],
+                       default='none',
+                       help='Load-balance scalar parameters to update with the SGD-style '
+                            'one-step meta-gradient approximation.')
+    group.add_argument('--metagrad-lr', type=float, default=0.0,
+                       help='Adam learning rate for metagrad_params. The default 0.0 leaves '
+                            'the meta-gradient update inactive.')
     group.add_argument('--moe-learnable-bias-type',
                        type=str, choices=[
                            'none',

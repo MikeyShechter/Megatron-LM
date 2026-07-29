@@ -1,5 +1,5 @@
 job_details:
-  name: test_regular_scale
+  name: test_triangle_metagrad
   output_dir: /e/project1/reformo/shechter1/checkpoints/megatron/
 
 parameters:
@@ -27,6 +27,7 @@ parameters:
   seq_length: [1024]              # = sequence_length
   max_position_embeddings: [1024]
   squared_relu: [true]
+  transformer_impl: ["local"]
 
   # ── MoE ──────────────────────────────────────────────────────────────────────
   num_experts: [64]
@@ -39,11 +40,13 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["centered_fsq_and_var", "noisy_centered_fsq"]
+  moe_router_load_balancing_type: ["centered_fsq"]
   moe_aux_loss_coeff: [0.01]
 
   load_balance_ste_width: [0.1]
-  load_balance_ste_type: ["rect"]
+  load_balance_ste_type: ["triangle"]
+  metagrad_params: ["width_and_coeff"]
+  metagrad_lr: [1.0e-3]
   # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
   moe_router_score_function: ["sqrtsoftplus"]
   # moe_learnable_bias_lr_mult: [0.1]

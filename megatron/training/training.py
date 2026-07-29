@@ -159,7 +159,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, param_is_not_shared
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -211,8 +211,16 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import (
     MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY,
     clear_aux_losses_tracker,
+    clear_moe_metagrad_prev_sensitivities,
+    clear_moe_metagrad_raw_sensitivities,
     clear_moe_router_metrics_tracker,
     get_load_balance_ste_params,
+    get_moe_metagrad_prev_sensitivities,
+    get_moe_metagrad_raw_sensitivities,
+    get_moe_metagrad_raw_state,
+    get_moe_metagrad_scalar_state,
+    moe_metagrad_enabled,
+    set_moe_metagrad_prev_sensitivities,
     track_moe_metrics,
     track_moe_router_metrics,
 )
@@ -941,6 +949,14 @@ def pretrain(
 
     if cfg_container.logger.log_progress:
         append_to_progress_log("Starting job")
+
+    if moe_metagrad_enabled(args):
+        # Meta-gradients run synthetic VJPs before the ordinary model backward,
+        # so compiled backward graphs must support retain_graph=True. Configure
+        # this before warming up any torch.compile-based fusion.
+        from torch._functorch import config as functorch_config
+
+        functorch_config.donated_buffer = False
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -2004,9 +2020,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+    metagrad_enabled = moe_metagrad_enabled(args)
+    metagrad_scalars = _compute_metagrad_scalars(optimizer, args) if metagrad_enabled else {}
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if metagrad_enabled:
+        if update_successful:
+            _apply_metagrad_scalar_updates(
+                args, config, optimizer, opt_param_scheduler, metagrad_scalars
+            )
+            _save_current_metagrad_sensitivities(optimizer, args)
+        else:
+            clear_moe_metagrad_raw_sensitivities()
+            clear_moe_metagrad_prev_sensitivities()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2228,6 +2256,265 @@ def _update_tied_moe_learnable_bias_lr(
             param_group['lr'].fill_(lr)
         else:
             param_group['lr'] = lr
+
+
+def _metagrad_names(args):
+    metagrad_params = getattr(args, 'metagrad_params', 'none')
+    if metagrad_params == "width":
+        return ("width",)
+    if metagrad_params == "coeff":
+        return ("coeff",)
+    if metagrad_params == "width_and_coeff":
+        return ("width", "coeff")
+    return ()
+
+
+def _current_sgd_approx_lr(args, optimizer):
+    lr = get_canonical_lr_for_logging(optimizer.param_groups)
+    if lr is None and optimizer.param_groups:
+        lr = optimizer.param_groups[0].get('lr', args.lr)
+    if isinstance(lr, torch.Tensor):
+        return float(lr.detach().float().item())
+    return float(lr if lr is not None else args.lr)
+
+
+@torch.no_grad()
+def _average_metagrad_raw_sensitivities():
+    for raw_by_param in get_moe_metagrad_raw_state().values():
+        for param, raw_sensitivity in raw_by_param.values():
+            is_expert_parallel = not getattr(param, 'allreduce', True)
+            if is_expert_parallel:
+                dp_group = mpu.get_expert_data_parallel_group()
+            else:
+                dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            dp_size = torch.distributed.get_world_size(group=dp_group)
+            if dp_size == 1:
+                continue
+            torch.distributed.all_reduce(
+                raw_sensitivity, op=torch.distributed.ReduceOp.SUM, group=dp_group
+            )
+            raw_sensitivity.div_(dp_size)
+
+
+def _get_optimizer_loss_scale(optimizer):
+    loss_scale = optimizer.get_loss_scale()
+    return float(loss_scale.detach().float().item())
+
+
+@torch.no_grad()
+def _unscale_metagrad_raw_sensitivities(optimizer):
+    loss_scale = _get_optimizer_loss_scale(optimizer)
+    if loss_scale == 1.0:
+        return
+    for raw_by_param in get_moe_metagrad_raw_state().values():
+        for _, raw_sensitivity in raw_by_param.values():
+            raw_sensitivity.div_(loss_scale)
+
+
+def _get_unscaled_model_param_grad(param, loss_scale):
+    grad = getattr(param, 'main_grad', None)
+    if grad is None:
+        grad = getattr(param, 'grad', None)
+    if grad is None:
+        return None
+    if hasattr(grad, '_local_tensor'):
+        grad = grad._local_tensor
+    grad = grad.detach().float()
+    if loss_scale != 1.0:
+        grad = grad / loss_scale
+    return grad
+
+
+@torch.no_grad()
+def _compute_metagrad_scalar(optimizer, name):
+    loss_scale = _get_optimizer_loss_scale(optimizer)
+    prev_sensitivities = get_moe_metagrad_prev_sensitivities(name)
+    raw_aux_sensitivities = get_moe_metagrad_raw_sensitivities("aux")
+    device = torch.device("cuda", torch.cuda.current_device())
+    dense_reduced = torch.zeros(2, device=device)
+    expert_reduced = torch.zeros(2, device=device)
+
+    for param_id, (param, prev_sensitivity) in prev_sensitivities.items():
+        if not param_is_not_shared(param):
+            continue
+        is_expert_parallel = not getattr(param, 'allreduce', True)
+        tp_group = (
+            mpu.get_expert_tensor_parallel_group()
+            if is_expert_parallel
+            else mpu.get_tensor_model_parallel_group()
+        )
+        if not tensor_parallel.param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group
+        ):
+            continue
+
+        grad = _get_unscaled_model_param_grad(param, loss_scale)
+        if grad is None:
+            continue
+
+        raw_aux = raw_aux_sensitivities.get(param_id)
+        if raw_aux is not None:
+            grad = grad - raw_aux[1].detach().float()
+
+        dot = torch.sum(grad * prev_sensitivity.detach().float())
+        reduced = expert_reduced if is_expert_parallel else dense_reduced
+        reduced[0].add_(dot)
+        reduced[1] = 1.0
+
+    dense_group = mpu.get_model_parallel_group()
+    expert_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    if torch.distributed.get_process_group_ranks(
+        dense_group
+    ) == torch.distributed.get_process_group_ranks(expert_group):
+        dense_reduced.add_(expert_reduced)
+        torch.distributed.all_reduce(
+            dense_reduced, op=torch.distributed.ReduceOp.SUM, group=dense_group
+        )
+        reduced = dense_reduced
+    else:
+        torch.distributed.all_reduce(
+            dense_reduced, op=torch.distributed.ReduceOp.SUM, group=dense_group
+        )
+        torch.distributed.all_reduce(
+            expert_reduced, op=torch.distributed.ReduceOp.SUM, group=expert_group
+        )
+        reduced = dense_reduced + expert_reduced
+
+    if reduced[1].item() == 0:
+        return None
+    return float(reduced[0].item())
+
+
+@torch.no_grad()
+def _compute_metagrad_scalars(optimizer, args):
+    _average_metagrad_raw_sensitivities()
+    _unscale_metagrad_raw_sensitivities(optimizer)
+
+    requested_names = _metagrad_names(args)
+    metagrad_scalars = {}
+    for name in requested_names:
+        scalar = _compute_metagrad_scalar(optimizer, name)
+        if scalar is not None:
+            metagrad_scalars[name] = scalar
+    return metagrad_scalars
+
+
+def _metagrad_param_value(param):
+    value = param.detach().cpu().tolist()
+    if isinstance(value, list):
+        return [float(item) for item in value]
+    return float(value)
+
+
+def _get_or_create_metagrad_optimizer(args):
+    state = get_moe_metagrad_scalar_state()
+    if state["scalar_optimizer"] is not None:
+        return state
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    requested_names = _metagrad_names(args)
+    params = {}
+    restored_params = state.pop("restored_scalar_params", {})
+    if "width" in requested_names:
+        initial_width = restored_params.get("width", args.moe_load_balance_ste_width)
+        width = torch.as_tensor(
+            initial_width, dtype=torch.float32, device=device
+        )
+        params["width"] = torch.nn.Parameter(width)
+    if "coeff" in requested_names:
+        initial_coeff = restored_params.get("coeff", args.moe_aux_loss_coeff)
+        coeff = torch.as_tensor(initial_coeff, dtype=torch.float32, device=device)
+        params["coeff"] = torch.nn.Parameter(coeff)
+
+    optimizer = torch.optim.Adam(params.values(), lr=args.metagrad_lr, weight_decay=0.0)
+    pending_optimizer_state = state.pop("pending_scalar_optimizer_state", None)
+    if pending_optimizer_state is not None:
+        optimizer.load_state_dict(pending_optimizer_state)
+    state["scalar_params"] = params
+    state["scalar_optimizer"] = optimizer
+    return state
+
+
+def _log_metagrad_update(args, metagrad_scalars, metagrad_parameters):
+    iteration = getattr(args, "curr_iteration", 0) + 1
+    if iteration % args.log_interval != 0 or torch.distributed.get_rank() != 0:
+        return
+    metrics = {}
+    parts = [f"iteration {iteration}"]
+    for name in _metagrad_names(args):
+        scalar = metagrad_scalars.get(name)
+        value = _metagrad_param_value(metagrad_parameters[name])
+        parts.extend(
+            (
+                f"{name}_grad={scalar}",
+                f"{name}={value}",
+            )
+        )
+        metrics[f"train/metagrad_{name}_grad"] = scalar
+        metrics[f"train/metagrad_{name}"] = value
+    print(" metagrad | " + " | ".join(parts), flush=True)
+    writer = get_tensorboard_writer()
+    if writer:
+        for key, value in metrics.items():
+            writer.add_scalar(key, value, iteration)
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.log(metrics, iteration)
+
+
+def _apply_metagrad_scalar_updates(
+    args, model_config, optimizer, opt_param_scheduler, metagrad_scalars
+):
+    if not metagrad_scalars:
+        return
+
+    metagrad_state = _get_or_create_metagrad_optimizer(args)
+    metagrad_optimizer = metagrad_state["scalar_optimizer"]
+    metagrad_parameters = metagrad_state["scalar_params"]
+
+    metagrad_optimizer.zero_grad(set_to_none=True)
+    for name, grad in metagrad_scalars.items():
+        param = metagrad_parameters[name]
+        param.grad = torch.full_like(param, float(grad))
+
+    if "coeff" in metagrad_parameters:
+        old_coeff = args.moe_aux_loss_coeff
+
+    metagrad_optimizer.step()
+
+    if "width" in metagrad_parameters:
+        metagrad_parameters["width"].data.clamp_(min=0.0)
+        new_width = _metagrad_param_value(metagrad_parameters["width"])
+        args.moe_load_balance_ste_width = new_width
+        if model_config is not None:
+            model_config.moe_load_balance_ste_width = new_width
+
+    if "coeff" in metagrad_parameters:
+        metagrad_parameters["coeff"].data.clamp_(min=0.0)
+        new_coeff = _metagrad_param_value(metagrad_parameters["coeff"])
+        _set_moe_aux_loss_coeff(args, new_coeff)
+        if model_config is not None:
+            model_config.moe_aux_loss_coeff = new_coeff
+        if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+            _update_tied_moe_learnable_bias_lr(
+                args, optimizer, opt_param_scheduler, old_coeff, new_coeff
+            )
+    _log_metagrad_update(args, metagrad_scalars, metagrad_parameters)
+
+
+@torch.no_grad()
+def _save_current_metagrad_sensitivities(optimizer, args):
+    train_lr = _current_sgd_approx_lr(args, optimizer)
+    for name in _metagrad_names(args):
+        prev_sensitivities = {}
+        for param_id, (param, raw_sensitivity) in get_moe_metagrad_raw_sensitivities(
+            name
+        ).items():
+            sensitivity = raw_sensitivity.detach().float().mul(-train_lr).clone()
+            prev_sensitivities[param_id] = (param, sensitivity)
+        set_moe_metagrad_prev_sensitivities(name, prev_sensitivities)
+
+    clear_moe_metagrad_raw_sensitivities()
 
 
 def _maybe_update_moe_balance_control_from_vio(

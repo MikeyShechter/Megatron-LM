@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import functools
 import math
 from dataclasses import dataclass
@@ -55,6 +56,15 @@ else:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 _MOE_ROUTER_METRICS_TRACKER: dict = {}
+_MOE_METAGRAD_LOSSES: dict[str, list[torch.Tensor]] = {}
+_MOE_METAGRAD_STATE: dict = {
+    "raw": {},
+    "prev": {},
+    "trainable_params_by_model": {},
+    "scalar_params": {},
+    "scalar_optimizer": None,
+    "pending_scalar_optimizer_state": None,
+}
 MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY = "_current/MaxVioGlobal"
 
 _MOE_ROUTER_METRIC_SPECS = {
@@ -203,6 +213,12 @@ def _triangle_ste_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
     return torch.clamp(1.0 - normalized_margin.abs(), min=0.0) / bandwidth
 
 
+def _triangle_ste_width_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+    abs_margin = margin.abs()
+    in_window = (abs_margin < bandwidth).to(dtype=torch.float32)
+    return (2.0 * abs_margin - bandwidth) * in_window / (bandwidth * bandwidth * bandwidth)
+
+
 class _TriangleSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
@@ -251,6 +267,9 @@ class _LoadBalanceLoadSTE(torch.autograd.Function):
             ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
         elif ctx.ste_type == "triangle":
             ste_grad = _triangle_ste_grad(margin_float, ctx.bandwidth)
+            ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
+        elif ctx.ste_type == "triangle_width_sensitivity":
+            ste_grad = _triangle_ste_width_grad(margin_float, ctx.bandwidth)
             ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
         else:
             half_width = ctx.bandwidth * 0.5
@@ -626,13 +645,9 @@ def direct_load_balancing_loss_func(
     load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
-    if isinstance(total_num_tokens, torch.Tensor):
-        total_num_tokens_tensor = total_num_tokens.to(
-            device=tokens_per_expert.device, dtype=torch.float32
-        )
-    else:
-        total_num_tokens_tensor = tokens_per_expert.new_tensor(float(total_num_tokens))
-
+    total_num_tokens_tensor = torch.as_tensor(
+        total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
+    )
     denom = torch.clamp(total_num_tokens_tensor * float(topk), min=1.0)
     hard_load_frac = tokens_per_expert.float() / denom
     load_frac = hard_load_frac
@@ -699,6 +714,57 @@ def direct_load_balancing_loss_func(
                 topk_plus_one_indices=load_balance_topk_plus_one_indices,
             )
 
+    gate = _direct_load_balance_gate(
+        hard_load_frac,
+        num_experts,
+        load_balance_gate_metric,
+        load_balance_gate_threshold,
+    )
+    loss = loss.detach() + gate * (loss - loss.detach())
+    return loss * moe_aux_loss_coeff
+
+
+def direct_load_balancing_width_sensitivity_loss_func(
+    load_balancing_type: str,
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    total_num_tokens: Union[int, torch.Tensor],
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    load_balance_ste_width: float = 0.0,
+    load_balance_ste_type: str = "rect",
+    load_balance_tanh_ste_slope: float = 1.0,
+    load_balance_ste_rect_poistion: str = "topk",
+    load_balance_gate_metric: str = "none",
+    load_balance_gate_threshold: float = 0.0,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    load_balance_topk_indices: Optional[torch.Tensor] = None,
+    load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Auxiliary scalar whose parameter gradient is d/d width of triangle-STE DLB grads."""
+    total_num_tokens_tensor = torch.as_tensor(
+        total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
+    )
+    denom = torch.clamp(total_num_tokens_tensor * float(topk), min=1.0)
+    hard_load_frac = tokens_per_expert.float() / denom
+    ste_forward_load = tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
+    ste_tokens_per_expert, _, _ = _load_balance_ste_load_surrogate(
+        logits,
+        routing_map,
+        ste_forward_load,
+        "triangle_width_sensitivity",
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+        load_balance_ste_rect_poistion,
+        load_balance_topk_indices,
+        load_balance_topk_plus_one_indices,
+    )
+    ste_load_frac = ste_tokens_per_expert.float() / denom
+    load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
+
+    loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
     gate = _direct_load_balance_gate(
         hard_load_frac,
         num_experts,
@@ -1717,6 +1783,203 @@ def clear_aux_losses_tracker() -> None:
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
+
+
+def save_to_metagrad_losses_tracker(name: str, loss: torch.Tensor) -> None:
+    """Save a scalar loss whose parameter gradient is needed for meta-gradients."""
+    if not loss.requires_grad:
+        return
+    _MOE_METAGRAD_LOSSES.setdefault(name, []).append(loss)
+
+
+def consume_metagrad_losses_tracker() -> dict[str, list[torch.Tensor]]:
+    """Return and clear current microbatch meta-gradient losses."""
+    losses = _MOE_METAGRAD_LOSSES.copy()
+    _MOE_METAGRAD_LOSSES.clear()
+    return losses
+
+
+def moe_metagrad_enabled(config: object) -> bool:
+    """Return whether load-balance metagrad bookkeeping should run."""
+    return (
+        getattr(config, "metagrad_params", "none") != "none"
+        and getattr(config, "metagrad_lr", 0.0) != 0.0
+        )
+
+
+def get_moe_metagrad_trainable_params(model) -> list[torch.Tensor]:
+    """Return the cached trainable parameter list used for metagrad autograd calls."""
+    params_by_model = _MOE_METAGRAD_STATE["trainable_params_by_model"]
+    model_id = id(model)
+    params = params_by_model.get(model_id)
+    if params is None:
+        params = [param for param in model.parameters() if param.requires_grad]
+        params_by_model[model_id] = params
+    return params
+
+
+def add_to_moe_metagrad_raw_sensitivity(
+    name: str, param: torch.Tensor, grad: torch.Tensor
+) -> None:
+    """Accumulate a detached raw sensitivity tensor for one model parameter."""
+    raw_by_param = _MOE_METAGRAD_STATE["raw"].setdefault(name, {})
+    param_id = id(param)
+    grad = grad.detach()
+    if param_id in raw_by_param:
+        raw_by_param[param_id][1].add_(grad)
+    else:
+        raw_by_param[param_id] = (param, grad.clone())
+
+
+def get_moe_metagrad_raw_sensitivities(name: str) -> dict:
+    """Return sparse raw sensitivities for a metagrad loss name."""
+    return _MOE_METAGRAD_STATE["raw"].setdefault(name, {})
+
+
+def get_moe_metagrad_prev_sensitivities(name: str) -> dict:
+    """Return sparse previous-step sensitivities for a metagrad parameter name."""
+    return _MOE_METAGRAD_STATE["prev"].setdefault(name, {})
+
+
+def set_moe_metagrad_prev_sensitivities(name: str, values: dict) -> None:
+    """Replace previous-step sensitivities for a metagrad parameter name."""
+    _MOE_METAGRAD_STATE["prev"][name] = values
+
+
+def get_moe_metagrad_raw_state() -> dict:
+    """Return sparse raw metagrad sensitivities."""
+    return _MOE_METAGRAD_STATE["raw"]
+
+
+def get_moe_metagrad_scalar_state() -> dict:
+    """Return scalar metagrad parameters and optimizer state."""
+    return _MOE_METAGRAD_STATE
+
+
+def clear_moe_metagrad_raw_sensitivities() -> None:
+    """Clear raw metagrad sensitivities from the current training step."""
+    for values in _MOE_METAGRAD_STATE["raw"].values():
+        values.clear()
+
+
+def clear_moe_metagrad_prev_sensitivities() -> None:
+    """Clear previous-step metagrad sensitivities."""
+    for values in _MOE_METAGRAD_STATE["prev"].values():
+        values.clear()
+
+
+def get_moe_metagrad_checkpoint_state(models) -> dict:
+    """Build rank-local, parameter-name-based metagrad checkpoint state."""
+    if not isinstance(models, list):
+        models = [models]
+    names_by_param_id = {}
+    for model_index, model in enumerate(models):
+        prefix = f"model{model_index}."
+        for param_name, param in model.named_parameters():
+            names_by_param_id[id(param)] = prefix + param_name
+
+    dense_prev = {}
+    expert_prev = {}
+    for metagrad_name, values in _MOE_METAGRAD_STATE["prev"].items():
+        for param_id, (param, sensitivity) in values.items():
+            param_name = names_by_param_id.get(param_id)
+            if param_name is not None:
+                target = (
+                    expert_prev
+                    if not getattr(param, "allreduce", True)
+                    else dense_prev
+                )
+                target.setdefault(metagrad_name, {})[param_name] = sensitivity.detach().cpu()
+
+    scalar_params = {
+        name: param.detach().cpu()
+        for name, param in _MOE_METAGRAD_STATE["scalar_params"].items()
+    }
+    scalar_optimizer = _MOE_METAGRAD_STATE["scalar_optimizer"]
+    scalar_optimizer_state = None
+    if scalar_optimizer is not None:
+        # Optimizer state_dict() shares its nested state dictionaries with the
+        # live optimizer. Copy it before moving checkpoint tensors to CPU.
+        scalar_optimizer_state = copy.deepcopy(scalar_optimizer.state_dict())
+        for optimizer_param_state in scalar_optimizer_state["state"].values():
+            for key, value in optimizer_param_state.items():
+                if torch.is_tensor(value):
+                    optimizer_param_state[key] = value.detach().cpu()
+
+    return {
+        "dense_prev": dense_prev,
+        "expert_prev": expert_prev,
+        "scalar_params": scalar_params,
+        "scalar_optimizer": scalar_optimizer_state,
+    }
+
+
+def load_moe_metagrad_checkpoint_state(
+    state: Optional[dict], models, args: Optional[object] = None
+) -> None:
+    """Restore rank-local metagrad state and defer scalar Adam restoration."""
+    clear_moe_metagrad_raw_sensitivities()
+    clear_moe_metagrad_prev_sensitivities()
+    _MOE_METAGRAD_STATE["scalar_params"] = {}
+    _MOE_METAGRAD_STATE["scalar_optimizer"] = None
+    _MOE_METAGRAD_STATE["pending_scalar_optimizer_state"] = None
+    _MOE_METAGRAD_STATE.pop("restored_scalar_params", None)
+    if not state:
+        return
+
+    if not isinstance(models, list):
+        models = [models]
+    params_by_name = {}
+    for model_index, model in enumerate(models):
+        prefix = f"model{model_index}."
+        for param_name, param in model.named_parameters():
+            params_by_name[prefix + param_name] = param
+
+    restored_prev = {}
+    previous_state_parts = (
+        state.get("dense_prev", {}),
+        state.get("expert_prev", {}),
+        state.get("prev", {}),
+    )
+    for previous_state in previous_state_parts:
+        for metagrad_name, named_values in previous_state.items():
+            restored_prev.setdefault(metagrad_name, {}).update(named_values)
+
+    for metagrad_name, named_values in restored_prev.items():
+        restored = {}
+        for param_name, sensitivity in named_values.items():
+            param = params_by_name.get(param_name)
+            if param is None:
+                continue
+            restored[id(param)] = (
+                param,
+                sensitivity.to(device=param.device, dtype=torch.float32),
+            )
+        set_moe_metagrad_prev_sensitivities(metagrad_name, restored)
+
+    restored_scalar_params = state.get("scalar_params", {})
+    _MOE_METAGRAD_STATE["restored_scalar_params"] = restored_scalar_params
+    _MOE_METAGRAD_STATE["pending_scalar_optimizer_state"] = state.get("scalar_optimizer")
+    scalar_values = {}
+    for name, value in restored_scalar_params.items():
+        value = value.detach().cpu().tolist()
+        scalar_values[name] = (
+            [float(item) for item in value] if isinstance(value, list) else float(value)
+        )
+    if args is not None:
+        if "width" in scalar_values:
+            args.moe_load_balance_ste_width = scalar_values["width"]
+        if "coeff" in scalar_values:
+            args.moe_aux_loss_coeff = scalar_values["coeff"]
+    for model in models:
+        for module in model.modules():
+            config = getattr(module, "config", None)
+            if config is None:
+                continue
+            if "width" in scalar_values:
+                config.moe_load_balance_ste_width = scalar_values["width"]
+            if "coeff" in scalar_values:
+                config.moe_aux_loss_coeff = scalar_values["coeff"]
 
 
 def get_moe_router_metrics_tracker() -> dict:

@@ -433,6 +433,8 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         "moe_ste_rect_poistion",
         "moe_load_balance_gate_metric",
         "moe_load_balance_gate_threshold",
+        "metagrad_params",
+        "metagrad_lr",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))

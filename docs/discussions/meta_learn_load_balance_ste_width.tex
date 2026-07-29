@@ -17,6 +17,7 @@
 \newcommand{\lbcoef}{\alpha}
 \newcommand{\bandwidth}{h}
 \newcommand{\rect}{\operatorname{Rect}}
+\newcommand{\tri}{\operatorname{Tri}}
 \newcommand{\dlbloss}{\mathcal{L}_{\mathrm{DLB}}}
 \newcommand{\TopK}{\operatorname{TopK}}
 \newcommand{\abs}[1]{\left\vert#1\right\vert}
@@ -406,5 +407,121 @@ Substituting into the hypergradient gives
   \right).
 \end{aligned}
 \]
+
+\section{Triangle STE Width Meta-gradient}
+
+Instead of the rectangular STE, use the area-one triangle
+\[
+  \tri(u)=\max(1-\abs{u},0).
+\]
+The missing factor of $2$ compared to the Bi-Real sign surrogate is
+intentional: here the forward hard nonlinearity is an indicator with jump size
+$1$, not a sign function with jump size $2$.  Thus
+\[
+  \int_{-\infty}^{\infty}
+  \frac{1}{\bandwidth}
+  \tri\!\left(\frac{z}{\bandwidth}\right)
+  dz
+  =
+  1.
+\]
+The triangle-STE estimate of the assignment-fraction gradient is
+\[
+  \widetilde{\nabla_{\modelparams}\assignmentfraction_e}^{\triangle}
+  (\modelparams,\bandwidth)
+  =
+  \frac{1}{\batchsize}
+  \sum_{t=1}^{\batchsize}
+  \frac{1}{\bandwidth}
+  \tri\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  \nabla_{\modelparams} z_e^{(t)}(\modelparams).
+\]
+Substituting this into the one-step meta objective gives the same expression
+as above, with
+\[
+  \frac{1}{\bandwidth}
+  \rect\!\left(\frac{z_e^{(t)}(\modelparams)}{\bandwidth}\right)
+  \quad\text{replaced by}\quad
+  \frac{1}{\bandwidth}
+  \tri\!\left(\frac{z_e^{(t)}(\modelparams)}{\bandwidth}\right).
+\]
+
+For the hypergradient, define
+\[
+  q_e^{(t)}(\bandwidth)
+  =
+  \frac{1}{\bandwidth}
+  \tri\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right).
+\]
+Holding $\modelparams$ fixed during the outer differentiation, $z_e^{(t)}$ is
+constant with respect to $\bandwidth$.  Therefore, away from the kink
+$\abs{z_e^{(t)}}=\bandwidth$,
+\[
+\begin{aligned}
+  \frac{\partial q_e^{(t)}}{\partial\bandwidth}
+  &=
+  -\frac{1}{\bandwidth^2}
+  \tri\!\left(
+    \frac{z_e^{(t)}(\modelparams)}{\bandwidth}
+  \right)
+  +
+  \frac{\abs{z_e^{(t)}(\modelparams)}}{\bandwidth^3}
+  \indic{\abs{z_e^{(t)}(\modelparams)}<\bandwidth} \\
+  &=
+  \frac{2\abs{z_e^{(t)}(\modelparams)}-\bandwidth}{\bandwidth^3}
+  \indic{\abs{z_e^{(t)}(\modelparams)}<\bandwidth}.
+\end{aligned}
+\]
+Thus the triangle-STE hypergradient is
+\[
+\begin{aligned}
+  \frac{dL_{\mathrm{meta}}^{\triangle}}{d\bandwidth}
+  &=
+  -\frac{2\eta\lbcoef \cdot \totalexperts}{\batchsize}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \frac{\partial q_e^{(t)}}{\partial\bandwidth} \\
+  &=
+  \frac{2\eta\lbcoef \cdot \totalexperts}
+       {\batchsize\bandwidth^3}
+  \sum_{e=1}^{\totalexperts}
+  \left(
+    \assignmentfraction_e(\modelparams)
+    -
+    \frac{\activeexperts}{\totalexperts}
+  \right)
+  \sum_{t=1}^{\batchsize}
+  \left[
+    v^\top
+    \nabla_{\modelparams}z_e^{(t)}(\modelparams)
+  \right]
+  \left(
+    \bandwidth - 2\abs{z_e^{(t)}(\modelparams)}
+  \right)
+  \indic{\abs{z_e^{(t)}(\modelparams)}<\bandwidth}.
+\end{aligned}
+\]
+
+This does not require an additional STE for the meta-gradient step.  In the
+rectangular case, changing $\bandwidth$ changes the support of a hard
+indicator, so differentiating with respect to $\bandwidth$ runs into the
+zero/undefined derivative of that indicator.  In the triangle case, the
+chosen surrogate is already a continuous piecewise-linear function of
+$z_e^{(t)}/\bandwidth$.  The only nondifferentiable points are the boundary
+kinks $\abs{z_e^{(t)}}=\bandwidth$, which form a measure-zero set; elsewhere
+the expression above is the ordinary derivative of the chosen surrogate.
 
 \end{document}

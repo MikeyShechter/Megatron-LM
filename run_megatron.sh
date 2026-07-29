@@ -49,8 +49,14 @@ export WANDB_CACHE_DIR=${RUN_STORAGE}/.cache/wandb
 export WANDB_CONFIG_DIR=${RUN_STORAGE}/.config/wandb
 export XDG_CACHE_HOME=${RUN_STORAGE}/.cache
 export XDG_CONFIG_HOME=${RUN_STORAGE}/.config
-export TMPDIR=${RUN_STORAGE}/tmp/megatron
+export MEGATRON_TMP_ROOT="${RUN_STORAGE}/tmp/megatron/${SLURM_JOB_ID:-${SLURM_JOBID:-manual-$$}}"
+export TMPDIR="${MEGATRON_TMP_ROOT}/batch"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" "$TMPDIR" "${RUN_STORAGE}/logs"
+
+cleanup_tmpdir() {
+  rm -rf -- "${MEGATRON_TMP_ROOT:?}"
+}
+trap cleanup_tmpdir EXIT
 
 # NCCL / InfiniBand — same as run_moe.sh
 export NCCL_SOCKET_IFNAME=ib0
@@ -95,6 +101,8 @@ srun \
     export TRITON_LIBCUDA_PATH=/.singularity.d/libs
     export LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/compat/lib.real:\${LD_LIBRARY_PATH:-}
     export PYTHONPATH=/workspace:/workspace/.venv/lib/python3.12/site-packages:/usr/local/lib/python3.12/dist-packages:\${PYTHONPATH:-}
+    export TMPDIR=\"${MEGATRON_TMP_ROOT}/node-\${SLURM_NODEID}\"
+    mkdir -p \"\${TMPDIR}\"
     NODE_RANK=\${SLURM_NODEID}
     cd /workspace
     /workspace/.venv/bin/python -m torch.distributed.run \

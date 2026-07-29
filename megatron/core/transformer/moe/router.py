@@ -17,12 +17,15 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
     direct_load_balancing_loss_func,
+    direct_load_balancing_width_sensitivity_loss_func,
     get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
     load_balance_ste_soft_mask,
+    moe_metagrad_enabled,
     qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
+    save_to_metagrad_losses_tracker,
     save_to_router_metrics_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
@@ -420,6 +423,24 @@ class TopKRouter(Router):
                 return 0.0
         return 0.0
 
+    def has_aux_loss_type(self, aux_loss_type: str) -> bool:
+        """Return whether the given auxiliary loss type is configured."""
+        if isinstance(self.routing_type, str):
+            return self.routing_type == aux_loss_type
+        if isinstance(self.routing_type, list):
+            return aux_loss_type in self.routing_type
+        return False
+
+    def _metagrad_tracks(self, name: str) -> bool:
+        if not moe_metagrad_enabled(self.config):
+            return False
+        metagrad_params = getattr(self.config, "metagrad_params", "none")
+        if name == "width":
+            return metagrad_params in ("width", "width_and_coeff")
+        if name == "coeff":
+            return metagrad_params in ("coeff", "width_and_coeff")
+        return False
+
     def is_aux_loss_enabled(self) -> bool:
         """Check if the auxiliary loss is enabled."""
         aux_loss_types = (
@@ -429,6 +450,8 @@ class TopKRouter(Router):
         ) + DIRECT_LOAD_BALANCING_LOSS_TYPES
         for aux_loss_type in aux_loss_types:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
+                return True
+            if self._metagrad_tracks("coeff") and self.has_aux_loss_type(aux_loss_type):
                 return True
         return False
 
@@ -492,7 +515,10 @@ class TopKRouter(Router):
         direct_loss_coeffs = []
         for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES:
             direct_aux_loss_coeff = self.get_aux_loss_coeff(load_balancing_type)
-            if direct_aux_loss_coeff != 0:
+            if direct_aux_loss_coeff != 0 or (
+                self._metagrad_tracks("coeff")
+                and self.has_aux_loss_type(load_balancing_type)
+            ):
                 direct_loss_coeffs.append((load_balancing_type, direct_aux_loss_coeff))
         if not direct_loss_coeffs:
             return probs
@@ -551,6 +577,51 @@ class TopKRouter(Router):
                 load_balance_topk_indices=topk_indices,
                 load_balance_topk_plus_one_indices=topk_plus_one_indices,
             )
+            metagrad_coeff_loss = None
+            if self._metagrad_tracks("coeff"):
+                if direct_aux_loss_coeff != 0:
+                    metagrad_coeff_loss = aux_loss / direct_aux_loss_coeff
+                else:
+                    metagrad_coeff_loss = direct_load_balancing_loss_func(
+                        load_balancing_type=load_balancing_type,
+                        logits=margin_input,
+                        routing_map=routing_map,
+                        tokens_per_expert=global_tokens_per_expert,
+                        total_num_tokens=total_num_tokens,
+                        topk=self.topk,
+                        num_experts=self.config.num_moe_experts,
+                        moe_aux_loss_coeff=1.0,
+                        load_balance_ste_width=load_balance_ste_width,
+                        load_balance_ste_type=load_balance_ste_type,
+                        load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
+                        load_balance_ste_rect_poistion=load_balance_ste_rect_poistion,
+                        load_balance_gate_metric=load_balance_gate_metric,
+                        load_balance_gate_threshold=load_balance_gate_threshold,
+                        reduce_group=reduce_group,
+                        load_balance_topk_indices=topk_indices,
+                        load_balance_topk_plus_one_indices=topk_plus_one_indices,
+                    )
+            metagrad_width_loss = None
+            if self._metagrad_tracks("width"):
+                metagrad_width_loss = direct_load_balancing_width_sensitivity_loss_func(
+                    load_balancing_type=load_balancing_type,
+                    logits=margin_input,
+                    routing_map=routing_map,
+                    tokens_per_expert=global_tokens_per_expert,
+                    total_num_tokens=total_num_tokens,
+                    topk=self.topk,
+                    num_experts=self.config.num_moe_experts,
+                    moe_aux_loss_coeff=direct_aux_loss_coeff,
+                    load_balance_ste_width=load_balance_ste_width,
+                    load_balance_ste_type=load_balance_ste_type,
+                    load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
+                    load_balance_ste_rect_poistion=load_balance_ste_rect_poistion,
+                    load_balance_gate_metric=load_balance_gate_metric,
+                    load_balance_gate_threshold=load_balance_gate_threshold,
+                    reduce_group=reduce_group,
+                    load_balance_topk_indices=topk_indices,
+                    load_balance_topk_plus_one_indices=topk_plus_one_indices,
+                )
             probs = self.attach_and_log_load_balancing_loss(
                 probs,
                 direct_aux_loss_coeff,
@@ -559,6 +630,8 @@ class TopKRouter(Router):
                 reduce_group,
                 reduce_group_has_dp=use_global_lb,
                 valid_token_count=local_num_tokens,
+                metagrad_width_loss=metagrad_width_loss,
+                metagrad_coeff_loss=metagrad_coeff_loss,
             )
         return probs
 
@@ -927,6 +1000,8 @@ class TopKRouter(Router):
         reduce_group: torch.distributed.ProcessGroup,
         reduce_group_has_dp: bool = False,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        metagrad_width_loss: Optional[torch.Tensor] = None,
+        metagrad_coeff_loss: Optional[torch.Tensor] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -952,6 +1027,10 @@ class TopKRouter(Router):
             and self.config.mtp_num_layers is not None
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
+            if metagrad_width_loss is not None:
+                metagrad_width_loss = metagrad_width_loss / self.config.mtp_num_layers
+            if metagrad_coeff_loss is not None:
+                metagrad_coeff_loss = metagrad_coeff_loss / self.config.mtp_num_layers
 
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
@@ -966,14 +1045,15 @@ class TopKRouter(Router):
         else:
             layer_number = self.layer_number
 
-        save_to_aux_losses_tracker(
-            aux_loss_name,
-            aux_loss / aux_loss_coeff,
-            layer_number,
-            num_layers,
-            reduce_group=reduce_group,
-            reduce_group_has_dp=reduce_group_has_dp,
-        )
+        if aux_loss_coeff != 0:
+            save_to_aux_losses_tracker(
+                aux_loss_name,
+                aux_loss / aux_loss_coeff,
+                layer_number,
+                num_layers,
+                reduce_group=reduce_group,
+                reduce_group_has_dp=reduce_group_has_dp,
+            )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
             # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
@@ -984,9 +1064,22 @@ class TopKRouter(Router):
             # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
             # Use valid_token_count (excluding padding) if provided, otherwise use total tokens.
             num_tokens = valid_token_count if valid_token_count is not None else activation.shape[0]
-            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * num_tokens)
+            attached_aux_loss = aux_loss * num_tokens
+            if metagrad_width_loss is not None:
+                metagrad_width_loss = metagrad_width_loss * num_tokens
+            if metagrad_coeff_loss is not None:
+                metagrad_coeff_loss = metagrad_coeff_loss * num_tokens
         else:
-            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+            attached_aux_loss = aux_loss
+
+        if moe_metagrad_enabled(self.config):
+            save_to_metagrad_losses_tracker("aux", attached_aux_loss)
+            if self._metagrad_tracks("coeff"):
+                save_to_metagrad_losses_tracker("coeff", metagrad_coeff_loss)
+            if self._metagrad_tracks("width") and metagrad_width_loss is not None:
+                save_to_metagrad_losses_tracker("width", metagrad_width_loss)
+
+        activation = MoEAuxLossAutoScaler.apply(activation, attached_aux_loss)
         return activation
 
     def apply_z_loss(self, logits, padding_mask: Optional[torch.Tensor] = None):
@@ -1115,6 +1208,10 @@ class TopKRouter(Router):
         should_apply_aux_loss = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
         direct_loss_enabled = should_apply_aux_loss and any(
             self.get_aux_loss_coeff(load_balancing_type) > 0
+            or (
+                self._metagrad_tracks("coeff")
+                and self.has_aux_loss_type(load_balancing_type)
+            )
             for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
         )
         should_return_top_indices = direct_loss_enabled and not self.config.moe_router_fusion

@@ -25,6 +25,12 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.moe_utils import (
+    add_to_moe_metagrad_raw_sensitivity,
+    consume_metagrad_losses_tracker,
+    get_moe_metagrad_trainable_params,
+    moe_metagrad_enabled,
+)
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -520,6 +526,87 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     return input_tensor_grad
 
 
+def _accumulate_metagrad_raw_sensitivities(model):
+    losses_by_name = consume_metagrad_losses_tracker()
+    params = get_moe_metagrad_trainable_params(model)
+    if not params:
+        return
+
+    for name, losses in losses_by_name.items():
+        loss = sum(losses)
+        loss_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        if loss_scale is not None:
+            loss = loss * loss_scale
+
+        # Transformer Engine's operation fuser clears this indexing metadata in
+        # backward even when the autograd graph is retained. Preserve it so the
+        # remaining synthetic VJPs and the ordinary model backward can reuse the
+        # same forward graph.
+        te_saved_tensor_ranges = []
+        te_saved_tensors_to_unmark = []
+        te_tensor_object_lists = []
+        pending_grad_fns = [loss.grad_fn]
+        visited_grad_fns = set()
+        while pending_grad_fns:
+            grad_fn = pending_grad_fns.pop()
+            if grad_fn is None or grad_fn in visited_grad_fns:
+                continue
+            visited_grad_fns.add(grad_fn)
+            tensor_objects = getattr(grad_fn, "tensor_objects", None)
+            if tensor_objects is not None:
+                te_tensor_object_lists.append((grad_fn, tensor_objects))
+            for op_ctx in getattr(grad_fn, "basic_op_ctxs", ()):
+                saved_range = getattr(op_ctx, "_saved_tensors_range", None)
+                if saved_range is not None:
+                    te_saved_tensor_ranges.append((op_ctx, saved_range))
+            for saved_tensor in getattr(grad_fn, "saved_tensors", ()):
+                if saved_tensor is None:
+                    continue
+                if not hasattr(saved_tensor, "_do_not_clear"):
+                    saved_tensor._do_not_clear = True
+                    te_saved_tensors_to_unmark.append(saved_tensor)
+            pending_grad_fns.extend(next_fn for next_fn, _ in grad_fn.next_functions)
+
+        # Fused linear backward kernels accumulate the real weight gradient directly
+        # into ``main_grad`` and return a dummy tensor solely to trigger DDP hooks.
+        # Save and restore those buffers so the synthetic VJP neither captures the
+        # dummy tensor nor changes the gradients used by the normal backward pass.
+        main_grad_snapshots = {}
+        grad_added_snapshots = {}
+        for param in params:
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is None or not hasattr(param, "grad_added_to_main_grad"):
+                continue
+            main_grad_snapshots[id(param)] = main_grad.clone()
+            grad_added_snapshots[id(param)] = param.grad_added_to_main_grad
+            param.grad_added_to_main_grad = False
+
+        try:
+            grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            for param, grad in zip(params, grads):
+                param_id = id(param)
+                if (
+                    param_id in main_grad_snapshots
+                    and param.grad_added_to_main_grad
+                ):
+                    grad = param.main_grad - main_grad_snapshots[param_id]
+                if grad is not None:
+                    add_to_moe_metagrad_raw_sensitivity(name, param, grad)
+        finally:
+            for op_ctx, saved_range in te_saved_tensor_ranges:
+                op_ctx._saved_tensors_range = saved_range
+            for grad_fn, tensor_objects in te_tensor_object_lists:
+                grad_fn.tensor_objects = tensor_objects
+            for saved_tensor in te_saved_tensors_to_unmark:
+                del saved_tensor._do_not_clear
+            for param in params:
+                param_id = id(param)
+                if param_id not in main_grad_snapshots:
+                    continue
+                param.main_grad.copy_(main_grad_snapshots[param_id])
+                param.grad_added_to_main_grad = grad_added_snapshots[param_id]
+
+
 def backward_step_multimodule(
     input_tensor: Dict[str, torch.Tensor],
     output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
@@ -707,6 +794,8 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
+                    if moe_metagrad_enabled(config):
+                        _accumulate_metagrad_raw_sensitivities(model)
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
@@ -729,6 +818,8 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
+            if moe_metagrad_enabled(config):
+                _accumulate_metagrad_raw_sensitivities(model)
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
