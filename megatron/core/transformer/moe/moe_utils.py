@@ -1555,7 +1555,7 @@ def topk_routing_with_score_function(
         else:
             scores, top_indices = compute_topk(scores, topk_count, num_groups, group_topk)
             scores, top_indices = _trim_topk_plus_one(scores, top_indices)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 

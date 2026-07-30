@@ -593,7 +593,7 @@ def test_topk_routing_returns_sorted_topk_plus_one_indices_under_no_grad():
 
 @pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
 @pytest.mark.parametrize("topk", [1, 2])
-def test_sigmoid_like_topk_routing_weights_are_normalized(score_function, topk):
+def test_sigmoid_like_topk_routing_weights_follow_topk_normalization(score_function, topk):
     logits = torch.tensor(
         [
             [2.0, -1.0, 0.5, -2.0],
@@ -604,7 +604,11 @@ def test_sigmoid_like_topk_routing_weights_are_normalized(score_function, topk):
     activated_scores = _router_activation(logits, score_function)
     top_indices = torch.topk(activated_scores, k=topk, dim=-1).indices
     top_scores = torch.gather(activated_scores, dim=-1, index=top_indices)
-    top_probs = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
+    top_probs = (
+        top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
+        if topk > 1
+        else top_scores
+    )
     expected_probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
 
     routing_probs, routing_map = topk_routing_with_score_function(
@@ -614,7 +618,7 @@ def test_sigmoid_like_topk_routing_weights_are_normalized(score_function, topk):
     )
 
     torch.testing.assert_close(routing_probs, expected_probs)
-    torch.testing.assert_close(routing_probs.sum(dim=-1), torch.ones(logits.size(0)))
+    torch.testing.assert_close(routing_probs.sum(dim=-1), top_probs.sum(dim=-1))
     assert torch.equal(routing_map, expected_probs.bool())
 
 
