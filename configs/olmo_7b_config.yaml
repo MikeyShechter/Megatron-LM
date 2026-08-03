@@ -1,6 +1,6 @@
 job_details:
   name: olmoe_1b_7b
-  output_dir: /e/scratch/reformo/shechter1/checkpoints/megatron/
+  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
 
 parameters:
   # Data.

@@ -22,7 +22,7 @@ export CONF=$1
 
 REPO_DIR=/e/project1/laionize/shechter1/repos/Megatron-LM
 SIF=/e/project1/laionize/shechter1/containers/megatron-lm-dev.sif
-RUN_STORAGE=/e/scratch/reformo/shechter1
+RUN_STORAGE=/e/project1/laionize/shechter1
 
 if [[ "${CONF}" != /* ]]; then
   CONF="${SLURM_SUBMIT_DIR:-$PWD}/${CONF}"
@@ -95,8 +95,14 @@ srun \
     export TRITON_LIBCUDA_PATH=/.singularity.d/libs
     export LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/compat/lib.real:\${LD_LIBRARY_PATH:-}
     export PYTHONPATH=/workspace:/workspace/.venv/lib/python3.12/site-packages:/usr/local/lib/python3.12/dist-packages:\${PYTHONPATH:-}
-    export TMPDIR=\"${MEGATRON_TMP_ROOT}/node-\${SLURM_NODEID}\"
-    mkdir -p \"\${TMPDIR}\"
+    export TMPDIR=\"/dev/shm/megatron-${SLURM_JOB_ID}-\${SLURM_NODEID}\"
+    export TORCHINDUCTOR_CACHE_DIR=\"\${TMPDIR}/torchinductor\"
+    export TRITON_CACHE_DIR=\"\${TMPDIR}/triton\"
+    mkdir -p \"\${TMPDIR}\" \"\${TORCHINDUCTOR_CACHE_DIR}\" \"\${TRITON_CACHE_DIR}\"
+    cleanup_node_tmpdir() {
+      rm -rf -- \"\${TMPDIR}\"
+    }
+    trap cleanup_node_tmpdir EXIT
     NODE_RANK=\${SLURM_NODEID}
     cd /workspace
     /workspace/.venv/bin/python -m torch.distributed.run \

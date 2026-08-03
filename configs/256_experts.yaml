@@ -1,6 +1,6 @@
 job_details:
-  name: experts256_deepseek
-  output_dir: /e/scratch/reformo/shechter1/checkpoints/megatron/
+  name: experts256_ste_stop_grad
+  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ parameters:
 
   # ── MoE ──────────────────────────────────────────────────────────────────────
   num_experts: [256]
-  moe_router_topk: [2,4]           # = top_k
+  moe_router_topk: [2]           # = top_k
   # Megatron load-balancing choices: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, none.
   moe_grouped_gemm: [true]
   moe_token_dispatcher_type: ["alltoall"]
@@ -40,20 +40,19 @@ parameters:
   moe_router_dtype: ["fp32"]
   
   moe_use_global_lb: [true]
-  # moe_aux_loss_coeff: [0.1, 0.01, 0.001]
+  moe_aux_loss_coeff: [0.1, 0.01, 0.001]
   moe_router_score_function: ["sqrtsoftplus"]
   
-  moe_router_load_balancing_type: ["none"]
-  moe_router_enable_expert_bias: [true]
-  moe_router_bias_update_rate: [0.1, 0.01, 0.001, 0.0001]
-  moe_aux_loss_coeff: [0.0]
-  # load_balance_ste_width: [1.0]
-  # moe_learnable_bias_type: ['none', 'expert_bias', 'per_token_bias']
+  moe_router_load_balancing_type: ["centered_fsq"]
+  # moe_router_enable_expert_bias: [true]
+  # moe_router_bias_update_rate: [0.1, 0.01, 0.001, 0.0001]
+  load_balance_ste_width: [0.1, 1.0, 10.0]
+  moe_learnable_bias_type: ['expert_bias', 'per_token_bias']
   # moe_ste_rect_poistion: ['topk', 'midpoint']
-  # load_balance_ste_type: ["rect", "triangle"]
+  load_balance_ste_type: ["rect"]  # , "triangle"
   
-  # tie_learnable_bias_lr_to_aux_loss_coeff: [true]
-  # moe_learnable_bias_pass_grad_through_scores: [true]
+  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  moe_learnable_bias_pass_grad_through_scores: [false]
 
   # LIST_LB:
     # - moe_router_load_balancing_type: ["none"] # DeepSeek loss free
