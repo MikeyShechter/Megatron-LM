@@ -3264,6 +3264,8 @@ def _add_moe_args(parser):
                            'expert_bias',
                            'per_token_bias',
                            'per_token_expert_bias',
+                           'expert_bias_weight',
+                           'per_token_bias_weight',
                        ],
                        default='none',
                        dest='moe_learnable_bias_type',
@@ -3272,21 +3274,25 @@ def _add_moe_args(parser):
                             'direct routed-load (STE) losses. "expert_bias": one bias per '
                             'expert; "per_token_bias": per-token biases from a linear layer '
                             'like the router gate; "per_token_expert_bias": per-token biases '
-                            'from a linear layer plus one bias per expert. Works with any '
-                            'direct load balancing type.')
+                            'from a linear layer plus one bias per expert. These variants affect '
+                            'top-k selection only. "expert_bias_weight" and '
+                            '"per_token_bias_weight" add the corresponding correction to the '
+                            'router logits, so it affects both selection and expert combine '
+                            'weights and receives ordinary LM gradients. The weight variants '
+                            'work with aux_loss as well as direct load balancing types.')
     group.add_argument('--moe-learnable-bias-pass-grad-through-scores',
                        action='store_true', default=False,
                        dest='moe_learnable_bias_pass_grad_through_scores',
-                       help='For learnable MoE routing biases load '
-                            'balancing: pass the STE gradient of the LB loss through the '
-                            'routing scores p as well as the biases. If unset, only the '
-                            'biases receive gradient.')
+                       help='For learnable MoE routing bias load balancing: pass the LB '
+                            'gradient through the base routing scores as well as the learned '
+                            'biases. If unset, only the bias parameters receive the LB gradient.')
     group.add_argument('--moe-lm-loss-ste',
                        action='store_true', default=False,
                        dest='moe_lm_loss_ste',
-                       help='Apply the STE on the top-k selection so the LM loss '
-                            'also trains the learnable routing biases (moe_learnable_bias_type), '
-                            'letting moe_aux_loss_coeff balance LB vs LM pressure on the biases. '
+                       help='Apply the STE on top-k selection so the LM loss trains assignment '
+                            'decisions made by the learnable routing biases. Weight-bias variants '
+                            'already receive ordinary LM gradients through their expert combine '
+                            'weights; this additionally supplies an assignment-level gradient. '
                             'Requires moe_learnable_bias_type != none and (for rect/triangle) '
                             'moe_load_balance_ste_width > 0.')
     learnable_bias_lr_group = group.add_mutually_exclusive_group()

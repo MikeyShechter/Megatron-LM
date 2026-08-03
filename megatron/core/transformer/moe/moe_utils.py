@@ -69,13 +69,46 @@ MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY = "_current/MaxVioGlobal"
 
 _MOE_ROUTER_METRIC_SPECS = {
     "tokens_per_expert": "expert",
+    "accepted_tokens_per_expert": "expert",
     "prob_sum": "expert",
     "token_count": "scalar",
     "entropy_sum": "scalar",
     "avg_1_2_coef_diff_sum": "scalar",
     "ste_in_rect_count": "scalar",
+    "ste_all_experts_in_rect_count": "scalar",
     "ste_selected_count": "scalar",
     "ste_over_rect_count": "expert",
+    "dispatch_count": "scalar",
+    "dispatch_max_vio_sum": "scalar",
+    "dispatch_max_vio_max": "scalar",
+    "accepted_dispatch_max_vio_sum": "scalar",
+    "accepted_dispatch_max_vio_max": "scalar",
+    "sequence_count": "scalar",
+    "sequence_max_vio_sum": "scalar",
+    "sequence_max_vio_max": "scalar",
+    "sequence_assignment_drop_fraction_sum": "scalar",
+    "sequence_assignment_drop_fraction_max": "scalar",
+    "sequences_with_any_drop_count": "scalar",
+    "attempted_assignment_count": "scalar",
+    "accepted_assignment_count": "scalar",
+    "dropped_assignment_count": "scalar",
+    "tokens_with_any_drop_count": "scalar",
+    "fully_dropped_token_count": "scalar",
+    "attempted_routing_weight_sum": "scalar",
+    "dropped_routing_weight_sum": "scalar",
+    "capacity_slot_count": "scalar",
+    "capacity_call_count": "scalar",
+    "capacity_max_load_ratio_sum": "scalar",
+    "capacity_max_load_ratio_max": "scalar",
+    "overflowed_expert_fraction_sum": "scalar",
+}
+
+_MOE_ROUTER_MAX_METRICS = {
+    "dispatch_max_vio_max",
+    "accepted_dispatch_max_vio_max",
+    "sequence_max_vio_max",
+    "sequence_assignment_drop_fraction_max",
+    "capacity_max_load_ratio_max",
 }
 
 for _pre_activation_metric_name in (
@@ -1993,11 +2026,11 @@ def save_to_router_metrics_tracker(
     layer_number: int,
     num_layers: int,
 ) -> None:
-    """Save additive per-layer router metrics for logging.
+    """Accumulate per-layer router metrics for logging.
 
     Args:
         name (str): Metric name.
-        value (torch.Tensor): Scalar or per-expert additive value.
+        value (torch.Tensor): Scalar or per-expert value to accumulate.
         layer_number (int): 1-indexed layer number.
         num_layers (int): Total number of layers represented in the tracker.
     """
@@ -2010,7 +2043,12 @@ def save_to_router_metrics_tracker(
         tracker[name] = torch.zeros(
             (num_layers, *value.shape), device=value.device, dtype=torch.float32
         )
-    tracker[name][layer_number - 1] += value
+    if name in _MOE_ROUTER_MAX_METRICS:
+        tracker[name][layer_number - 1] = torch.maximum(
+            tracker[name][layer_number - 1], value
+        )
+    else:
+        tracker[name][layer_number - 1] += value
 
 
 def clear_moe_router_metrics_tracker() -> None:
@@ -2034,7 +2072,7 @@ def _initialize_router_metrics_tracker(
 def reduce_moe_router_metrics_tracker_across_ranks(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> None:
-    """Reduce additive MoE router metrics across pipeline, tensor, context, and data ranks."""
+    """Reduce accumulated MoE router metrics across model and data-parallel ranks."""
     tracker = get_moe_router_metrics_tracker()
     if not tracker:
         return
@@ -2048,9 +2086,14 @@ def reduce_moe_router_metrics_tracker_across_ranks(
         pp_group = pg_collection.pp
         tp_dp_cp_group = pg_collection.tp_dp_cp
 
-    for values in tracker.values():
-        torch.distributed.all_reduce(values, group=pp_group)
-        torch.distributed.all_reduce(values, group=tp_dp_cp_group)
+    for name, values in tracker.items():
+        reduce_op = (
+            torch.distributed.ReduceOp.MAX
+            if name in _MOE_ROUTER_MAX_METRICS
+            else torch.distributed.ReduceOp.SUM
+        )
+        torch.distributed.all_reduce(values, group=pp_group, op=reduce_op)
+        torch.distributed.all_reduce(values, group=tp_dp_cp_group, op=reduce_op)
 
 
 def _as_load_balance_type_list(moe_router_load_balancing_type: Union[str, List[str]]) -> List[str]:
@@ -2140,6 +2183,8 @@ def _build_moe_router_metrics_log(
     load_frac = tokens_per_expert / assignment_count.clamp(min=1.0).unsqueeze(-1)
     max_vio_per_layer = (load_frac.max(dim=-1).values - target) / target
     total_vio_per_layer = torch.abs(load_frac - target).sum(dim=-1) / target
+    prob_mean = prob_sum / token_count.clamp(min=1.0).unsqueeze(-1)
+    f_p_l1_per_layer = torch.abs(load_frac - prob_mean).sum(dim=-1)
     entropy_per_layer = metrics["entropy_sum"].float() / token_count.clamp(min=1.0)
     avg_1_2_coef_diff_per_layer = (
         metrics["avg_1_2_coef_diff_sum"].float() / token_count.clamp(min=1.0)
@@ -2164,6 +2209,129 @@ def _build_moe_router_metrics_log(
         log[f"{effective_prefix}/router_values/avg_1_2_coef_diff"] = float(
             _mean_active(avg_1_2_coef_diff_per_layer, active_layers).item()
         )
+        log[f"{effective_prefix}/router_values/f_p_l1"] = float(
+            _mean_active(f_p_l1_per_layer, active_layers).item()
+        )
+
+        dispatch_count = metrics["dispatch_count"].float().sum()
+        sequence_count = metrics["sequence_count"].float().sum()
+        log[f"{effective_prefix}/router_balance/max_vio_dispatch_mean"] = float(
+            (
+                metrics["dispatch_max_vio_sum"].float().sum()
+                / dispatch_count.clamp(min=1.0)
+            ).item()
+        )
+        log[f"{effective_prefix}/router_balance/max_vio_dispatch_worst"] = float(
+            metrics["dispatch_max_vio_max"].float().max().item()
+        )
+        log[f"{effective_prefix}/router_balance/max_vio_sequence_mean"] = float(
+            (
+                metrics["sequence_max_vio_sum"].float().sum()
+                / sequence_count.clamp(min=1.0)
+            ).item()
+        )
+        log[f"{effective_prefix}/router_balance/max_vio_sequence_worst"] = float(
+            metrics["sequence_max_vio_max"].float().max().item()
+        )
+
+        capacity_call_count = metrics["capacity_call_count"].float().sum()
+        if capacity_call_count.item() > 0:
+            attempted_assignment_count = metrics["attempted_assignment_count"].float().sum()
+            accepted_assignment_count = metrics["accepted_assignment_count"].float().sum()
+            dropped_assignment_count = metrics["dropped_assignment_count"].float().sum()
+            total_token_count = token_count.sum()
+            attempted_routing_weight_sum = (
+                metrics["attempted_routing_weight_sum"].float().sum()
+            )
+            capacity_slot_count = metrics["capacity_slot_count"].float().sum()
+
+            accepted_tokens_per_expert = metrics["accepted_tokens_per_expert"].float()
+            accepted_count_per_layer = accepted_tokens_per_expert.sum(dim=-1)
+            accepted_active_layers = accepted_count_per_layer > 0
+            accepted_load_frac = accepted_tokens_per_expert / accepted_count_per_layer.clamp(
+                min=1.0
+            ).unsqueeze(-1)
+            accepted_max_vio_per_layer = (
+                accepted_load_frac.max(dim=-1).values - target
+            ) / target
+
+            log[f"{effective_prefix}/token_dropping/assignment_drop_fraction"] = float(
+                (
+                    dropped_assignment_count / attempted_assignment_count.clamp(min=1.0)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/tokens_with_any_drop_fraction"] = float(
+                (
+                    metrics["tokens_with_any_drop_count"].float().sum()
+                    / total_token_count.clamp(min=1.0)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/fully_dropped_token_fraction"] = float(
+                (
+                    metrics["fully_dropped_token_count"].float().sum()
+                    / total_token_count.clamp(min=1.0)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/sequences_with_any_drop_fraction"] = float(
+                (
+                    metrics["sequences_with_any_drop_count"].float().sum()
+                    / sequence_count.clamp(min=1.0)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/sequence_assignment_drop_fraction_mean"] = (
+                float(
+                    (
+                        metrics["sequence_assignment_drop_fraction_sum"].float().sum()
+                        / sequence_count.clamp(min=1.0)
+                    ).item()
+                )
+            )
+            log[f"{effective_prefix}/token_dropping/sequence_assignment_drop_fraction_worst"] = (
+                float(
+                    metrics["sequence_assignment_drop_fraction_max"].float().max().item()
+                )
+            )
+            log[f"{effective_prefix}/token_dropping/routing_weight_drop_fraction"] = float(
+                (
+                    metrics["dropped_routing_weight_sum"].float().sum()
+                    / attempted_routing_weight_sum.clamp(min=1e-12)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/accepted_assignments_per_token"] = float(
+                (accepted_assignment_count / total_token_count.clamp(min=1.0)).item()
+            )
+            log[f"{effective_prefix}/token_dropping/useful_capacity_utilization"] = float(
+                (accepted_assignment_count / capacity_slot_count.clamp(min=1.0)).item()
+            )
+            log[f"{effective_prefix}/token_dropping/overflowed_expert_fraction"] = float(
+                (
+                    metrics["overflowed_expert_fraction_sum"].float().sum()
+                    / capacity_call_count
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/max_capacity_ratio_mean"] = float(
+                (
+                    metrics["capacity_max_load_ratio_sum"].float().sum()
+                    / capacity_call_count
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/max_capacity_ratio_worst"] = float(
+                metrics["capacity_max_load_ratio_max"].float().max().item()
+            )
+            log[f"{effective_prefix}/token_dropping/max_vio_accepted_dispatch_mean"] = float(
+                (
+                    metrics["accepted_dispatch_max_vio_sum"].float().sum()
+                    / dispatch_count.clamp(min=1.0)
+                ).item()
+            )
+            log[f"{effective_prefix}/token_dropping/max_vio_accepted_dispatch_worst"] = float(
+                metrics["accepted_dispatch_max_vio_max"].float().max().item()
+            )
+            log[f"{effective_prefix}/token_dropping/max_vio_accepted_aggregate"] = float(
+                _mean_active(
+                    accepted_max_vio_per_layer, accepted_active_layers
+                ).item()
+            )
 
     vio_prefixes = _validation_metric_prefixes(prefix, "vio")
     if vio_prefixes:
@@ -2179,7 +2347,6 @@ def _build_moe_router_metrics_log(
                     max_vio_per_layer[layer_idx].item()
                 )
 
-    prob_mean = prob_sum / token_count.clamp(min=1.0).unsqueeze(-1)
     aux_loss_per_layer = tokens_per_expert.new_zeros(tokens_per_expert.size(0))
     load_balance_types = _as_load_balance_type_list(moe_router_load_balancing_type)
     if "aux_loss" in load_balance_types:
@@ -2204,8 +2371,12 @@ def _build_moe_router_metrics_log(
     if ste_prefixes:
         ste_selected_count = metrics["ste_selected_count"].float()
         ste_in_rect_count = metrics["ste_in_rect_count"].float()
+        ste_all_experts_in_rect_count = metrics["ste_all_experts_in_rect_count"].float()
         ste_over_rect_count = metrics["ste_over_rect_count"].float()
         in_rect_frac = ste_in_rect_count.sum() / ste_selected_count.sum().clamp(min=1.0)
+        all_experts_in_rect_frac = ste_all_experts_in_rect_count.sum() / (
+            token_count.sum().clamp(min=1.0) * num_experts
+        )
         over_rect_frac_per_expert = (
             ste_over_rect_count / token_count.clamp(min=1.0).unsqueeze(-1)
         )
@@ -2219,6 +2390,9 @@ def _build_moe_router_metrics_log(
 
         for ste_prefix in ste_prefixes:
             log[f"{ste_prefix}/all_layers/in_rect_frac"] = float(in_rect_frac.item())
+            log[f"{ste_prefix}/all_layers/all_experts_in_rect_frac"] = float(
+                all_experts_in_rect_frac.item()
+            )
             log[f"{ste_prefix}/all_layers/max_over_rect"] = float(max_over_rect.item())
             log[f"{ste_prefix}/all_layers/avg_over_rect"] = float(avg_over_rect.item())
 

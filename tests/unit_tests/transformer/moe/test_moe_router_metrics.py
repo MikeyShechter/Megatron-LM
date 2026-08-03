@@ -50,6 +50,7 @@ def test_build_val_moe_router_metrics_log():
         "entropy_sum": torch.tensor([4.0, 6.0]),
         "avg_1_2_coef_diff_sum": torch.tensor([2.0, 4.0]),
         "ste_in_rect_count": torch.tensor([2.0, 3.0]),
+        "ste_all_experts_in_rect_count": torch.tensor([6.0, 4.0]),
         "ste_selected_count": torch.tensor([8.0, 8.0]),
         "ste_over_rect_count": torch.tensor(
             [
@@ -84,6 +85,7 @@ def test_build_val_moe_router_metrics_log():
     assert log["val/aux_loss"] == pytest.approx(1.0)
     assert log["val/router_values/avg_1_2_coef_diff"] == pytest.approx(0.375)
     assert log["ste/all_layers/in_rect_frac"] == pytest.approx(5.0 / 16.0)
+    assert log["ste/all_layers/all_experts_in_rect_frac"] == pytest.approx(10.0 / 64.0)
     assert log["ste/all_layers/max_over_rect"] == pytest.approx(0.5)
     assert log["ste/all_layers/avg_over_rect"] == pytest.approx(0.15625)
     assert all(not key.startswith("val/MaxVio") for key in log)
@@ -109,6 +111,7 @@ def test_build_task_validation_moe_router_metrics_log_skips_pre_activation_diagn
         "entropy_sum": torch.tensor([4.0, 6.0]),
         "avg_1_2_coef_diff_sum": torch.tensor([2.0, 4.0]),
         "ste_in_rect_count": torch.tensor([2.0, 3.0]),
+        "ste_all_experts_in_rect_count": torch.tensor([6.0, 4.0]),
         "ste_selected_count": torch.tensor([8.0, 8.0]),
         "ste_over_rect_count": torch.tensor(
             [
@@ -150,6 +153,7 @@ def test_build_regular_validation_moe_router_metrics_log_emits_root_pre_activati
         "entropy_sum": torch.tensor([4.0, 6.0]),
         "avg_1_2_coef_diff_sum": torch.tensor([2.0, 4.0]),
         "ste_in_rect_count": torch.tensor([2.0, 3.0]),
+        "ste_all_experts_in_rect_count": torch.tensor([6.0, 4.0]),
         "ste_selected_count": torch.tensor([8.0, 8.0]),
         "ste_over_rect_count": torch.tensor(
             [
