@@ -1649,6 +1649,16 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+def _uses_balance_only_bias_adder(args: Any) -> bool:
+    return getattr(args, 'moe_learnable_bias_type', 'none') == 'bias_adder_balance_only'
+
+
+def _has_aux_loss_coeff_tied_parameter_lr(args: Any) -> bool:
+    return _uses_balance_only_bias_adder(args) or getattr(
+        args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False
+    )
+
+
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
@@ -1661,18 +1671,31 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
-    moe_learnable_bias_lr_mult = getattr(args, 'moe_learnable_bias_lr_mult', None)
-    if moe_learnable_bias_lr_mult is not None:
-        moe_learnable_bias_override = {'max_lr': config.lr * moe_learnable_bias_lr_mult}
+    if _uses_balance_only_bias_adder(args):
+        aux_loss_coeff = args.moe_aux_loss_coeff
+        aux_only_override = {
+            'max_lr': config.lr * aux_loss_coeff,
+            'is_aux_loss_coeff_tied': True,
+        }
         if config.min_lr is not None:
-            moe_learnable_bias_override['min_lr'] = (
-                config.min_lr * moe_learnable_bias_lr_mult
+            aux_only_override['min_lr'] = config.min_lr * aux_loss_coeff
+        config_overrides[ParamKey(attr='is_moe_aux_only_parameter')] = aux_only_override
+    else:
+        moe_learnable_bias_lr_mult = getattr(args, 'moe_learnable_bias_lr_mult', None)
+        if moe_learnable_bias_lr_mult is not None:
+            moe_learnable_bias_override = {
+                'max_lr': config.lr * moe_learnable_bias_lr_mult
+            }
+            if config.min_lr is not None:
+                moe_learnable_bias_override['min_lr'] = (
+                    config.min_lr * moe_learnable_bias_lr_mult
+                )
+            config_overrides[ParamKey(attr='is_moe_learnable_bias_parameter')] = (
+                moe_learnable_bias_override
             )
-        config_overrides[ParamKey(attr='is_moe_learnable_bias_parameter')] = (
-            moe_learnable_bias_override
-        )
 
     return config, config_overrides
+
 
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
@@ -2141,7 +2164,7 @@ def _restore_tied_moe_aux_loss_coeff_for_resume(
     args, checkpointing_context, load_optimizer
 ):
     if (
-        not getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False)
+        not _has_aux_loss_coeff_tied_parameter_lr(args)
         or args.load is None
         or args.moe_use_upcycling
         or args.finetune
@@ -2160,7 +2183,7 @@ def _restore_tied_moe_aux_loss_coeff_for_resume(
     _set_moe_aux_loss_coeff(args, setup_coeff)
     print_rank_0(
         f"Restored moe_aux_loss_coeff={setup_coeff} from checkpoint before "
-        "building tied learnable-bias LR groups"
+        "building auxiliary-coefficient-tied LR groups"
     )
     return checkpoint_coeff
 
@@ -2177,7 +2200,7 @@ def _clamp_restored_moe_aux_loss_coeff_after_load(
         unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
     )
     get_model_config(model_config_source).moe_aux_loss_coeff = clamped_coeff
-    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+    if _has_aux_loss_coeff_tied_parameter_lr(args):
         _update_tied_moe_learnable_bias_lr(
             args, optimizer, opt_param_scheduler, restored_coeff, clamped_coeff
         )
@@ -2234,18 +2257,23 @@ def _update_tied_moe_learnable_bias_lr(
     old_min_lr = args.min_lr * old_coeff if args.min_lr is not None else None
     new_min_lr = args.min_lr * new_coeff if args.min_lr is not None else None
 
+    balance_only_bias_adder = _uses_balance_only_bias_adder(args)
     for param_group in optimizer.param_groups:
-        has_learnable_bias_param = any(
-            getattr(param, 'is_moe_learnable_bias_parameter', False)
-            for param in param_group.get('params', [])
-        )
-        if (
-            not has_learnable_bias_param
-            and not _param_group_matches_tied_moe_learnable_bias_lr(
-                param_group, old_max_lr, old_min_lr
+        if balance_only_bias_adder:
+            if not param_group.get('is_aux_loss_coeff_tied', False):
+                continue
+        else:
+            has_learnable_bias_param = any(
+                getattr(param, 'is_moe_learnable_bias_parameter', False)
+                for param in param_group.get('params', [])
             )
-        ):
-            continue
+            if (
+                not has_learnable_bias_param
+                and not _param_group_matches_tied_moe_learnable_bias_lr(
+                    param_group, old_max_lr, old_min_lr
+                )
+            ):
+                continue
 
         param_group['max_lr'] = new_max_lr
         if args.min_lr is not None:
@@ -2495,7 +2523,7 @@ def _apply_metagrad_scalar_updates(
         _set_moe_aux_loss_coeff(args, new_coeff)
         if model_config is not None:
             model_config.moe_aux_loss_coeff = new_coeff
-        if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+        if _has_aux_loss_coeff_tied_parameter_lr(args):
             _update_tied_moe_learnable_bias_lr(
                 args, optimizer, opt_param_scheduler, old_coeff, new_coeff
             )
@@ -2537,7 +2565,7 @@ def _maybe_update_moe_balance_control_from_vio(
     _set_moe_aux_loss_coeff(args, new_coeff)
     if model_config is not None:
         model_config.moe_aux_loss_coeff = new_coeff
-    if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
+    if _has_aux_loss_coeff_tied_parameter_lr(args):
         _update_tied_moe_learnable_bias_lr(
             args, optimizer, opt_param_scheduler, old_coeff, new_coeff
         )

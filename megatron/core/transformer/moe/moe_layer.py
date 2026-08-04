@@ -125,6 +125,10 @@ class RouterInterface(Protocol):
         """
         ...
 
+    def prepare_input(self, input: torch.Tensor, /) -> torch.Tensor:
+        """Prepare the representation shared by the router and experts."""
+        ...
+
     def set_layer_number(self, layer_number: int) -> None:
         """Set the layer number for the router.
 
@@ -587,6 +591,7 @@ class MoELayer(BaseMoELayer):
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
+        hidden_states = self.router.prepare_input(hidden_states)
         probs, routing_map = self.route(hidden_states)
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
@@ -626,6 +631,7 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
+                    hidden_states = self.router.prepare_input(hidden_states)
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)

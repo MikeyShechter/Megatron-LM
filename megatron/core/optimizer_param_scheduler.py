@@ -35,6 +35,7 @@ class ParamGroupOverride(TypedDict, total=False):
     end_wd: float
     wd_mult: float
     optimizer: str
+    is_aux_loss_coeff_tied: bool
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:

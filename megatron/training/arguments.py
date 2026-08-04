@@ -3266,6 +3266,8 @@ def _add_moe_args(parser):
                            'per_token_expert_bias',
                            'expert_bias_weight',
                            'per_token_bias_weight',
+                           'bias_adder_joint',
+                           'bias_adder_balance_only',
                        ],
                        default='none',
                        dest='moe_learnable_bias_type',
@@ -3279,7 +3281,12 @@ def _add_moe_args(parser):
                             '"per_token_bias_weight" add the corresponding correction to the '
                             'router logits, so it affects both selection and expert combine '
                             'weights and receives ordinary LM gradients. The weight variants '
-                            'work with aux_loss as well as direct load balancing types.')
+                            'work with aux_loss as well as direct load balancing types. '
+                            '"bias_adder_joint" and "bias_adder_balance_only" send '
+                            'Norm(x + A x) to both the router and experts while restricting LB '
+                            'gradients to A. The joint variant also gives A LM gradients; the '
+                            'balance-only variant does not and automatically scales A\'s learning '
+                            'rate by moe_aux_loss_coeff.')
     group.add_argument('--moe-learnable-bias-pass-grad-through-scores',
                        action='store_true', default=False,
                        dest='moe_learnable_bias_pass_grad_through_scores',

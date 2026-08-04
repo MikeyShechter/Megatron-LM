@@ -147,6 +147,10 @@ class Router(ABC, MegatronModule):
         """Set the layer number for the router."""
         self.layer_number = layer_number
 
+    def prepare_input(self, input: torch.Tensor) -> torch.Tensor:
+        """Prepare the representation shared by the router and experts."""
+        return input
+
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.
@@ -267,6 +271,10 @@ class TopKRouter(Router):
         self.learnable_bias_weight = None
         self._per_token_bias = None
         self._per_token_bias_for_load_balance = None
+        self.bias_adder_weight = None
+        self.bias_adder_norm = None
+        self._bias_adder_input_for_load_balance = None
+        self._bias_adder_logits_for_load_balance = None
         if self.learnable_bias_type != "none":
             assert self.learnable_bias_type in (
                 "expert_bias",
@@ -274,6 +282,8 @@ class TopKRouter(Router):
                 "per_token_expert_bias",
                 "expert_bias_weight",
                 "per_token_bias_weight",
+                "bias_adder_joint",
+                "bias_adder_balance_only",
             ), (
                 f"Invalid moe_learnable_bias_type: {self.learnable_bias_type}"
             )
@@ -310,6 +320,29 @@ class TopKRouter(Router):
             )
             setattr(self.learnable_bias_weight, 'sequence_parallel', self.config.sequence_parallel)
             setattr(self.learnable_bias_weight, 'is_moe_learnable_bias_parameter', True)
+        if self._uses_bias_adder():
+            self.bias_adder_weight = torch.nn.Parameter(
+                torch.zeros(
+                    (self.config.hidden_size, self.config.hidden_size),
+                    dtype=self.config.params_dtype,
+                )
+            )
+            setattr(self.bias_adder_weight, 'sequence_parallel', self.config.sequence_parallel)
+            if self.learnable_bias_type == "bias_adder_balance_only":
+                setattr(self.bias_adder_weight, 'is_moe_aux_only_parameter', True)
+
+            norm_cls = (
+                torch.nn.RMSNorm
+                if self.config.normalization == "RMSNorm"
+                else torch.nn.LayerNorm
+            )
+            self.bias_adder_norm = norm_cls(
+                self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                dtype=self.config.params_dtype,
+            )
+            for parameter in self.bias_adder_norm.parameters():
+                setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
@@ -650,6 +683,77 @@ class TopKRouter(Router):
     def _learnable_bias_affects_expert_weights(self) -> bool:
         """Whether the learnable bias is added to logits used for routing weights."""
         return self.learnable_bias_type in ("expert_bias_weight", "per_token_bias_weight")
+
+    def _uses_bias_adder(self) -> bool:
+        """Whether to transform the representation shared by routing and experts."""
+        return self.learnable_bias_type in (
+            "bias_adder_joint",
+            "bias_adder_balance_only",
+        )
+
+    def _apply_bias_adder_norm(
+        self, input: torch.Tensor, detach_parameters: bool = False
+    ) -> torch.Tensor:
+        """Apply the bias-adder normalization, optionally freezing its affine parameters."""
+        if not detach_parameters:
+            return self.bias_adder_norm(input)
+
+        weight = self.bias_adder_norm.weight.detach()
+        if self.config.normalization == "RMSNorm":
+            return torch.nn.functional.rms_norm(
+                input,
+                (self.config.hidden_size,),
+                weight=weight,
+                eps=self.config.layernorm_epsilon,
+            )
+        return torch.nn.functional.layer_norm(
+            input,
+            (self.config.hidden_size,),
+            weight=weight,
+            bias=self.bias_adder_norm.bias.detach(),
+            eps=self.config.layernorm_epsilon,
+        )
+
+    def prepare_input(self, input: torch.Tensor) -> torch.Tensor:
+        """Return Norm(x + A x) for both routing and expert computation.
+
+        The auxiliary-loss graph is numerically identical, but only A remains
+        differentiable. In the balance-only variant the main graph uses detach(A),
+        so A receives no LM gradient while the LM gradient to x is preserved.
+        """
+        self._bias_adder_input_for_load_balance = None
+        if not self._uses_bias_adder():
+            return input
+        if self.bias_adder_weight.device != input.device:
+            self.bias_adder_weight.data = self.bias_adder_weight.data.to(device=input.device)
+            self.bias_adder_norm.to(device=input.device)
+
+        main_weight = self.bias_adder_weight
+        if self.learnable_bias_type == "bias_adder_balance_only":
+            main_weight = main_weight.detach()
+        main_input = input + torch.nn.functional.linear(input, main_weight)
+        transformed_input = self._apply_bias_adder_norm(main_input)
+
+        if self.training and torch.is_grad_enabled():
+            detached_input = input.detach()
+            load_balance_input = detached_input + torch.nn.functional.linear(
+                detached_input, self.bias_adder_weight
+            )
+            self._bias_adder_input_for_load_balance = self._apply_bias_adder_norm(
+                load_balance_input, detach_parameters=True
+            )
+
+        return transformed_input
+
+    def _gating_with_detached_parameters(self, input: torch.Tensor) -> torch.Tensor:
+        """Apply the router gate while allowing gradients only to its input."""
+        router_dtype = input.dtype
+        if self.config.moe_router_dtype == 'fp32':
+            router_dtype = torch.float32
+        elif self.config.moe_router_dtype == 'fp64':
+            router_dtype = torch.float64
+        bias = self.bias.detach() if self.bias is not None else None
+        return router_gating_linear(input, self.weight.detach(), bias, router_dtype)
 
     def _get_raw_learnable_routing_bias_components(self, for_load_balance: bool = False):
         """Return raw expert, per-token, and combined learnable routing biases."""
@@ -1345,7 +1449,11 @@ class TopKRouter(Router):
         # representations are detached, leaving only the learned bias parameters trainable.
         learnable_bias = self._get_learnable_routing_bias()
         learnable_bias_affects_weights = self._learnable_bias_affects_expert_weights()
-        logits_for_load_balance = logits
+        logits_for_load_balance = (
+            self._bias_adder_logits_for_load_balance
+            if self._bias_adder_logits_for_load_balance is not None
+            else logits
+        )
         logits_for_lm_ste = logits
         if learnable_bias is not None and learnable_bias_affects_weights:
             learnable_bias_for_load_balance = self._get_learnable_routing_bias(
@@ -1361,7 +1469,7 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
-        if not learnable_bias_affects_weights:
+        if not learnable_bias_affects_weights and not self._uses_bias_adder():
             logits_for_load_balance = logits
             logits_for_lm_ste = logits
 
@@ -1462,6 +1570,7 @@ class TopKRouter(Router):
         if (
             self.lm_loss_ste
             and self.learnable_bias_type != "none"
+            and not self._uses_bias_adder()
             and self.training
             and torch.is_grad_enabled()
         ):
@@ -1476,7 +1585,9 @@ class TopKRouter(Router):
         should_track_router_metrics = self.layer_number is not None
         if should_apply_aux_loss or should_track_router_metrics:
             aux_logits = (
-                logits_for_load_balance if learnable_bias_affects_weights else logits
+                logits_for_load_balance
+                if learnable_bias_affects_weights or self._uses_bias_adder()
+                else logits
             )
             aux_routing_output = compute_routing_scores_for_aux_loss(
                 aux_logits,
@@ -1578,6 +1689,11 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        self._bias_adder_logits_for_load_balance = None
+        if self._bias_adder_input_for_load_balance is not None:
+            self._bias_adder_logits_for_load_balance = self._gating_with_detached_parameters(
+                self._bias_adder_input_for_load_balance
+            )
 
         # Per-token routing bias: a linear layer exactly like the router gate.
         self._per_token_bias = None
