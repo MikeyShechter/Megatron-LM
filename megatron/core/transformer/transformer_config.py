@@ -641,6 +641,10 @@ class TransformerConfig(ModelParallelConfig):
     micro-batch level.
     - "fsq": Fractional-squared routed-load loss with optional STE.
     - "centered_fsq": Centered fractional-squared routed-load loss with optional STE.
+    - "quantile_correction_ste": Centered fractional-squared routed-load loss whose
+      backward pass uses the batch's per-expert Quantile Balancing correction.
+    - "fixed_number_boundary_ste": Centered fractional-squared routed-load loss whose
+      backward pass uses the M closest boundary tokens for every expert.
     - "centered_fsq_and_var": Centered fractional-squared routed-load loss plus a hard
       load-variance penalty, both differentiated through the load-balance STE.
     - "noisy_centered_fsq": Analytic uniformly noised centered fractional-squared
@@ -655,6 +659,8 @@ class TransformerConfig(ModelParallelConfig):
     - "quantile_balancing": Dual coordinate-descent quantile balancing. Load balance is
     handled by an internal per-expert bias update; auxiliary losses must be disabled
     (`moe_aux_loss_coeff` = 0) when QB is selected.
+    - "qb_projection_distillation": Distills a stopped-gradient QB-corrected Top-K target
+      into the raw router logits.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -739,6 +745,13 @@ class TransformerConfig(ModelParallelConfig):
     updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
     no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
 
+    moe_qb_projection_temperature: float = 1.0
+    """Temperature used only by the QB projection distillation probability transform."""
+
+    moe_qb_projection_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Probability transform used only by QB projection distillation. Positive sigmoid and
+    sqrtsoftplus scores are normalized across experts before the distillation loss."""
+
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
@@ -769,7 +782,22 @@ class TransformerConfig(ModelParallelConfig):
             }
         },
     )
-    """Constant width of finite-window STEs used by direct routed-load balancing losses."""
+    """Constant width of finite-window STEs used by direct routed-load balancing losses.
+    This is not used by `quantile_correction_ste` or `fixed_number_boundary_ste`."""
+
+    moe_load_balance_ste_boundary_fraction: float = field(
+        default=0.0,
+        metadata={
+            "argparse_meta": {
+                "arg_names": [
+                    "--moe-load-balance-ste-boundary-fraction",
+                    "--load-balance-ste-boundary-fraction",
+                ]
+            }
+        },
+    )
+    """Fraction of tokens closest to each expert boundary used by
+    `fixed_number_boundary_ste`. The resulting M is `ceil(fraction * valid_tokens)`."""
 
     metagrad_params: str = "none"
     """Meta-gradient-controlled load-balance parameters: none, width, coeff, or width_and_coeff."""
@@ -1359,6 +1387,37 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_load_balance_ste_width < 0.0:
             raise ValueError("moe_load_balance_ste_width must be non-negative")
+        if not 0.0 <= self.moe_load_balance_ste_boundary_fraction <= 1.0:
+            raise ValueError(
+                "moe_load_balance_ste_boundary_fraction must be between 0 and 1"
+            )
+        if (
+            self.moe_load_balance_ste_width > 0.0
+            and self.moe_load_balance_ste_boundary_fraction > 0.0
+        ):
+            raise ValueError(
+                "moe_load_balance_ste_width and moe_load_balance_ste_boundary_fraction are "
+                "mutually exclusive"
+            )
+
+        load_balancing_types = (
+            self.moe_router_load_balancing_type
+            if isinstance(self.moe_router_load_balancing_type, list)
+            else [self.moe_router_load_balancing_type]
+        )
+        if (
+            "fixed_number_boundary_ste" in load_balancing_types
+            and self.moe_load_balance_ste_boundary_fraction == 0.0
+        ):
+            raise ValueError(
+                "fixed_number_boundary_ste requires "
+                "moe_load_balance_ste_boundary_fraction to be positive"
+            )
+        if (
+            "qb_projection_distillation" in load_balancing_types
+            and self.moe_qb_projection_temperature <= 0.0
+        ):
+            raise ValueError("moe_qb_projection_temperature must be positive")
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
@@ -1369,6 +1428,8 @@ class TransformerConfig(ModelParallelConfig):
                         "aux_loss",
                         "fsq",
                         "centered_fsq",
+                        "quantile_correction_ste",
+                        "fixed_number_boundary_ste",
                         "centered_fsq_and_var",
                         "noisy_centered_fsq",
                         "maxvio",
@@ -1377,18 +1438,23 @@ class TransformerConfig(ModelParallelConfig):
                         "seq_aux_loss",
                         "global_aux_loss",
                         "quantile_balancing",
+                        "qb_projection_distillation",
                         "none",
                     ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
-                            "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, "
-                            "maxvio, maxviosq, totalvio, seq_aux_loss, global_aux_loss, "
-                            "quantile_balancing or none load balancing"
+                            "fsq, centered_fsq, quantile_correction_ste, "
+                            "fixed_number_boundary_ste, centered_fsq_and_var, "
+                            "noisy_centered_fsq, maxvio, maxviosq, totalvio, seq_aux_loss, "
+                            "global_aux_loss, quantile_balancing, qb_projection_distillation or "
+                            "none load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
                 "fsq",
                 "centered_fsq",
+                "quantile_correction_ste",
+                "fixed_number_boundary_ste",
                 "centered_fsq_and_var",
                 "noisy_centered_fsq",
                 "maxvio",
@@ -1397,13 +1463,15 @@ class TransformerConfig(ModelParallelConfig):
                 "seq_aux_loss",
                 "global_aux_loss",
                 "quantile_balancing",
+                "qb_projection_distillation",
                 "none",
             ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
-                    "fsq, centered_fsq, centered_fsq_and_var, noisy_centered_fsq, maxvio, "
-                    "maxviosq, totalvio, seq_aux_loss, global_aux_loss, quantile_balancing or "
-                    "none load balancing"
+                    "fsq, centered_fsq, quantile_correction_ste, fixed_number_boundary_ste, "
+                    "centered_fsq_and_var, noisy_centered_fsq, maxvio, maxviosq, totalvio, "
+                    "seq_aux_loss, global_aux_loss, quantile_balancing, "
+                    "qb_projection_distillation or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

@@ -2791,6 +2791,8 @@ def training_log(
         for load_balancing_type in (
             "fsq",
             "centered_fsq",
+            "quantile_correction_ste",
+            "fixed_number_boundary_ste",
             "centered_fsq_and_var",
             "noisy_centered_fsq",
             "maxvio",
@@ -2803,6 +2805,8 @@ def training_log(
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in moe_router_load_balancing_types:
             track_names.append("global_load_balancing_loss")
+        if "qb_projection_distillation" in moe_router_load_balancing_types:
+            track_names.append("qb_projection_distillation_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 

@@ -3198,6 +3198,8 @@ def _add_moe_args(parser):
                            'aux_loss',
                            'fsq',
                            'centered_fsq',
+                           'quantile_correction_ste',
+                           'fixed_number_boundary_ste',
                            'centered_fsq_and_var',
                            'noisy_centered_fsq',
                            'maxvio',
@@ -3207,10 +3209,11 @@ def _add_moe_args(parser):
                            'global_aux_loss',
                            'sinkhorn',
                            'quantile_balancing',
+                           'qb_projection_distillation',
                            'none',
                        ],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "fsq", "centered_fsq", "centered_fsq_and_var", "noisy_centered_fsq", "maxvio", "maxviosq", and "totalvio" correspond to direct routed-load losses; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" uses dual coordinate descent on a per-expert bias to handle load balance internally; and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "fsq", "centered_fsq", "quantile_correction_ste", "fixed_number_boundary_ste", "centered_fsq_and_var", "noisy_centered_fsq", "maxvio", "maxviosq", and "totalvio" correspond to direct routed-load losses; "qb_projection_distillation" trains raw router logits against a QB-corrected Top-K target; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" uses dual coordinate descent on a per-expert bias to handle load balance internally; and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-balance-update-rate', type=float, default=0.0,
@@ -3283,8 +3286,9 @@ def _add_moe_args(parser):
                             'weights and receives ordinary LM gradients. The weight variants '
                             'work with aux_loss as well as direct load balancing types. '
                             '"bias_adder_joint" and "bias_adder_balance_only" send '
-                            'Norm(x + A x) to both the router and experts while restricting LB '
-                            'gradients to A. The joint variant also gives A LM gradients; the '
+                            'parameter-free Norm(x + A x) to both the router and experts while '
+                            'restricting LB gradients to A. The joint variant also gives A LM '
+                            'gradients; the '
                             'balance-only variant does not and automatically scales A\'s learning '
                             'rate by moe_aux_loss_coeff.')
     group.add_argument('--moe-learnable-bias-pass-grad-through-scores',

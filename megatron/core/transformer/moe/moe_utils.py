@@ -78,6 +78,9 @@ _MOE_ROUTER_METRIC_SPECS = {
     "ste_all_experts_in_rect_count": "scalar",
     "ste_selected_count": "scalar",
     "ste_over_rect_count": "expert",
+    "quantile_delta_bias_sum": "expert",
+    "quantile_delta_bias_count": "scalar",
+    "quantile_affected_entry_count": "scalar",
     "dispatch_count": "scalar",
     "dispatch_max_vio_sum": "scalar",
     "dispatch_max_vio_max": "scalar",
@@ -332,6 +335,8 @@ class _TanhSTE(torch.autograd.Function):
 DIRECT_LOAD_BALANCING_LOSS_TYPES = (
     "fsq",
     "centered_fsq",
+    "quantile_correction_ste",
+    "fixed_number_boundary_ste",
     "centered_fsq_and_var",
     "noisy_centered_fsq",
     "maxvio",
@@ -409,7 +414,13 @@ def _direct_load_balance_from_load(
 
     if load_balancing_type == "fsq":
         return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
-    if load_balancing_type in ("centered_fsq", "centered_fsq_and_var", "noisy_centered_fsq"):
+    if load_balancing_type in (
+        "centered_fsq",
+        "quantile_correction_ste",
+        "fixed_number_boundary_ste",
+        "centered_fsq_and_var",
+        "noisy_centered_fsq",
+    ):
         return 1.0 + num_experts_tensor * torch.square(load_frac - expected_frac).sum(dim=-1)
     if load_balancing_type == "maxvio":
         return 1.0 + (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
@@ -559,6 +570,292 @@ def _load_balance_ste_load_surrogate(
     return ste_tokens_per_expert, margin, valid_tokens
 
 
+def _gather_valid_load_balance_margins(
+    margin: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Gather valid stopped-gradient margins over the load-balancing group."""
+    with torch.no_grad():
+        gathered_margin = margin.detach().float()
+        gathered_valid_tokens = valid_tokens.detach()
+        gather_size = reduce_group.size() if reduce_group is not None else 1
+        if gather_size > 1:
+            local_num_tokens = gathered_margin.size(0)
+            full_margin = torch.empty(
+                (local_num_tokens * gather_size, num_experts),
+                device=gathered_margin.device,
+                dtype=gathered_margin.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(
+                full_margin, gathered_margin.contiguous(), group=reduce_group
+            )
+            full_valid_tokens = torch.empty(
+                local_num_tokens * gather_size,
+                device=gathered_valid_tokens.device,
+                dtype=torch.uint8,
+            )
+            torch.distributed.all_gather_into_tensor(
+                full_valid_tokens,
+                gathered_valid_tokens.to(dtype=torch.uint8).contiguous(),
+                group=reduce_group,
+            )
+            gathered_margin = full_margin
+            gathered_valid_tokens = full_valid_tokens.bool()
+
+        return gathered_margin[gathered_valid_tokens]
+
+
+def _quantile_correction_delta_bias(
+    margin: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    topk: int,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Return the stopped-gradient QB correction for each expert."""
+    with torch.no_grad():
+        quantile_margin = _gather_valid_load_balance_margins(
+            margin, valid_tokens, num_experts, reduce_group
+        )
+
+        num_valid_tokens = quantile_margin.size(0)
+        target_assignments = num_valid_tokens * topk // num_experts
+        kth_smallest = num_valid_tokens - target_assignments
+        target_boundary = torch.kthvalue(
+            quantile_margin, kth_smallest, dim=0
+        ).values
+        return -target_boundary
+
+
+def _fixed_boundary_radius(
+    margin: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    boundary_fraction: float,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Return each expert's M-th margin radius."""
+    with torch.no_grad():
+        absolute_margin = _gather_valid_load_balance_margins(
+            margin, valid_tokens, num_experts, reduce_group
+        ).abs()
+        boundary_tokens = math.ceil(boundary_fraction * absolute_margin.size(0))
+        return torch.kthvalue(absolute_margin, boundary_tokens, dim=0).values
+
+
+class _FixedBoundaryLoadSTE(torch.autograd.Function):
+    """Hard routed load with a fixed-number boundary derivative."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        margin: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        forward_load: torch.Tensor,
+        radius: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(margin, valid_tokens, radius)
+        return forward_load
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        margin, valid_tokens, radius = ctx.saved_tensors
+        boundary_mask = margin.float().abs() <= radius.float().unsqueeze(0)
+        boundary_mask = boundary_mask & valid_tokens.unsqueeze(-1)
+        ste_grad = boundary_mask.float()
+        grad_margin = grad_output.unsqueeze(0).float() * ste_grad
+        return grad_margin.to(dtype=margin.dtype), None, None, None
+
+
+def _fixed_boundary_load_surrogate(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    forward_load: torch.Tensor,
+    boundary_fraction: float,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    ste_rect_poistion: str,
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the hard-load surrogate using the M closest tokens per expert."""
+    margin, valid_tokens = _load_balance_margin(
+        logits,
+        routing_map,
+        ste_rect_poistion,
+        topk_indices=topk_indices,
+        topk_plus_one_indices=topk_plus_one_indices,
+    )
+    radius = _fixed_boundary_radius(
+        margin,
+        valid_tokens,
+        boundary_fraction,
+        num_experts,
+        reduce_group,
+    )
+    forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
+    ste_tokens_per_expert = _FixedBoundaryLoadSTE.apply(
+        margin, valid_tokens, forward_load, radius
+    )
+    return ste_tokens_per_expert, margin, valid_tokens
+
+
+class _QuantileCorrectionLoadSTE(torch.autograd.Function):
+    """Hard routed load with the quantile-secant derivative in the backward pass."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        margin: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        forward_load: torch.Tensor,
+        delta_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(margin, valid_tokens, delta_bias)
+        return forward_load
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        margin, valid_tokens, delta_bias = ctx.saved_tensors
+        margin_float = margin.float()
+        delta_bias_float = delta_bias.float().unsqueeze(0)
+        nonzero_delta = delta_bias_float != 0.0
+        safe_delta = torch.where(
+            nonzero_delta, delta_bias_float, torch.ones_like(delta_bias_float)
+        )
+        hard_assignment = (margin_float > 0.0).to(dtype=torch.float32)
+        corrected_assignment = (margin_float + delta_bias_float > 0.0).to(
+            dtype=torch.float32
+        )
+        ste_grad = (corrected_assignment - hard_assignment) / safe_delta
+        ste_grad = ste_grad * nonzero_delta.to(dtype=ste_grad.dtype)
+        ste_grad = ste_grad * valid_tokens.unsqueeze(-1).to(dtype=ste_grad.dtype)
+        grad_margin = grad_output.unsqueeze(0).float() * ste_grad
+        return grad_margin.to(dtype=margin.dtype), None, None, None
+
+
+def _quantile_correction_load_surrogate(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    forward_load: torch.Tensor,
+    topk: int,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    delta_bias: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the hard-load surrogate and its per-expert QB correction."""
+    margin, valid_tokens = _load_balance_margin(
+        logits,
+        routing_map,
+        "topk_plus_one",
+        topk_plus_one_indices=topk_plus_one_indices,
+    )
+    if delta_bias is None:
+        delta_bias = _quantile_correction_delta_bias(
+            margin, valid_tokens, topk, num_experts, reduce_group
+        )
+    forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
+    ste_tokens_per_expert = _QuantileCorrectionLoadSTE.apply(
+        margin, valid_tokens, forward_load, delta_bias
+    )
+    return ste_tokens_per_expert, margin, valid_tokens, delta_bias
+
+
+def _qb_projection_target(
+    logits: torch.Tensor,
+    topk: int,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build a stopped-gradient QB-corrected Top-K target from raw router logits."""
+    with torch.no_grad():
+        raw_scores = logits.detach().float()
+        current_topk = torch.topk(raw_scores, k=topk + 1, dim=-1)
+        current_indices = current_topk.indices[:, :topk]
+        routing_map = torch.zeros_like(raw_scores, dtype=torch.bool)
+        routing_map.scatter_(1, current_indices, True)
+        valid_tokens = torch.ones(
+            raw_scores.size(0), device=raw_scores.device, dtype=torch.bool
+        )
+        if padding_mask is not None:
+            valid_tokens = ~padding_mask
+            routing_map = routing_map & valid_tokens.unsqueeze(-1)
+
+        margin = raw_scores - current_topk.values[:, topk : topk + 1]
+        delta_bias = _quantile_correction_delta_bias(
+            margin,
+            valid_tokens,
+            topk,
+            num_experts,
+            reduce_group,
+        )
+        target_indices = torch.topk(
+            raw_scores + delta_bias.unsqueeze(0), k=topk, dim=-1
+        ).indices
+        target = torch.zeros_like(raw_scores)
+        target.scatter_(1, target_indices, 1.0)
+        return target * valid_tokens.unsqueeze(-1).float()
+
+
+def qb_projection_distillation_loss_func(
+    logits: torch.Tensor,
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    temperature: float,
+    projection_score_function: str,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Distill a QB-corrected target into the raw router logits."""
+    target = _qb_projection_target(
+        logits,
+        topk,
+        num_experts,
+        reduce_group,
+        padding_mask=padding_mask,
+    )
+    scaled_logits = logits.float() / temperature
+    if projection_score_function == "softmax":
+        log_prob = torch.log_softmax(scaled_logits, dim=-1)
+    else:
+        if projection_score_function == "sigmoid":
+            log_positive_scores = torch.nn.functional.logsigmoid(scaled_logits)
+        elif projection_score_function == "sqrtsoftplus":
+            log_positive_scores = 0.5 * torch.log(
+                torch.nn.functional.softplus(scaled_logits)
+            )
+        else:
+            raise ValueError(
+                f"Unsupported QB projection score function: {projection_score_function}"
+            )
+        log_prob = log_positive_scores - torch.logsumexp(
+            log_positive_scores, dim=-1, keepdim=True
+        )
+
+    local_loss_sum = -(target * log_prob).sum()
+    local_valid_tokens = target.any(dim=-1).sum().float()
+    if reduce_group is not None:
+        total_valid_tokens = reduce_from_tensor_model_parallel_region(
+            local_valid_tokens, reduce_group
+        )
+    else:
+        total_valid_tokens = local_valid_tokens
+    return (
+        local_loss_sum
+        * local_loss_sum.new_tensor(float(moe_aux_loss_coeff))
+        / (total_valid_tokens * float(topk))
+    )
+
+
 def _centered_fsq_expected_indicator(
     margin: torch.Tensor,
     valid_tokens: torch.Tensor,
@@ -676,6 +973,8 @@ def direct_load_balancing_loss_func(
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     load_balance_topk_indices: Optional[torch.Tensor] = None,
     load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
+    quantile_correction_delta_bias: Optional[torch.Tensor] = None,
+    load_balance_ste_boundary_fraction: float = 0.0,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
     total_num_tokens_tensor = torch.as_tensor(
@@ -705,7 +1004,44 @@ def direct_load_balancing_loss_func(
             topk_plus_one_indices=load_balance_topk_plus_one_indices,
         )
     else:
-        if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
+        if load_balancing_type == "quantile_correction_ste":
+            ste_forward_load = (
+                tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
+            )
+            ste_tokens_per_expert, ste_margin, ste_valid_tokens, _ = (
+                _quantile_correction_load_surrogate(
+                    logits,
+                    routing_map,
+                    ste_forward_load,
+                    topk,
+                    num_experts,
+                    reduce_group,
+                    delta_bias=quantile_correction_delta_bias,
+                    topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                )
+            )
+            ste_load_frac = ste_tokens_per_expert.float() / denom
+            load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
+        elif load_balancing_type == "fixed_number_boundary_ste":
+            ste_forward_load = (
+                tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
+            )
+            ste_tokens_per_expert, ste_margin, ste_valid_tokens = (
+                _fixed_boundary_load_surrogate(
+                    logits,
+                    routing_map,
+                    ste_forward_load,
+                    load_balance_ste_boundary_fraction,
+                    num_experts,
+                    reduce_group,
+                    load_balance_ste_rect_poistion,
+                    topk_indices=load_balance_topk_indices,
+                    topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                )
+            )
+            ste_load_frac = ste_tokens_per_expert.float() / denom
+            load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
+        elif load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
             ste_forward_load = (
                 tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
             )
@@ -2332,6 +2668,35 @@ def _build_moe_router_metrics_log(
                     accepted_max_vio_per_layer, accepted_active_layers
                 ).item()
             )
+
+    quantile_delta_bias_count = metrics.get("quantile_delta_bias_count")
+    if quantile_delta_bias_count is not None:
+        quantile_delta_bias_count = quantile_delta_bias_count.float()
+    quantile_active_layers = (
+        quantile_delta_bias_count > 0
+        if quantile_delta_bias_count is not None
+        else None
+    )
+    if (
+        prefix in ("val", "val/regular")
+        and quantile_active_layers is not None
+        and quantile_active_layers.any()
+    ):
+        quantile_delta_bias = metrics["quantile_delta_bias_sum"].float() / (
+            quantile_delta_bias_count.clamp(min=1.0).unsqueeze(-1)
+        )
+        all_layer_delta_bias = quantile_delta_bias[quantile_active_layers].flatten()
+        quantile_log_prefix = "quantile_correction/delta_b_e"
+        log[f"{quantile_log_prefix}/mean"] = float(all_layer_delta_bias.mean().item())
+        log[f"{quantile_log_prefix}/max"] = float(all_layer_delta_bias.max().item())
+        log[f"{quantile_log_prefix}/min"] = float(all_layer_delta_bias.min().item())
+        affected_entry_count = metrics["quantile_affected_entry_count"].float().sum()
+        log["quantile_correction/affected_token_expert_fraction"] = float(
+            (
+                affected_entry_count
+                / (token_count.sum().clamp(min=1.0) * num_experts)
+            ).item()
+        )
 
     vio_prefixes = _validation_metric_prefixes(prefix, "vio")
     if vio_prefixes:

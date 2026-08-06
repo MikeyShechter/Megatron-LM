@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     _load_balance_margin,
+    _quantile_correction_delta_bias,
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
@@ -24,6 +25,7 @@ from megatron.core.transformer.moe.moe_utils import (
     load_balance_ste_soft_mask,
     moe_metagrad_enabled,
     qb_dual_update,
+    qb_projection_distillation_loss_func,
     router_gating_linear,
     save_to_aux_losses_tracker,
     save_to_metagrad_losses_tracker,
@@ -275,6 +277,7 @@ class TopKRouter(Router):
         self.bias_adder_norm = None
         self._bias_adder_input_for_load_balance = None
         self._bias_adder_logits_for_load_balance = None
+        self._quantile_correction_delta_bias_cache = None
         if self.learnable_bias_type != "none":
             assert self.learnable_bias_type in (
                 "expert_bias",
@@ -339,10 +342,8 @@ class TopKRouter(Router):
             self.bias_adder_norm = norm_cls(
                 self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
-                dtype=self.config.params_dtype,
+                elementwise_affine=False,
             )
-            for parameter in self.bias_adder_norm.parameters():
-                setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
@@ -492,6 +493,7 @@ class TopKRouter(Router):
             "aux_loss",
             "seq_aux_loss",
             "global_aux_loss",
+            "qb_projection_distillation",
         ) + DIRECT_LOAD_BALANCING_LOSS_TYPES
         for aux_loss_type in aux_loss_types:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
@@ -602,7 +604,15 @@ class TopKRouter(Router):
         load_balance_gate_threshold = getattr(
             self.config, "moe_load_balance_gate_threshold", 0.0
         )
+        load_balance_ste_boundary_fraction = getattr(
+            self.config, "moe_load_balance_ste_boundary_fraction", 0.0
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
+            quantile_correction_delta_bias = (
+                self._quantile_correction_delta_bias_cache
+                if load_balancing_type == "quantile_correction_ste"
+                else None
+            )
             aux_loss = direct_load_balancing_loss_func(
                 load_balancing_type=load_balancing_type,
                 logits=margin_input,
@@ -621,6 +631,8 @@ class TopKRouter(Router):
                 reduce_group=reduce_group,
                 load_balance_topk_indices=topk_indices,
                 load_balance_topk_plus_one_indices=topk_plus_one_indices,
+                quantile_correction_delta_bias=quantile_correction_delta_bias,
+                load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
             )
             metagrad_coeff_loss = None
             if self._metagrad_tracks("coeff"):
@@ -645,9 +657,15 @@ class TopKRouter(Router):
                         reduce_group=reduce_group,
                         load_balance_topk_indices=topk_indices,
                         load_balance_topk_plus_one_indices=topk_plus_one_indices,
+                        quantile_correction_delta_bias=quantile_correction_delta_bias,
+                        load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
                     )
             metagrad_width_loss = None
-            if self._metagrad_tracks("width"):
+            if (
+                self._metagrad_tracks("width")
+                and load_balancing_type
+                not in ("quantile_correction_ste", "fixed_number_boundary_ste")
+            ):
                 metagrad_width_loss = direct_load_balancing_width_sensitivity_loss_func(
                     load_balancing_type=load_balancing_type,
                     logits=margin_input,
@@ -680,6 +698,44 @@ class TopKRouter(Router):
             )
         return probs
 
+    def _apply_qb_projection_distillation(
+        self,
+        probs: torch.Tensor,
+        raw_router_logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Train raw router logits to imitate a stopped-gradient QB target."""
+        aux_loss_coeff = self.get_aux_loss_coeff("qb_projection_distillation")
+        if aux_loss_coeff == 0:
+            return probs
+
+        use_global_lb = getattr(self.config, "moe_use_global_lb", False)
+        reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
+        aux_loss = qb_projection_distillation_loss_func(
+            logits=raw_router_logits,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=aux_loss_coeff,
+            temperature=self.config.moe_qb_projection_temperature,
+            projection_score_function=self.config.moe_qb_projection_score_function,
+            reduce_group=reduce_group,
+            padding_mask=padding_mask,
+        )
+        local_num_tokens = (
+            (~padding_mask).sum()
+            if padding_mask is not None
+            else raw_router_logits.new_tensor(raw_router_logits.size(0))
+        )
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            aux_loss_coeff,
+            aux_loss,
+            "qb_projection_distillation_loss",
+            reduce_group,
+            reduce_group_has_dp=use_global_lb,
+            valid_token_count=local_num_tokens,
+        )
+
     def _learnable_bias_affects_expert_weights(self) -> bool:
         """Whether the learnable bias is added to logits used for routing weights."""
         return self.learnable_bias_type in ("expert_bias_weight", "per_token_bias_weight")
@@ -691,28 +747,9 @@ class TopKRouter(Router):
             "bias_adder_balance_only",
         )
 
-    def _apply_bias_adder_norm(
-        self, input: torch.Tensor, detach_parameters: bool = False
-    ) -> torch.Tensor:
-        """Apply the bias-adder normalization, optionally freezing its affine parameters."""
-        if not detach_parameters:
-            return self.bias_adder_norm(input)
-
-        weight = self.bias_adder_norm.weight.detach()
-        if self.config.normalization == "RMSNorm":
-            return torch.nn.functional.rms_norm(
-                input,
-                (self.config.hidden_size,),
-                weight=weight,
-                eps=self.config.layernorm_epsilon,
-            )
-        return torch.nn.functional.layer_norm(
-            input,
-            (self.config.hidden_size,),
-            weight=weight,
-            bias=self.bias_adder_norm.bias.detach(),
-            eps=self.config.layernorm_epsilon,
-        )
+    def _apply_bias_adder_norm(self, input: torch.Tensor) -> torch.Tensor:
+        """Apply the parameter-free bias-adder normalization."""
+        return self.bias_adder_norm(input)
 
     def prepare_input(self, input: torch.Tensor) -> torch.Tensor:
         """Return Norm(x + A x) for both routing and expert computation.
@@ -740,7 +777,7 @@ class TopKRouter(Router):
                 detached_input, self.bias_adder_weight
             )
             self._bias_adder_input_for_load_balance = self._apply_bias_adder_norm(
-                load_balance_input, detach_parameters=True
+                load_balance_input
             )
 
         return transformed_input
@@ -913,6 +950,8 @@ class TopKRouter(Router):
         ste_all_experts_in_rect_count = token_count.new_tensor(0.0)
         ste_selected_count = tokens_per_expert.sum()
         ste_over_rect_count = torch.zeros_like(tokens_per_expert)
+        quantile_delta_bias = None
+        quantile_affected_entry_count = token_count.new_tensor(0.0)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
         if (not self.training) and load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
             # True margin: biased scores when selection biases are active, else logits.
@@ -928,6 +967,31 @@ class TopKRouter(Router):
             ste_in_rect_count = selected_in_rect.float().sum()
             ste_all_experts_in_rect_count = all_experts_in_rect.float().sum()
             ste_over_rect_count = selected_over_rect.float().sum(dim=0)
+
+        if self.has_aux_loss_type("quantile_correction_ste"):
+            margin_input, _ = self._margin_input_for_ste(logits, detached=True)
+            quantile_margin, quantile_valid_tokens = _load_balance_margin(
+                margin_input, attempted_routing_map, "topk_plus_one"
+            )
+            use_global_lb = getattr(self.config, "moe_use_global_lb", False)
+            reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
+            quantile_delta_bias = _quantile_correction_delta_bias(
+                quantile_margin,
+                quantile_valid_tokens,
+                self.topk,
+                self.config.num_moe_experts,
+                reduce_group,
+            )
+            self._quantile_correction_delta_bias_cache = quantile_delta_bias
+            if not self.training:
+                hard_assignment = quantile_margin > 0.0
+                corrected_assignment = (
+                    quantile_margin + quantile_delta_bias.unsqueeze(0)
+                ) > 0.0
+                quantile_affected_entry_count = (
+                    (hard_assignment != corrected_assignment)
+                    & quantile_valid_tokens.unsqueeze(-1)
+                ).float().sum()
 
         attempted_assignment_count = tokens_per_expert.sum()
         accepted_assignment_count = accepted_tokens_per_expert.sum()
@@ -1030,6 +1094,25 @@ class TopKRouter(Router):
         save_to_router_metrics_tracker(
             "ste_over_rect_count", ste_over_rect_count, layer_number, num_layers
         )
+        if quantile_delta_bias is not None:
+            save_to_router_metrics_tracker(
+                "quantile_delta_bias_sum",
+                quantile_delta_bias,
+                layer_number,
+                num_layers,
+            )
+            save_to_router_metrics_tracker(
+                "quantile_delta_bias_count",
+                quantile_delta_bias.new_tensor(1.0),
+                layer_number,
+                num_layers,
+            )
+            save_to_router_metrics_tracker(
+                "quantile_affected_entry_count",
+                quantile_affected_entry_count,
+                layer_number,
+                num_layers,
+            )
         for name, value in (
             ("dispatch_count", dispatch_count),
             ("dispatch_max_vio_sum", dispatch_max_vio),
@@ -1438,6 +1521,8 @@ class TopKRouter(Router):
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
+        raw_router_logits = logits
+        self._quantile_correction_delta_bias_cache = None
 
         # Flatten padding_mask to [num_tokens] if provided
         if padding_mask is not None:
@@ -1450,7 +1535,9 @@ class TopKRouter(Router):
         learnable_bias = self._get_learnable_routing_bias()
         learnable_bias_affects_weights = self._learnable_bias_affects_expert_weights()
         logits_for_load_balance = (
-            self._bias_adder_logits_for_load_balance
+            self._bias_adder_logits_for_load_balance.reshape(
+                -1, self.config.num_moe_experts
+            )
             if self._bias_adder_logits_for_load_balance is not None
             else logits
         )
@@ -1489,13 +1576,28 @@ class TopKRouter(Router):
             for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES
         )
         should_return_top_indices = direct_loss_enabled and not self.config.moe_router_fusion
+        quantile_correction_enabled = direct_loss_enabled and self.has_aux_loss_type(
+            "quantile_correction_ste"
+        )
+        fixed_boundary_enabled = direct_loss_enabled and self.has_aux_loss_type(
+            "fixed_number_boundary_ste"
+        )
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
         load_balance_ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
         should_return_topk_plus_one_indices = (
             should_return_top_indices
-            and load_balance_ste_type in ("rect", "triangle")
-            and load_balance_ste_width > 0.0
-            and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+            and (
+                quantile_correction_enabled
+                or (
+                    fixed_boundary_enabled
+                    and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+                )
+                or (
+                    load_balance_ste_type in ("rect", "triangle")
+                    and load_balance_ste_width > 0.0
+                    and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+                )
+            )
         )
         should_return_selection_top_indices = should_return_top_indices and selection_bias is not None
         selection_topk_indices = None
@@ -1641,11 +1743,16 @@ class TopKRouter(Router):
                 probs,
                 logits_for_load_balance,
                 routing_map_for_aux_loss,
-                selection_routing_map=routing_map,
+                selection_routing_map=attempted_routing_map,
                 aux_topk_indices=aux_topk_indices,
                 aux_topk_plus_one_indices=aux_topk_plus_one_indices,
                 selection_topk_indices=selection_topk_indices,
                 selection_topk_plus_one_indices=selection_topk_plus_one_indices,
+                padding_mask=padding_mask,
+            )
+            probs = self._apply_qb_projection_distillation(
+                probs,
+                raw_router_logits,
                 padding_mask=padding_mask,
             )
             probs = self._apply_seq_aux_loss(
