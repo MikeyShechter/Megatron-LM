@@ -37,9 +37,9 @@ parameters:
   moe_aux_loss_coeff: [0.1, 0.01, 0.001]
   load_balance_ste_width: [0.0]
   load_balance_ste_type: ["rect"]
-  moe_learnable_bias_type: ["none", "expert_bias"]
-  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
-  moe_learnable_bias_pass_grad_through_scores: [false]
+  moe_learnable_bias_type: ["expert_bias"]
+  moe_learnable_bias_lr_mult: [0.1, 0.01]
+  moe_learnable_bias_pass_grad_through_scores: [true]
 
   optimizer: ["muon"]
   muon_scale_mode: ["shape_scaling"]
