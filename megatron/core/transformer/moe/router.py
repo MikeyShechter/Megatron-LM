@@ -655,6 +655,9 @@ class TopKRouter(Router):
         load_balance_ste_boundary_fraction = getattr(
             self.config, "moe_load_balance_ste_boundary_fraction", 0.0
         )
+        load_balance_ste_detach_threshold = getattr(
+            self.config, "moe_load_balance_ste_detach_threshold", False
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             quantile_correction_delta_bias = (
                 self._quantile_correction_delta_bias_cache
@@ -681,6 +684,7 @@ class TopKRouter(Router):
                 load_balance_topk_plus_one_indices=topk_plus_one_indices,
                 quantile_correction_delta_bias=quantile_correction_delta_bias,
                 load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
+                load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
             )
             metagrad_coeff_loss = None
             if self._metagrad_tracks("coeff"):
@@ -707,6 +711,7 @@ class TopKRouter(Router):
                         load_balance_topk_plus_one_indices=topk_plus_one_indices,
                         quantile_correction_delta_bias=quantile_correction_delta_bias,
                         load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
+                        load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
                     )
             metagrad_width_loss = None
             if (
@@ -733,6 +738,7 @@ class TopKRouter(Router):
                     reduce_group=reduce_group,
                     load_balance_topk_indices=topk_indices,
                     load_balance_topk_plus_one_indices=topk_plus_one_indices,
+                    load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
                 )
             probs = self.attach_and_log_load_balancing_loss(
                 probs,
@@ -964,6 +970,9 @@ class TopKRouter(Router):
             load_balance_ste_width,
             load_balance_tanh_ste_slope,
             ste_rect_poistion,
+            detach_threshold=getattr(
+                self.config, "moe_load_balance_ste_detach_threshold", False
+            ),
         )
         # Keep the ordinary LM gradient into probs exactly unchanged. The additive,
         # zero-forward term creates a separate assignment-gradient branch whose

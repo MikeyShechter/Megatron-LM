@@ -128,6 +128,56 @@ def _loss_and_grad(loss_fn, logits):
     return loss.detach(), grad.detach()
 
 
+@pytest.mark.parametrize("ste_rect_poistion", ["topk", "topk_plus_one", "midpoint"])
+def test_load_balance_margin_can_detach_threshold_gradient(ste_rect_poistion):
+    routing_map = torch.tensor([[True, True, False]])
+    upstream_grad = torch.tensor([[1.0, 2.0, 3.0]])
+
+    def margin_grad(detach_threshold):
+        logits = torch.tensor([[3.0, 2.0, 1.0]], requires_grad=True)
+        margin, _ = _load_balance_margin(
+            logits,
+            routing_map,
+            ste_rect_poistion,
+            detach_threshold=detach_threshold,
+        )
+        return torch.autograd.grad((margin * upstream_grad).sum(), logits)[0]
+
+    attached_grad = margin_grad(False)
+    detached_grad = margin_grad(True)
+
+    torch.testing.assert_close(detached_grad, upstream_grad)
+    assert not torch.equal(attached_grad, detached_grad)
+
+
+def test_centered_fsq_threshold_detachment_changes_only_backward():
+    def loss_and_grad(detach_threshold):
+        logits = torch.tensor(
+            [[2.7, 2.5, 2.4, 0.1]], dtype=torch.float32, requires_grad=True
+        )
+        routing_map = torch.tensor([[True, True, False, False]])
+        loss = direct_load_balancing_loss_func(
+            load_balancing_type="centered_fsq",
+            logits=logits,
+            routing_map=routing_map,
+            tokens_per_expert=routing_map.sum(dim=0),
+            total_num_tokens=1,
+            topk=2,
+            num_experts=4,
+            moe_aux_loss_coeff=1.0,
+            load_balance_ste_width=0.5,
+            load_balance_ste_detach_threshold=detach_threshold,
+        )
+        return loss.detach(), torch.autograd.grad(loss, logits)[0]
+
+    attached_loss, attached_grad = loss_and_grad(False)
+    detached_loss, detached_grad = loss_and_grad(True)
+
+    torch.testing.assert_close(detached_loss, attached_loss)
+    assert attached_grad[0, 1].abs() < 1e-7
+    assert detached_grad[0, 1] > 1e-4
+
+
 def _assert_close_to_reference(
     optimized_value,
     reference_value,

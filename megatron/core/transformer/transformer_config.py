@@ -822,6 +822,20 @@ class TransformerConfig(ModelParallelConfig):
     """Fraction of tokens closest to each expert boundary used by
     `fixed_number_boundary_ste`. The resulting M is `ceil(fraction * valid_tokens)`."""
 
+    moe_load_balance_ste_detach_threshold: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": [
+                    "--moe-load-balance-ste-detach-threshold",
+                    "--load-balance-ste-detach-threshold",
+                ]
+            }
+        },
+    )
+    """Stop gradients through the token-dependent Top-K threshold used to construct
+    margin-based load-balancing STEs. Forward margins and routing are unchanged."""
+
     metagrad_params: str = "none"
     """Meta-gradient-controlled load-balance parameters: none, width, coeff, or width_and_coeff."""
 

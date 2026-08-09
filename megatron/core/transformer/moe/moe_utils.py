@@ -519,6 +519,7 @@ def _load_balance_margin(
     ste_rect_poistion: str = "topk",
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     routing_map = routing_map.bool()
     valid_tokens = routing_map.any(dim=-1)
@@ -551,6 +552,8 @@ def _load_balance_margin(
     else:
         raise ValueError(f"Unsupported STE rect position: {ste_rect_poistion}")
 
+    if detach_threshold:
+        threshold = threshold.detach()
     return logits.float() - threshold, valid_tokens
 
 
@@ -561,6 +564,7 @@ def load_balance_ste_soft_mask(
     load_balance_ste_width: float,
     load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
+    detach_threshold: bool = False,
 ) -> torch.Tensor:
     """Per-token soft selection mask from the load-balance STE.
 
@@ -573,7 +577,12 @@ def load_balance_ste_soft_mask(
         soft_mask = hard_mask + logits - logits.detach()
         return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
 
-    margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
+    margin, valid_tokens = _load_balance_margin(
+        logits,
+        routing_map,
+        ste_rect_poistion,
+        detach_threshold=detach_threshold,
+    )
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
     elif load_balance_ste_type == "triangle":
@@ -590,6 +599,7 @@ def _load_balance_ste_tokens_per_expert(
     load_balance_ste_width: float,
     load_balance_tanh_ste_slope: float,
     ste_rect_poistion: str,
+    detach_threshold: bool = False,
 ) -> torch.Tensor:
     soft_mask = load_balance_ste_soft_mask(
         logits,
@@ -598,6 +608,7 @@ def _load_balance_ste_tokens_per_expert(
         load_balance_ste_width,
         load_balance_tanh_ste_slope,
         ste_rect_poistion,
+        detach_threshold=detach_threshold,
     )
     return soft_mask.sum(dim=0)
 
@@ -612,6 +623,7 @@ def _load_balance_ste_load_surrogate(
     ste_rect_poistion: str,
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if load_balance_ste_type == "full":
         # A regular full STE differentiates the hard assignment directly with
@@ -626,6 +638,7 @@ def _load_balance_ste_load_surrogate(
             ste_rect_poistion,
             topk_indices=topk_indices,
             topk_plus_one_indices=topk_plus_one_indices,
+            detach_threshold=detach_threshold,
         )
     forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
     ste_tokens_per_expert = _LoadBalanceLoadSTE.apply(
@@ -750,6 +763,7 @@ def _fixed_boundary_load_surrogate(
     ste_rect_poistion: str,
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the hard-load surrogate using the M closest tokens per expert."""
     margin, valid_tokens = _load_balance_margin(
@@ -758,6 +772,7 @@ def _fixed_boundary_load_surrogate(
         ste_rect_poistion,
         topk_indices=topk_indices,
         topk_plus_one_indices=topk_plus_one_indices,
+        detach_threshold=detach_threshold,
     )
     radius = _fixed_boundary_radius(
         margin,
@@ -818,6 +833,7 @@ def _quantile_correction_load_surrogate(
     reduce_group: Optional[torch.distributed.ProcessGroup],
     delta_bias: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the hard-load surrogate and its per-expert QB correction."""
     margin, valid_tokens = _load_balance_margin(
@@ -825,6 +841,7 @@ def _quantile_correction_load_surrogate(
         routing_map,
         "topk_plus_one",
         topk_plus_one_indices=topk_plus_one_indices,
+        detach_threshold=detach_threshold,
     )
     if delta_bias is None:
         delta_bias = _quantile_correction_delta_bias(
@@ -959,6 +976,7 @@ def _centered_fsq_variance_loss(
     valid_tokens: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> torch.Tensor:
     """Variance term from the uniformly noised centered-logit DLB objective."""
     if load_balance_ste_width <= 0.0:
@@ -971,6 +989,7 @@ def _centered_fsq_variance_loss(
             ste_rect_poistion,
             topk_indices=topk_indices,
             topk_plus_one_indices=topk_plus_one_indices,
+            detach_threshold=detach_threshold,
         )
     expected_indicator = _centered_fsq_expected_indicator(
         margin,
@@ -995,6 +1014,7 @@ def _noisy_centered_fsq_loss(
     reduce_group: Optional[torch.distributed.ProcessGroup],
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
 ) -> torch.Tensor:
     """Analytic uniformly noised centered-FSQ objective."""
     margin, valid_tokens = _load_balance_margin(
@@ -1003,6 +1023,7 @@ def _noisy_centered_fsq_loss(
         ste_rect_poistion,
         topk_indices=topk_indices,
         topk_plus_one_indices=topk_plus_one_indices,
+        detach_threshold=detach_threshold,
     )
     expected_indicator = _centered_fsq_expected_indicator(
         margin,
@@ -1044,6 +1065,7 @@ def direct_load_balancing_loss_func(
     load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
     quantile_correction_delta_bias: Optional[torch.Tensor] = None,
     load_balance_ste_boundary_fraction: float = 0.0,
+    load_balance_ste_detach_threshold: bool = False,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE."""
     total_num_tokens_tensor = torch.as_tensor(
@@ -1071,6 +1093,7 @@ def direct_load_balancing_loss_func(
             reduce_group,
             topk_indices=load_balance_topk_indices,
             topk_plus_one_indices=load_balance_topk_plus_one_indices,
+            detach_threshold=load_balance_ste_detach_threshold,
         )
     else:
         if load_balancing_type == "quantile_correction_ste":
@@ -1087,6 +1110,7 @@ def direct_load_balancing_loss_func(
                     reduce_group,
                     delta_bias=quantile_correction_delta_bias,
                     topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                    detach_threshold=load_balance_ste_detach_threshold,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
@@ -1106,6 +1130,7 @@ def direct_load_balancing_loss_func(
                     load_balance_ste_rect_poistion,
                     topk_indices=load_balance_topk_indices,
                     topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                    detach_threshold=load_balance_ste_detach_threshold,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
@@ -1128,6 +1153,7 @@ def direct_load_balancing_loss_func(
                     ste_rect_poistion,
                     load_balance_topk_indices,
                     load_balance_topk_plus_one_indices,
+                    detach_threshold=load_balance_ste_detach_threshold,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
@@ -1153,6 +1179,7 @@ def direct_load_balancing_loss_func(
                 valid_tokens=reusable_valid_tokens,
                 topk_indices=load_balance_topk_indices,
                 topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                detach_threshold=load_balance_ste_detach_threshold,
             )
 
     gate = _direct_load_balance_gate(
@@ -1183,6 +1210,7 @@ def direct_load_balancing_width_sensitivity_loss_func(
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     load_balance_topk_indices: Optional[torch.Tensor] = None,
     load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
+    load_balance_ste_detach_threshold: bool = False,
 ) -> torch.Tensor:
     """Auxiliary scalar whose parameter gradient is d/d width of triangle-STE DLB grads."""
     total_num_tokens_tensor = torch.as_tensor(
@@ -1201,6 +1229,7 @@ def direct_load_balancing_width_sensitivity_loss_func(
         load_balance_ste_rect_poistion,
         load_balance_topk_indices,
         load_balance_topk_plus_one_indices,
+        detach_threshold=load_balance_ste_detach_threshold,
     )
     ste_load_frac = ste_tokens_per_expert.float() / denom
     load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
