@@ -533,13 +533,23 @@ def test_router_gating_linear(router_dtype):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])
-def test_router_gating_linear_bias(router_dtype):
-    tols = dict(rtol=2.0e-2, atol=1.0e-3)
+@pytest.mark.parametrize(
+    ("parameter_dtype", "router_dtype"),
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+    ],
+)
+def test_router_gating_linear_bias(parameter_dtype, router_dtype):
+    # Explicit bias addition changes the BF16 rounding order relative to fused
+    # torch.linear by at most one small BF16 bin near zero.
+    tols = dict(rtol=2.0e-2, atol=1.0e-2 if router_dtype == torch.bfloat16 else 1.0e-3)
 
-    ref_inp = torch.randn((4096, 7168), dtype=router_dtype, device="cuda")
-    ref_weight = torch.randn((256, 7168), dtype=router_dtype, device="cuda")
-    ref_bias = torch.randn((256,), dtype=router_dtype, device="cuda")
+    ref_inp = torch.randn((4096, 7168), dtype=parameter_dtype, device="cuda")
+    ref_weight = torch.randn((256, 7168), dtype=parameter_dtype, device="cuda")
+    ref_bias = torch.randn((256,), dtype=parameter_dtype, device="cuda")
     ref_inp.requires_grad = True
     ref_weight.requires_grad = True
     ref_bias.requires_grad = True

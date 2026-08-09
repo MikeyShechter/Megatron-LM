@@ -137,6 +137,14 @@ class ValidationConfig:
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
 
+    eval_split_router_with_weighter: bool = False
+    """On regular validation data, replay the same batches with split-weighter scores selecting
+    experts and log comparable router/weighter loss and global load-balance metrics."""
+
+    eval_split_router_with_router_weights: bool = False
+    """On regular validation data, replay the same batches with the split router performing both
+    expert selection and combine weighting, using moe_weighter_activation for valid weights."""
+
     test_mode: bool = False
     """Run all real-time test alongside the experiment."""
 
@@ -160,6 +168,9 @@ class ValidationConfig:
     """Comma-separated prepared task names, or dclm-core-22, to evaluate as answer-token
     validation loss datasets. If not set, task-loss validation is disabled.
     """
+
+    skip_task_eval: bool = False
+    """Skip prepared downstream task-loss datasets while retaining regular validation."""
 
     task_eval_data_dir: str | None = "/e/project1/laionize/shechter1/core_megatron_datasets"
     """Directory containing prepared task-loss validation .pt files."""

@@ -4,8 +4,11 @@ import pytest
 import torch
 
 from megatron.core.transformer.moe.moe_utils import (
+    _MOE_WEIGHTER_DIAGNOSTIC_METRIC_NAMES,
     _PRE_ACTIVATION_METRIC_LOG_NAMES,
     _build_moe_router_metrics_log,
+    _initialize_router_metrics_tracker,
+    get_moe_router_metrics_tracker,
 )
 
 
@@ -30,6 +33,24 @@ def _add_pre_activation_metrics(metrics):
     metrics["learnable_both_bias_value_count"] = torch.tensor([2.0, 6.0])
 
     return metrics
+
+
+def test_weighter_diagnostic_metrics_are_initialized_only_when_requested():
+    tracker = get_moe_router_metrics_tracker()
+    tracker.clear()
+    try:
+        _initialize_router_metrics_tracker(2, 4, torch.device("cpu"))
+        assert _MOE_WEIGHTER_DIAGNOSTIC_METRIC_NAMES.isdisjoint(tracker)
+
+        _initialize_router_metrics_tracker(
+            2,
+            4,
+            torch.device("cpu"),
+            include_weighter_diagnostics=True,
+        )
+        assert _MOE_WEIGHTER_DIAGNOSTIC_METRIC_NAMES.issubset(tracker)
+    finally:
+        tracker.clear()
 
 
 def test_build_val_moe_router_metrics_log():

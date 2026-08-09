@@ -14,11 +14,12 @@
 
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: sbatch $0 <spec.yaml>"
+  echo "Usage: sbatch $0 <spec.yaml> [entrypoint.py]"
   exit 2
 fi
 
 export CONF=$1
+ENTRYPOINT=${2:-pretrain_gpt.py}
 
 REPO_DIR=/e/project1/laionize/shechter1/repos/Megatron-LM
 SIF=/e/project1/laionize/shechter1/containers/megatron-lm-dev.sif
@@ -111,7 +112,7 @@ srun \
       --node-rank=\${NODE_RANK} \
       --master-addr=${MASTER_ADDR} \
       --master-port=${MASTER_PORT} \
-      pretrain_gpt.py \
+      ${ENTRYPOINT} \
         --config \"${CONF}\"
   "
 

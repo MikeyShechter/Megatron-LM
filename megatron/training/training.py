@@ -221,6 +221,9 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_metagrad_scalar_state,
     moe_metagrad_enabled,
     set_moe_metagrad_prev_sensitivities,
+    set_moe_router_regular_validation_diagnostics_enabled,
+    set_moe_router_weighting_eval_enabled,
+    set_moe_weighter_routing_eval_enabled,
     track_moe_metrics,
     track_moe_router_metrics,
 )
@@ -1693,6 +1696,13 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             config_overrides[ParamKey(attr='is_moe_learnable_bias_parameter')] = (
                 moe_learnable_bias_override
             )
+
+    moe_router_lr_mult = getattr(args, 'moe_router_lr_mult', 1.0)
+    if moe_router_lr_mult != 1.0:
+        split_router_override = {'max_lr': config.lr * moe_router_lr_mult}
+        if config.min_lr is not None:
+            split_router_override['min_lr'] = config.min_lr * moe_router_lr_mult
+        config_overrides[ParamKey(attr='is_split_moe_router_parameter')] = split_router_override
 
     return config, config_overrides
 
@@ -4252,6 +4262,46 @@ def evaluate_and_print_results(
     task_loss_values = []
     base_wandb_prefix = "test" if "test set" in prefix else "val"
 
+    class _ValidationBatchRecorder:
+        """Record CPU validation batches while forwarding an existing iterator."""
+
+        def __init__(self, source):
+            self.source = source
+            self.batches = []
+
+        def __next__(self):
+            batch = next(self.source)
+            self.batches.append(batch)
+            return batch
+
+    class _ValidationBatchReplay:
+        """Replay batches captured by a _ValidationBatchRecorder."""
+
+        def __init__(self, batches):
+            self.batches = batches
+            self.position = 0
+
+        def __next__(self):
+            if self.position >= len(self.batches):
+                raise RuntimeError("alternate routing evaluation exhausted recorded batches")
+            batch = self.batches[self.position]
+            self.position += 1
+            return batch
+
+    def _record_validation_iterator(iterator):
+        if isinstance(iterator, list):
+            return [_record_validation_iterator(item) for item in iterator]
+        if iterator is None:
+            return None
+        return _ValidationBatchRecorder(iterator)
+
+    def _replay_validation_iterator(iterator):
+        if isinstance(iterator, list):
+            return [_replay_validation_iterator(item) for item in iterator]
+        if iterator is None:
+            return None
+        return _ValidationBatchReplay(iterator.batches)
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         validation_set_name = None
@@ -4261,16 +4311,42 @@ def evaluate_and_print_results(
                 suffix = f"-{validation_set_name}"
             else:
                 suffix = f"-{index}"
-        total_loss_dict, collected_non_loss_data, timelimit = evaluate(
-            forward_step_func,
-            iterator,
-            model,
-            process_non_loss_data_func,
-            config,
-            verbose,
-            non_loss_data_func,
-            eval_iters=iterations,
+        collect_regular_validation_router_diagnostics = (
+            base_wandb_prefix == "val"
+            and validation_set_name not in task_loss_task_names
         )
+        compare_router_and_weighter = (
+            collect_regular_validation_router_diagnostics
+            and getattr(args, "eval_split_router_with_weighter", False)
+            and getattr(args, "moe_router_use_separate_weighter", False)
+        )
+        compare_router_both = (
+            collect_regular_validation_router_diagnostics
+            and getattr(args, "eval_split_router_with_router_weights", False)
+            and getattr(args, "moe_router_use_separate_weighter", False)
+        )
+        record_alternate_routing_batches = compare_router_and_weighter or compare_router_both
+        eval_iterator = (
+            _record_validation_iterator(iterator)
+            if record_alternate_routing_batches
+            else iterator
+        )
+        set_moe_router_regular_validation_diagnostics_enabled(
+            collect_regular_validation_router_diagnostics
+        )
+        try:
+            total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+                forward_step_func,
+                eval_iterator,
+                model,
+                process_non_loss_data_func,
+                config,
+                verbose,
+                non_loss_data_func,
+                eval_iters=iterations,
+            )
+        finally:
+            set_moe_router_regular_validation_diagnostics_enabled(False)
         # Timelimit hit during evaluation
         if timelimit:
             return
@@ -4320,7 +4396,7 @@ def evaluate_and_print_results(
                 if suffix == ""
                 else f"{base_wandb_prefix}/{suffix.lstrip('-')}"
             )
-            track_moe_router_metrics(
+            router_metrics_log = track_moe_router_metrics(
                 loss_scale=router_loss_scale,
                 iteration=iteration,
                 writer=writer,
@@ -4330,7 +4406,104 @@ def evaluate_and_print_results(
                 num_layers=_get_num_moe_logging_layers(args),
                 num_experts=args.num_experts,
                 moe_router_load_balancing_type=args.moe_router_load_balancing_type,
+                include_weighter_diagnostics=(
+                    collect_regular_validation_router_diagnostics
+                    and getattr(args, "moe_router_use_separate_weighter", False)
+                ),
             )
+        else:
+            router_metrics_log = {}
+
+        comparison_log = {}
+        if record_alternate_routing_batches:
+            if "lm loss" in total_loss_dict:
+                comparison_log["val/router/lm_loss"] = total_loss_dict["lm loss"].item()
+            for source_key, metric_name in (
+                ("vio/MaxVioGlobal", "MaxVioGlobal"),
+                ("vio/MaxVioGlobalWorstLayer", "MaxVioGlobalWorstLayer"),
+            ):
+                if source_key in router_metrics_log:
+                    comparison_log[f"val/router/{metric_name}"] = router_metrics_log[source_key]
+
+        def _evaluate_alternate_routing(setter):
+            consumed_valid_samples = args.consumed_valid_samples
+            setter(True)
+            try:
+                alternate_loss_dict, _, alternate_timelimit = evaluate(
+                    forward_step_func,
+                    _replay_validation_iterator(eval_iterator),
+                    model,
+                    None,
+                    config,
+                    verbose,
+                    None,
+                    eval_iters=iterations,
+                )
+            finally:
+                setter(False)
+                args.consumed_valid_samples = consumed_valid_samples
+
+            if alternate_timelimit:
+                return alternate_loss_dict, {}, True
+
+            alternate_metrics_log = track_moe_router_metrics(
+                loss_scale=router_loss_scale,
+                iteration=iteration,
+                writer=None,
+                wandb_writer=None,
+                prefix="val/regular",
+                force_initialize=True,
+                num_layers=_get_num_moe_logging_layers(args),
+                num_experts=args.num_experts,
+                moe_router_load_balancing_type=args.moe_router_load_balancing_type,
+            )
+            return alternate_loss_dict, alternate_metrics_log, alternate_timelimit
+
+        if compare_router_and_weighter:
+            weighter_loss_dict, weighter_metrics_log, weighter_timelimit = (
+                _evaluate_alternate_routing(set_moe_weighter_routing_eval_enabled)
+            )
+            if weighter_timelimit:
+                return
+
+            if "lm loss" in weighter_loss_dict:
+                comparison_log["val/weighter/lm_loss"] = weighter_loss_dict["lm loss"].item()
+            for source_key, metric_name in (
+                ("vio/MaxVioGlobal", "MaxVioGlobal"),
+                ("vio/MaxVioGlobalWorstLayer", "MaxVioGlobalWorstLayer"),
+            ):
+                if source_key in weighter_metrics_log:
+                    comparison_log[f"val/weighter/{metric_name}"] = weighter_metrics_log[source_key]
+
+        if compare_router_both:
+            router_both_loss_dict, router_both_metrics_log, router_both_timelimit = (
+                _evaluate_alternate_routing(set_moe_router_weighting_eval_enabled)
+            )
+            if router_both_timelimit:
+                return
+
+            if "lm loss" in router_both_loss_dict:
+                comparison_log["val/router_both/lm_loss"] = router_both_loss_dict[
+                    "lm loss"
+                ].item()
+            for source_key, metric_name in (
+                ("vio/MaxVioGlobal", "MaxVioGlobal"),
+                ("vio/MaxVioGlobalWorstLayer", "MaxVioGlobalWorstLayer"),
+            ):
+                if source_key in router_both_metrics_log:
+                    comparison_log[f"val/router_both/{metric_name}"] = (
+                        router_both_metrics_log[source_key]
+                    )
+
+        if comparison_log:
+            if writer:
+                for key, value in comparison_log.items():
+                    writer.add_scalar(key, value, iteration)
+            if wandb_writer and comparison_log and is_last_rank():
+                wandb_writer.log(comparison_log, iteration)
+
+            for key, value in comparison_log.items():
+                string += f"{key} value: {value:.6E} | "
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)

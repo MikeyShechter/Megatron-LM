@@ -378,7 +378,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
-    if getattr(args, "task_eval_tasks", None):
+    if getattr(args, "task_eval_tasks", None) and not getattr(args, "skip_task_eval", False):
         task_valid_ds = load_prepared_task_loss_validation_datasets(args, config)
         regular_valid_ds = (
             []
@@ -405,6 +405,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
 def configure_task_loss_eval_args(args: Any) -> None:
     """Route prepared task-loss datasets through named validation datasets."""
+
+    if getattr(args, "skip_task_eval", False):
+        return
 
     task_names = resolve_task_loss_task_names(getattr(args, "task_eval_tasks", None))
     if not task_names:

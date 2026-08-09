@@ -3225,8 +3225,10 @@ def _add_moe_args(parser):
     group.add_argument('--moe-balance-target-vio', type=float, default=0.0,
                        help='Target MaxVioGlobal for moe_balance_update_rate.')
     group.add_argument('--moe-load-balance-ste-type', '--load-balance-ste-type',
-                       type=str, choices=['rect', 'tanh', 'triangle'], default='rect',
-                       help='Surrogate gradient operator for direct routed-load balancing losses.')
+                       type=str, choices=['rect', 'full', 'tanh', 'triangle'], default='rect',
+                       help='Surrogate gradient operator for direct routed-load balancing losses. '
+                            '"full" uses hard assignments in forward and an identity derivative '
+                            'for every valid token-expert score.')
     group.add_argument('--moe-load-balance-ste-schedule', '--load-balance-ste-schedule',
                        type=str, choices=['constant', 'linear', 'cosine', 'exponential'],
                        default='constant',
@@ -3301,10 +3303,11 @@ def _add_moe_args(parser):
                        action='store_true', default=False,
                        dest='moe_lm_loss_ste',
                        help='Apply the STE on top-k selection so the LM loss trains assignment '
-                            'decisions made by the learnable routing biases. Weight-bias variants '
-                            'already receive ordinary LM gradients through their expert combine '
-                            'weights; this additionally supplies an assignment-level gradient. '
-                            'Requires moe_learnable_bias_type != none and (for rect/triangle) '
+                            'decisions made by learnable routing biases. Split routers always '
+                            'receive this LM assignment STE independently of this flag. '
+                            'Weight-bias variants already receive ordinary LM gradients through '
+                            'their expert combine weights; this additionally supplies an '
+                            'assignment-level gradient. Rect/triangle STEs require '
                             'moe_load_balance_ste_width > 0.')
     learnable_bias_lr_group = group.add_mutually_exclusive_group()
     learnable_bias_lr_group.add_argument('--moe-learnable-bias-lr-mult', type=float, default=None,

@@ -717,6 +717,28 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
+    moe_router_use_separate_weighter: bool = False
+    """Use separate linear layers for hard expert selection and expert combine weights."""
+
+    moe_router_selection_activation: Literal['none', 'sigmoid', 'sqrtsoftplus'] = "none"
+    """Activation applied to split-router scores before hard expert selection and its STE."""
+
+    moe_weighter_activation: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Activation used by the split weighter for the selected experts' combine weights."""
+
+    moe_router_enable_bias: bool = False
+    """Add a trainable per-expert bias to the split router linear layer. The weighter is bias-free."""
+
+    moe_router_pass_grad_to_input: bool = False
+    """Allow split-router losses to backpropagate through the router input representation."""
+
+    moe_router_lr_mult: float = 1.0
+    """Learning-rate multiplier for split-router weight and bias parameters."""
+
+    moe_lm_loss_ste_normalized_relative: bool = False
+    """Use a rect-independent normalized-relative LM assignment STE for split routing.
+    Every selected expert receives the local signal `p_e * grad_y dot (h_e - y)`."""
+
     moe_learnable_bias_sqrtsoftplus: bool = False
     """Apply sqrtsoftplus activation to learnable MoE routing bias outputs."""
 
@@ -783,7 +805,8 @@ class TransformerConfig(ModelParallelConfig):
         },
     )
     """Constant width of finite-window STEs used by direct routed-load balancing losses.
-    This is not used by `quantile_correction_ste` or `fixed_number_boundary_ste`."""
+    This is not used by the `full` STE, `quantile_correction_ste`, or
+    `fixed_number_boundary_ste`."""
 
     moe_load_balance_ste_boundary_fraction: float = field(
         default=0.0,

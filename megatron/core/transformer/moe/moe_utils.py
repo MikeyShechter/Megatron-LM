@@ -56,6 +56,9 @@ else:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 _MOE_ROUTER_METRICS_TRACKER: dict = {}
+_MOE_ROUTER_REGULAR_VALIDATION_DIAGNOSTICS_ENABLED = False
+_MOE_WEIGHTER_ROUTING_EVAL_ENABLED = False
+_MOE_ROUTER_WEIGHTING_EVAL_ENABLED = False
 _MOE_METAGRAD_LOSSES: dict[str, list[torch.Tensor]] = {}
 _MOE_METAGRAD_STATE: dict = {
     "raw": {},
@@ -130,12 +133,60 @@ for _pre_activation_metric_name in (
         }
     )
 
+_MOE_WEIGHTER_DIAGNOSTIC_METRIC_SPECS = {
+    "weighter_diag_token_count": "scalar",
+    "weighter_entropy_sum": "scalar",
+    "weighter_effective_k_sum": "scalar",
+    "weighter_top1_sum": "scalar",
+    "weighter_weight_sum": "expert",
+    "weighter_logits_top1_pre_activation_sum": "scalar",
+    "weighter_logits_top2_pre_activation_sum": "scalar",
+    "weighter_logits_pre_activation_sum": "scalar",
+    "weighter_logits_top_count": "scalar",
+    "weighter_logits_value_count": "scalar",
+}
+_MOE_WEIGHTER_DIAGNOSTIC_METRIC_NAMES = frozenset(_MOE_WEIGHTER_DIAGNOSTIC_METRIC_SPECS)
+
 _PRE_ACTIVATION_METRIC_LOG_NAMES = {
     "router_logits": "router_logits",
+    "weighter_logits": "weighter_logits",
     "learnable_expert_bias": "router_bias/expert",
     "learnable_token_bias": "router_bias/token",
     "learnable_both_bias": "router_bias/both",
 }
+
+
+def set_moe_router_regular_validation_diagnostics_enabled(enabled: bool) -> None:
+    """Enable split-router diagnostics only while evaluating regular validation data."""
+    global _MOE_ROUTER_REGULAR_VALIDATION_DIAGNOSTICS_ENABLED
+    _MOE_ROUTER_REGULAR_VALIDATION_DIAGNOSTICS_ENABLED = bool(enabled)
+
+
+def moe_router_regular_validation_diagnostics_enabled() -> bool:
+    """Return whether regular-validation-only split-router diagnostics are active."""
+    return _MOE_ROUTER_REGULAR_VALIDATION_DIAGNOSTICS_ENABLED
+
+
+def set_moe_weighter_routing_eval_enabled(enabled: bool) -> None:
+    """Use split-weighter scores for hard routing during an alternate eval pass."""
+    global _MOE_WEIGHTER_ROUTING_EVAL_ENABLED
+    _MOE_WEIGHTER_ROUTING_EVAL_ENABLED = bool(enabled)
+
+
+def moe_weighter_routing_eval_enabled() -> bool:
+    """Return whether split-weighter scores currently determine expert selection."""
+    return _MOE_WEIGHTER_ROUTING_EVAL_ENABLED
+
+
+def set_moe_router_weighting_eval_enabled(enabled: bool) -> None:
+    """Use split-router logits for combine weights during an alternate eval pass."""
+    global _MOE_ROUTER_WEIGHTING_EVAL_ENABLED
+    _MOE_ROUTER_WEIGHTING_EVAL_ENABLED = bool(enabled)
+
+
+def moe_router_weighting_eval_enabled() -> bool:
+    """Return whether split-router logits currently determine combine weights."""
+    return _MOE_ROUTER_WEIGHTING_EVAL_ENABLED
 
 
 def switch_load_balancing_loss_func(
@@ -295,7 +346,9 @@ class _LoadBalanceLoadSTE(torch.autograd.Function):
         margin, valid_tokens = ctx.saved_tensors
         margin_float = margin.float()
         valid_mask = valid_tokens.unsqueeze(-1)
-        if ctx.ste_type == "tanh":
+        if ctx.ste_type == "full":
+            ste_grad = valid_mask.expand_as(margin_float).to(dtype=torch.float32)
+        elif ctx.ste_type == "tanh":
             slope = ctx.tanh_slope
             k = max(1.0 / slope, 1.0)
             tanh_value = torch.tanh(slope * margin_float)
@@ -378,6 +431,10 @@ def _get_scheduled_load_balance_ste_value(
 
 def get_load_balance_ste_params(config: object) -> tuple[str, float, float]:
     """Resolve the active routed-load STE type and scheduled control value."""
+    ste_type = getattr(config, "moe_load_balance_ste_type", "rect")
+    if ste_type == "full":
+        return ste_type, 0.0, 1.0
+
     schedule = getattr(config, "moe_load_balance_ste_schedule", "constant")
     curr_iteration = getattr(config, "curr_iteration", 0)
     train_iters = getattr(config, "train_iters", None)
@@ -400,7 +457,6 @@ def get_load_balance_ste_params(config: object) -> tuple[str, float, float]:
         curr_iteration=curr_iteration,
         train_iters=train_iters,
     )
-    ste_type = getattr(config, "moe_load_balance_ste_type", "rect")
     ste_bandwidth = tanh_bandwidth if ste_type == "tanh" else rect_bandwidth
     tanh_slope = 1.0 / ste_bandwidth if ste_type == "tanh" else 1.0
     return ste_type, ste_bandwidth, tanh_slope
@@ -511,6 +567,12 @@ def load_balance_ste_soft_mask(
     The forward value matches the hard ``routing_map`` while the backward pass
     routes gradient through the selection margin. Shape [num_tokens, num_experts].
     """
+    if load_balance_ste_type == "full":
+        valid_tokens = routing_map.bool().any(dim=-1)
+        hard_mask = routing_map.to(dtype=logits.dtype)
+        soft_mask = hard_mask + logits - logits.detach()
+        return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
+
     margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
     if load_balance_ste_type == "tanh":
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
@@ -551,13 +613,20 @@ def _load_balance_ste_load_surrogate(
     topk_indices: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    margin, valid_tokens = _load_balance_margin(
-        logits,
-        routing_map,
-        ste_rect_poistion,
-        topk_indices=topk_indices,
-        topk_plus_one_indices=topk_plus_one_indices,
-    )
+    if load_balance_ste_type == "full":
+        # A regular full STE differentiates the hard assignment directly with
+        # respect to every router score. It therefore does not use a top-k
+        # boundary or backpropagate through a token-dependent threshold.
+        margin = logits.float()
+        valid_tokens = routing_map.bool().any(dim=-1)
+    else:
+        margin, valid_tokens = _load_balance_margin(
+            logits,
+            routing_map,
+            ste_rect_poistion,
+            topk_indices=topk_indices,
+            topk_plus_one_indices=topk_plus_one_indices,
+        )
     forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
     ste_tokens_per_expert = _LoadBalanceLoadSTE.apply(
         margin,
@@ -1041,7 +1110,10 @@ def direct_load_balancing_loss_func(
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
             load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
-        elif load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
+        elif (
+            load_balance_ste_type in ("full", "tanh")
+            or load_balance_ste_width > 0.0
+        ):
             ste_forward_load = (
                 tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
             )
@@ -1695,6 +1767,103 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     routing_map = routing_map.transpose(0, 1)
     return routing_map
+
+
+def topk_selection_with_score_function(
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str = "none",
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    expert_bias: Optional[torch.Tensor] = None,
+    router_replay: Optional['RouterReplay'] = None,
+    return_topk_plus_one_indices: bool = False,
+    random_tie_breaking: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Select experts from split-router scores without using those scores as combine weights."""
+    assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+    num_tokens, num_experts = logits.shape
+
+    if score_function == "none":
+        scores = logits.float()
+    elif score_function == "softmax":
+        scores = torch.softmax(logits.float(), dim=-1)
+    elif score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid split-router score_function: {score_function}")
+
+    scores_for_selection = scores
+    if expert_bias is not None:
+        scores_for_selection = scores_for_selection + expert_bias.float()
+
+    can_return_topk_plus_one = (
+        return_topk_plus_one_indices
+        and topk < num_experts
+        and group_topk is None
+        and router_replay is None
+    )
+    topk_count = topk + 1 if can_return_topk_plus_one else topk
+
+    def compute_topk(
+        current_scores: torch.Tensor,
+        current_topk: int,
+        num_groups: Optional[int] = None,
+        group_topk: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores_for_topk = current_scores
+        if random_tie_breaking:
+            scores_for_topk = (
+                current_scores.float()
+                + torch.rand_like(current_scores, dtype=torch.float32) * 1e-7
+            )
+        if group_topk:
+            _, indices = group_limited_topk(
+                scores=scores_for_topk,
+                topk=current_topk,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
+        else:
+            _, indices = torch.topk(scores_for_topk, k=current_topk, dim=1, sorted=True)
+        values = torch.gather(current_scores, dim=1, index=indices)
+        return values, indices
+
+    if router_replay is None:
+        _, top_indices = compute_topk(
+            scores_for_selection, topk_count, num_groups=num_groups, group_topk=group_topk
+        )
+    else:
+        _, top_indices = router_replay.get_replay_topk(
+            scores_for_selection,
+            topk_count,
+            num_groups,
+            group_topk,
+            compute_topk,
+        )
+
+    topk_plus_one_indices = None
+    if can_return_topk_plus_one:
+        topk_plus_one_indices = top_indices[:, topk : topk + 1]
+        top_indices = top_indices[:, :topk]
+
+    rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+    if torch.are_deterministic_algorithms_enabled():
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices),
+            torch.ones_like(top_indices, dtype=routing_map.dtype),
+            accumulate=False,
+        )
+        routing_map = routing_map.bool()
+    else:
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    return scores, routing_map, top_indices, topk_plus_one_indices
 
 
 def topk_routing_with_score_function(
@@ -2395,18 +2564,26 @@ def clear_moe_router_metrics_tracker() -> None:
 
 
 def _initialize_router_metrics_tracker(
-    num_layers: int, num_experts: int, device: torch.device
+    num_layers: int,
+    num_experts: int,
+    device: torch.device,
+    include_weighter_diagnostics: bool = False,
 ) -> None:
     tracker = get_moe_router_metrics_tracker()
-    for name, shape_type in _MOE_ROUTER_METRIC_SPECS.items():
-        if name in tracker:
-            continue
-        shape = (num_layers, num_experts) if shape_type == "expert" else (num_layers,)
-        tracker[name] = torch.zeros(shape, device=device, dtype=torch.float32)
+    metric_specs = [_MOE_ROUTER_METRIC_SPECS]
+    if include_weighter_diagnostics:
+        metric_specs.append(_MOE_WEIGHTER_DIAGNOSTIC_METRIC_SPECS)
+    for specs in metric_specs:
+        for name, shape_type in specs.items():
+            if name in tracker:
+                continue
+            shape = (num_layers, num_experts) if shape_type == "expert" else (num_layers,)
+            tracker[name] = torch.zeros(shape, device=device, dtype=torch.float32)
 
 
 def reduce_moe_router_metrics_tracker_across_ranks(
     pg_collection: Optional[ProcessGroupCollection] = None,
+    include_weighter_diagnostics: bool = False,
 ) -> None:
     """Reduce accumulated MoE router metrics across model and data-parallel ranks."""
     tracker = get_moe_router_metrics_tracker()
@@ -2422,7 +2599,14 @@ def reduce_moe_router_metrics_tracker_across_ranks(
         pp_group = pg_collection.pp
         tp_dp_cp_group = pg_collection.tp_dp_cp
 
-    for name, values in tracker.items():
+    metric_names = [
+        name for name in tracker if name not in _MOE_WEIGHTER_DIAGNOSTIC_METRIC_NAMES
+    ]
+    if include_weighter_diagnostics:
+        metric_names.extend(_MOE_WEIGHTER_DIAGNOSTIC_METRIC_SPECS)
+
+    for name in metric_names:
+        values = tracker[name]
         reduce_op = (
             torch.distributed.ReduceOp.MAX
             if name in _MOE_ROUTER_MAX_METRICS
@@ -2483,8 +2667,12 @@ def _add_pre_activation_metric_logs(
 ) -> None:
     """Add validation pre-activation router/bias summaries to the log dict."""
     for metric_name, log_name in _PRE_ACTIVATION_METRIC_LOG_NAMES.items():
-        top_count = metrics[f"{metric_name}_top_count"].float().sum()
-        value_count = metrics[f"{metric_name}_value_count"].float().sum()
+        top_count_key = f"{metric_name}_top_count"
+        value_count_key = f"{metric_name}_value_count"
+        if top_count_key not in metrics or value_count_key not in metrics:
+            continue
+        top_count = metrics[top_count_key].float().sum()
+        value_count = metrics[value_count_key].float().sum()
         if top_count.item() <= 0 or value_count.item() <= 0:
             continue
 
@@ -2536,6 +2724,63 @@ def _build_moe_router_metrics_log(
     log: dict[str, float] = {}
     if prefix in ("val", "val/regular"):
         _add_pre_activation_metric_logs(log, metrics)
+
+        weighter_diag_token_count = metrics.get("weighter_diag_token_count")
+        if weighter_diag_token_count is not None:
+            weighter_diag_token_count = weighter_diag_token_count.float()
+        weighter_active_layers = (
+            weighter_diag_token_count > 0
+            if weighter_diag_token_count is not None
+            else None
+        )
+        if weighter_active_layers is not None and weighter_active_layers.any():
+            weighter_entropy = metrics["weighter_entropy_sum"].float() / (
+                weighter_diag_token_count.clamp(min=1.0)
+            )
+            routed_k = assignment_count / token_count.clamp(min=1.0)
+            normalized_entropy = weighter_entropy / routed_k.clamp(min=2.0).log()
+            effective_k = metrics["weighter_effective_k_sum"].float() / (
+                weighter_diag_token_count.clamp(min=1.0)
+            )
+            top1_weight = metrics["weighter_top1_sum"].float() / (
+                weighter_diag_token_count.clamp(min=1.0)
+            )
+
+            weighter_weight_sum = metrics["weighter_weight_sum"].float()
+            weighted_load = weighter_weight_sum / weighter_weight_sum.sum(dim=-1).clamp(
+                min=1e-12
+            ).unsqueeze(-1)
+            weighted_assignment_l1 = torch.abs(weighted_load - load_frac).sum(dim=-1)
+
+            selected_weight_per_expert = weighter_weight_sum / tokens_per_expert.clamp(
+                min=1.0
+            )
+            selected_experts = tokens_per_expert > 0
+            min_selected_weight = selected_weight_per_expert.masked_fill(
+                ~selected_experts, float('inf')
+            ).min(dim=-1).values
+            max_selected_weight = selected_weight_per_expert.masked_fill(
+                ~selected_experts, float('-inf')
+            ).max(dim=-1).values
+
+            log["weighter/selected_weight_entropy_normalized"] = float(
+                normalized_entropy[weighter_active_layers].mean().item()
+            )
+            log["weighter/effective_k"] = float(
+                effective_k[weighter_active_layers].mean().item()
+            )
+            log["weighter/top1_weight"] = float(
+                top1_weight[weighter_active_layers].mean().item()
+            )
+            log["weighter/weighted_vs_assignment_l1"] = float(
+                weighted_assignment_l1[weighter_active_layers].mean().item()
+            )
+            log["weighter/per_expert_mean_selected_weight_min"] = float(
+                min_selected_weight[weighter_active_layers].mean().item()
+            )
+            log["weighter/per_expert_mean_selected_weight_max"] = float(
+                max_selected_weight[weighter_active_layers].mean().item()
+            )
 
     if task_specific_validation:
         task_name = prefix.split("/", 1)[1]
@@ -2776,6 +3021,7 @@ def track_moe_router_metrics(
     moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss",
     pg_collection: Optional[ProcessGroupCollection] = None,
     return_current_max_vio_global: bool = False,
+    include_weighter_diagnostics: bool = False,
 ) -> dict[str, float]:
     """Reduce and log accumulated MoE router diagnostics."""
     tracker = get_moe_router_metrics_tracker()
@@ -2783,9 +3029,17 @@ def track_moe_router_metrics(
         assert num_layers is not None
         assert num_experts is not None
         device = next(iter(tracker.values())).device if tracker else torch.device("cuda")
-        _initialize_router_metrics_tracker(num_layers, num_experts, device)
+        _initialize_router_metrics_tracker(
+            num_layers,
+            num_experts,
+            device,
+            include_weighter_diagnostics=include_weighter_diagnostics,
+        )
 
-    reduce_moe_router_metrics_tracker_across_ranks(pg_collection=pg_collection)
+    reduce_moe_router_metrics_tracker_across_ranks(
+        pg_collection=pg_collection,
+        include_weighter_diagnostics=include_weighter_diagnostics,
+    )
     current_max_vio_global = None
     if return_current_max_vio_global:
         current_max_vio_global = _compute_moe_router_max_vio_global(tracker, num_experts)
@@ -3149,8 +3403,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
-            output = output[0]
+            # Transformer Engine's fused bias path is not reliable when the router
+            # parameters are BF16 and the requested output is FP32. In particular,
+            # it can return corrupt values even for an all-zero bias. Compute the
+            # GEMM without bias and add it explicitly in the output dtype instead.
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN")[0]
+            if bias is not None:
+                output = output + bias.to(dtype=router_dtype)
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
         else:
@@ -3194,7 +3453,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
-        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+        grad_bias = grad_output.sum(dim=0).to(bias.dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, grad_bias, None
 

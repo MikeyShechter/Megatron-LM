@@ -23,6 +23,9 @@ from megatron.core.transformer.moe.moe_utils import (
     get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
     load_balance_ste_soft_mask,
+    moe_router_regular_validation_diagnostics_enabled,
+    moe_router_weighting_eval_enabled,
+    moe_weighter_routing_eval_enabled,
     moe_metagrad_enabled,
     qb_dual_update,
     qb_projection_distillation_loss_func,
@@ -32,6 +35,7 @@ from megatron.core.transformer.moe.moe_utils import (
     save_to_router_metrics_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
+    topk_selection_with_score_function,
     topk_routing_with_score_function,
     z_loss_func,
 )
@@ -66,16 +70,33 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.use_separate_weighter = self.config.moe_router_use_separate_weighter
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
-        if self.config.add_bias_linear:
+        self.weighter_weight = None
+        if self.use_separate_weighter:
+            self.weighter_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32
+                )
+            )
+            setattr(self.weight, 'is_split_moe_router_parameter', True)
+
+        router_has_bias = (
+            self.config.moe_router_enable_bias
+            if self.use_separate_weighter
+            else self.config.add_bias_linear
+        )
+        if router_has_bias:
             self.bias = torch.nn.Parameter(
                 torch.empty((self.config.num_moe_experts), dtype=torch.float32)
             )
+            if self.use_separate_weighter:
+                setattr(self.bias, 'is_split_moe_router_parameter', True)
         else:
             self.bias = None
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
@@ -86,14 +107,25 @@ class Router(ABC, MegatronModule):
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:
-            if self.config.init_moe_router_zero:
+            if self.use_separate_weighter:
+                torch.nn.init.normal_(self.weight, mean=0.0, std=1e-6)
+                self.config.init_method(self.weighter_weight)
+            elif self.config.init_moe_router_zero:
                 torch.nn.init.zeros_(self.weight)
             else:
                 self.config.init_method(self.weight)
             if self.bias is not None:
-                self.config.init_method(self.bias)
+                if self.use_separate_weighter:
+                    torch.nn.init.zeros_(self.bias)
+                else:
+                    self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.weighter_weight is not None:
+            self.weighter_weight.data = self.weighter_weight.data.to(
+                dtype=self.config.params_dtype
+            )
+            setattr(self.weighter_weight, 'sequence_parallel', self.config.sequence_parallel)
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
@@ -121,6 +153,20 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float64
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
+
+    def weighting(self, input: torch.Tensor):
+        """Return bias-free split-weighter logits."""
+        if self.weighter_weight.device.type == 'cpu':
+            self.weighter_weight.data = self.weighter_weight.data.to(
+                device=torch.cuda.current_device()
+            )
+
+        weighter_dtype = input.dtype
+        if self.config.moe_router_dtype == 'fp32':
+            weighter_dtype = torch.float32
+        elif self.config.moe_router_dtype == 'fp64':
+            weighter_dtype = torch.float64
+        return router_gating_linear(input, self.weighter_weight, None, weighter_dtype)
 
     @abstractmethod
     def routing(self, logits: torch.Tensor):
@@ -187,6 +233,8 @@ class TopKRouter(Router):
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
+        self.router_selection_activation = self.config.moe_router_selection_activation
+        self.weighter_activation = self.config.moe_weighter_activation
         self.input_jitter = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
@@ -665,6 +713,7 @@ class TopKRouter(Router):
                 self._metagrad_tracks("width")
                 and load_balancing_type
                 not in ("quantile_correction_ste", "fixed_number_boundary_ste")
+                and load_balance_ste_type != "full"
             ):
                 metagrad_width_loss = direct_load_balancing_width_sensitivity_loss_func(
                     load_balancing_type=load_balancing_type,
@@ -738,7 +787,10 @@ class TopKRouter(Router):
 
     def _learnable_bias_affects_expert_weights(self) -> bool:
         """Whether the learnable bias is added to logits used for routing weights."""
-        return self.learnable_bias_type in ("expert_bias_weight", "per_token_bias_weight")
+        return not self.use_separate_weighter and self.learnable_bias_type in (
+            "expert_bias_weight",
+            "per_token_bias_weight",
+        )
 
     def _uses_bias_adder(self) -> bool:
         """Whether to transform the representation shared by routing and experts."""
@@ -822,13 +874,25 @@ class TopKRouter(Router):
 
     def _compute_selection_scores(self, logits: torch.Tensor) -> torch.Tensor:
         """Scores p = activation(logits), matching what top-k selection uses."""
-        if self.score_function == "softmax":
+        score_function = (
+            self.router_selection_activation if self.use_separate_weighter else self.score_function
+        )
+        if score_function == "none":
+            return logits.float()
+        if score_function == "softmax":
             return torch.softmax(logits, dim=-1, dtype=torch.float32)
-        if self.score_function == "sigmoid":
+        if score_function == "sigmoid":
             return torch.sigmoid(logits.float())
-        if self.score_function == "sqrtsoftplus":
+        if score_function == "sqrtsoftplus":
             return torch.nn.functional.softplus(logits.float()).sqrt()
-        raise ValueError(f"Invalid score_function: {self.score_function}")
+        raise ValueError(f"Invalid score_function: {score_function}")
+
+    def _compute_split_scores_for_aux_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Return normalized router scores for metrics and soft auxiliary losses."""
+        if self.router_selection_activation == "none":
+            return torch.softmax(logits, dim=-1, dtype=torch.float32)
+        scores = self._compute_selection_scores(logits)
+        return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
 
     def _selection_bias_for_margin(self, detached: bool):
         """Bias added to scores for top-k selection (learnable or DeepSeek), or None."""
@@ -849,6 +913,13 @@ class TopKRouter(Router):
         the true margin is in score space and includes the bias.
         """
         bias = self._selection_bias_for_margin(detached)
+        if self.use_separate_weighter:
+            scores = self._compute_selection_scores(logits)
+            if detached:
+                scores = scores.detach()
+            if bias is None:
+                return scores, False
+            return scores + bias, True
         if bias is None:
             return logits, False
         scores = self._compute_selection_scores(logits)
@@ -860,29 +931,28 @@ class TopKRouter(Router):
             scores = scores.detach()
         return scores + bias, True
 
-    def _apply_learnable_bias_lm_ste(
+    def _apply_selection_lm_ste(
         self,
         probs: torch.Tensor,
         logits: torch.Tensor,
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Route the LM-loss gradient to the learnable routing biases via the STE.
+        """Route the LM-loss gradient through hard top-k selection via the STE.
 
         Top-k selection is non-differentiable, so the LM loss cannot train the
-        learnable bias b on its own. Here probs are scaled by the STE soft
-        selection mask (the same one the LB loss uses), whose forward value matches the
-        hard routing map (so probs, and therefore the MoE output, are unchanged) while
-        its backward pass flows gradient through the biased selection margin to b.
-        Selection is then shaped by both balance (LB loss) and performance (LM loss),
-        letting moe_aux_loss_coeff control the trade-off directly instead of
-        moe_learnable_bias_lr_mult.
+        split router or a selection-only learnable bias on its own. A zero-valued
+        forward term attaches the same selection STE used by the LB loss to the expert
+        combine weights. The MoE output and the ordinary weighter gradient are unchanged,
+        while the backward pass trains the parameters that made the assignment.
         """
         load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope = (
             get_load_balance_ste_params(self.config)
         )
-        # margin_input = p.detach() + b, so the STE gradient flows to b (and only to the
-        # router logits if moe_learnable_bias_pass_grad_through_scores is set).
+        # In split mode the router input was detached in forward unless explicitly
+        # configured otherwise, so this trains the router without changing the token
+        # representation. For selection-only learned biases, score detachment remains
+        # controlled by moe_learnable_bias_pass_grad_through_scores.
         margin_input, _ = self._margin_input_for_ste(logits, detached=False)
         ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
         if padding_mask is not None:
@@ -895,9 +965,40 @@ class TopKRouter(Router):
             load_balance_tanh_ste_slope,
             ste_rect_poistion,
         )
-        # soft_mask == routing_map in forward, and probs is zero off the selected set,
-        # so probs is unchanged; the gradient flows through soft_mask to b.
-        return probs * soft_mask.to(probs.dtype)
+        # Keep the ordinary LM gradient into probs exactly unchanged. The additive,
+        # zero-forward term creates a separate assignment-gradient branch whose
+        # coefficient is detached from the weighter.
+        soft_mask = soft_mask.to(probs.dtype)
+        return probs + probs.detach() * (soft_mask - soft_mask.detach())
+
+    def _apply_normalized_relative_lm_ste(
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Give every selected expert a rect-independent relative LM assignment signal.
+
+        The normalized surrogate has derivative `p_e * grad_y dot (h_e - y)` with
+        respect to each selected expert's activated router score. Its contribution is
+        zero in forward, and all weighter probabilities are detached on this branch.
+        """
+        selection_scores, _ = self._margin_input_for_ste(logits, detached=False)
+        if padding_mask is not None:
+            routing_map = routing_map & ~padding_mask.unsqueeze(-1)
+
+        hard_assignment = routing_map.to(dtype=selection_scores.dtype)
+        assignment_ste = (
+            hard_assignment + selection_scores - selection_scores.detach()
+        )
+        detached_probs = probs.detach().to(dtype=selection_scores.dtype)
+        relative_weights = detached_probs * assignment_ste
+        relative_weights = relative_weights / (
+            relative_weights.sum(dim=-1, keepdim=True) + 1e-20
+        )
+        relative_weights = relative_weights.to(dtype=probs.dtype)
+        return probs + relative_weights - relative_weights.detach()
 
     def _save_router_metrics(
         self,
@@ -908,6 +1009,7 @@ class TopKRouter(Router):
         accepted_routing_map: torch.Tensor,
         seq_length: int,
         bsz: int,
+        weighter_logits: Optional[torch.Tensor] = None,
         expert_capacity: Optional[int] = None,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> None:
@@ -946,6 +1048,23 @@ class TopKRouter(Router):
             top2_coef = torch.zeros_like(top1_coef)
         avg_1_2_coef_diff_sum = ((top1_coef - top2_coef) * valid_tokens.float()).sum()
 
+        collect_weighter_diagnostics = (
+            self.use_separate_weighter
+            and not self.training
+            and moe_router_regular_validation_diagnostics_enabled()
+        )
+        if collect_weighter_diagnostics:
+            selected_probs = probs * attempted_routing_map.float()
+            weighter_entropy = -(
+                selected_probs * (selected_probs + eps).log()
+            ).sum(dim=-1)
+            weighter_entropy_sum = (weighter_entropy * valid_tokens.float()).sum()
+            weighter_effective_k_sum = (
+                weighter_entropy.exp() * valid_tokens.float()
+            ).sum()
+            weighter_top1_sum = (selected_probs.max(dim=-1).values * valid_tokens.float()).sum()
+            weighter_weight_sum = selected_probs.sum(dim=0)
+
         ste_in_rect_count = token_count.new_tensor(0.0)
         ste_all_experts_in_rect_count = token_count.new_tensor(0.0)
         ste_selected_count = tokens_per_expert.sum()
@@ -953,7 +1072,18 @@ class TopKRouter(Router):
         quantile_delta_bias = None
         quantile_affected_entry_count = token_count.new_tensor(0.0)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
-        if (not self.training) and load_balance_ste_type == "rect" and load_balance_ste_width > 0.0:
+        if (not self.training) and load_balance_ste_type == "full":
+            # Preserve the existing STE-support metrics for comparisons: every
+            # valid score has a nonzero surrogate derivative under the full STE.
+            ste_in_rect_count = ste_selected_count
+            ste_all_experts_in_rect_count = (
+                token_count * self.config.num_moe_experts
+            )
+        elif (
+            (not self.training)
+            and load_balance_ste_type == "rect"
+            and load_balance_ste_width > 0.0
+        ):
             # True margin: biased scores when selection biases are active, else logits.
             margin_input, _ = self._margin_input_for_ste(logits, detached=True)
             ste_rect_poistion = getattr(self.config, "moe_ste_rect_poistion", "topk")
@@ -1146,10 +1276,29 @@ class TopKRouter(Router):
         ):
             save_to_router_metrics_tracker(name, value, layer_number, num_layers)
 
+        if collect_weighter_diagnostics:
+            for name, value in (
+                ("weighter_diag_token_count", token_count),
+                ("weighter_entropy_sum", weighter_entropy_sum),
+                ("weighter_effective_k_sum", weighter_effective_k_sum),
+                ("weighter_top1_sum", weighter_top1_sum),
+                ("weighter_weight_sum", weighter_weight_sum),
+            ):
+                save_to_router_metrics_tracker(name, value, layer_number, num_layers)
+
         if not self.training:
             self._save_pre_activation_value_metrics(
                 "router_logits", logits, valid_tokens, token_count, layer_number, num_layers
             )
+            if collect_weighter_diagnostics:
+                self._save_pre_activation_value_metrics(
+                    "weighter_logits",
+                    weighter_logits,
+                    valid_tokens,
+                    token_count,
+                    layer_number,
+                    num_layers,
+                )
             expert_bias, token_bias, combined_bias = (
                 self._get_raw_learnable_routing_bias_components()
             )
@@ -1505,7 +1654,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        weighter_logits: Optional[torch.Tensor] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -1521,6 +1675,8 @@ class TopKRouter(Router):
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
+        if weighter_logits is not None:
+            weighter_logits = weighter_logits.view(-1, self.config.num_moe_experts)
         raw_router_logits = logits
         self._quantile_correction_delta_bias_cache = None
 
@@ -1533,7 +1689,9 @@ class TopKRouter(Router):
         # differentiable view for LB losses: by default the base router logits and token
         # representations are detached, leaving only the learned bias parameters trainable.
         learnable_bias = self._get_learnable_routing_bias()
-        learnable_bias_affects_weights = self._learnable_bias_affects_expert_weights()
+        learnable_bias_affects_weights = (
+            self._learnable_bias_affects_expert_weights() and not self.use_separate_weighter
+        )
         logits_for_load_balance = (
             self._bias_adder_logits_for_load_balance.reshape(
                 -1, self.config.num_moe_experts
@@ -1602,9 +1760,48 @@ class TopKRouter(Router):
         should_return_selection_top_indices = should_return_top_indices and selection_bias is not None
         selection_topk_indices = None
         selection_topk_plus_one_indices = None
+        split_selection_scores = None
 
         # Calculate probs and routing_map for token dispatching
-        if self.routing_type == "sinkhorn":
+        if self.use_separate_weighter and self.routing_type not in (
+            "sinkhorn",
+            "quantile_balancing",
+        ):
+            use_weighter_for_selection = moe_weighter_routing_eval_enabled()
+            selection_logits = weighter_logits if use_weighter_for_selection else logits
+            selection_activation = (
+                self.weighter_activation
+                if use_weighter_for_selection
+                else self.router_selection_activation
+            )
+            (
+                split_selection_scores,
+                routing_map,
+                selection_topk_indices,
+                selection_topk_plus_one_indices,
+            ) = topk_selection_with_score_function(
+                selection_logits,
+                self.topk,
+                score_function=selection_activation,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                expert_bias=None if use_weighter_for_selection else selection_bias,
+                router_replay=self.router_replay,
+                return_topk_plus_one_indices=should_return_topk_plus_one_indices,
+                random_tie_breaking=(
+                    self.config.init_moe_router_zero and not use_weighter_for_selection
+                ),
+            )
+            weighting_logits = logits if moe_router_weighting_eval_enabled() else weighter_logits
+            probs, _ = topk_routing_with_score_function(
+                weighting_logits,
+                self.topk,
+                use_pre_softmax=False,
+                score_function=self.weighter_activation,
+                fused=False,
+                precomputed_indices=selection_topk_indices,
+            )
+        elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "quantile_balancing":
             assert (
@@ -1668,17 +1865,31 @@ class TopKRouter(Router):
             selection_topk_indices = None
             selection_topk_plus_one_indices = None
 
-        # Pass the LM-loss gradient to learnable routing biases via the selection STE.
+        # Pass the LM-loss gradient through hard selection. In split mode this trains
+        # the router from expert usefulness while leaving combine weights to the weighter.
         if (
-            self.lm_loss_ste
-            and self.learnable_bias_type != "none"
-            and not self._uses_bias_adder()
+            (
+                self.use_separate_weighter
+                or (
+                    self.lm_loss_ste
+                    and self.learnable_bias_type != "none"
+                    and not self._uses_bias_adder()
+                )
+            )
             and self.training
             and torch.is_grad_enabled()
         ):
-            probs = self._apply_learnable_bias_lm_ste(
-                probs, logits_for_lm_ste, routing_map, padding_mask=padding_mask
-            )
+            if (
+                self.use_separate_weighter
+                and self.config.moe_lm_loss_ste_normalized_relative
+            ):
+                probs = self._apply_normalized_relative_lm_ste(
+                    probs, logits_for_lm_ste, routing_map, padding_mask=padding_mask
+                )
+            else:
+                probs = self._apply_selection_lm_ste(
+                    probs, logits_for_lm_ste, routing_map, padding_mask=padding_mask
+                )
 
         routing_map_for_aux_loss = None
         scores_for_aux_loss = None
@@ -1686,37 +1897,51 @@ class TopKRouter(Router):
         aux_topk_plus_one_indices = None
         should_track_router_metrics = self.layer_number is not None
         if should_apply_aux_loss or should_track_router_metrics:
-            aux_logits = (
-                logits_for_load_balance
-                if learnable_bias_affects_weights or self._uses_bias_adder()
-                else logits
-            )
-            aux_routing_output = compute_routing_scores_for_aux_loss(
-                aux_logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-                return_top_indices=should_return_top_indices,
-                return_topk_plus_one_indices=(
-                    should_return_top_indices and should_return_topk_plus_one_indices
-                ),
-            )
-            if (
-                should_return_top_indices
-                and should_return_topk_plus_one_indices
-                and len(aux_routing_output) == 4
-            ):
-                (
-                    routing_map_for_aux_loss,
-                    scores_for_aux_loss,
-                    aux_topk_indices,
-                    aux_topk_plus_one_indices,
-                ) = aux_routing_output
-            elif should_return_top_indices:
-                routing_map_for_aux_loss, scores_for_aux_loss, aux_topk_indices = aux_routing_output
+            if self.use_separate_weighter and split_selection_scores is not None:
+                routing_map_for_aux_loss = attempted_routing_map
+                scores_for_aux_loss = self._compute_split_scores_for_aux_loss(logits)
+                if padding_mask is not None:
+                    valid_mask = ~padding_mask.unsqueeze(-1)
+                    routing_map_for_aux_loss = routing_map_for_aux_loss & valid_mask
+                    scores_for_aux_loss = scores_for_aux_loss * valid_mask
+                aux_topk_indices = selection_topk_indices
+                aux_topk_plus_one_indices = selection_topk_plus_one_indices
             else:
-                routing_map_for_aux_loss, scores_for_aux_loss = aux_routing_output
+                aux_logits = (
+                    logits_for_load_balance
+                    if learnable_bias_affects_weights or self._uses_bias_adder()
+                    else logits
+                )
+                aux_routing_output = compute_routing_scores_for_aux_loss(
+                    aux_logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_fusion,
+                    padding_mask=padding_mask,
+                    return_top_indices=should_return_top_indices,
+                    return_topk_plus_one_indices=(
+                        should_return_top_indices and should_return_topk_plus_one_indices
+                    ),
+                )
+                if (
+                    should_return_top_indices
+                    and should_return_topk_plus_one_indices
+                    and len(aux_routing_output) == 4
+                ):
+                    (
+                        routing_map_for_aux_loss,
+                        scores_for_aux_loss,
+                        aux_topk_indices,
+                        aux_topk_plus_one_indices,
+                    ) = aux_routing_output
+                elif should_return_top_indices:
+                    (
+                        routing_map_for_aux_loss,
+                        scores_for_aux_loss,
+                        aux_topk_indices,
+                    ) = aux_routing_output
+                else:
+                    routing_map_for_aux_loss, scores_for_aux_loss = aux_routing_output
 
         if should_track_router_metrics:
             self._save_router_metrics(
@@ -1727,6 +1952,7 @@ class TopKRouter(Router):
                 routing_map,
                 seq_length,
                 bsz,
+                weighter_logits=weighter_logits,
                 expert_capacity=expert_capacity,
                 padding_mask=padding_mask,
             )
@@ -1793,9 +2019,13 @@ class TopKRouter(Router):
         """
         self._maintain_float32_expert_bias()
 
-        # Apply input jitter
+        weighter_input = input
+        # Input jitter and stop-gradient apply only to the split router branch.
         input = self.apply_input_jitter(input)
+        if self.use_separate_weighter and not self.config.moe_router_pass_grad_to_input:
+            input = input.detach()
         logits = self.gating(input)
+        weighter_logits = self.weighting(weighter_input) if self.use_separate_weighter else None
         self._bias_adder_logits_for_load_balance = None
         if self._bias_adder_input_for_load_balance is not None:
             self._bias_adder_logits_for_load_balance = self._gating_with_detached_parameters(
@@ -1828,7 +2058,11 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits,
+            padding_mask=padding_mask,
+            weighter_logits=weighter_logits,
+        )
 
         return probs, routing_map
 
@@ -1912,6 +2146,24 @@ class InferenceTopKRouter(TopKRouter):
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        if self.use_separate_weighter:
+            weighter_logits = self.weighting(input).squeeze(1)
+            _, _, top_indices, _ = topk_selection_with_score_function(
+                logits,
+                self.topk,
+                score_function=self.router_selection_activation,
+                expert_bias=self.expert_bias,
+                router_replay=self.router_replay,
+            )
+            probs, top_indices = topk_routing_with_score_function(
+                weighter_logits,
+                self.topk,
+                score_function=self.weighter_activation,
+                dense_output=True,
+                precomputed_indices=top_indices,
+            )
+            return probs.squeeze(1), top_indices.squeeze(1)
 
         precomputed_indices = None
         if self.qb_beta is not None:

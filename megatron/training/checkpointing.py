@@ -1696,6 +1696,10 @@ def load_args_from_checkpoint(
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
     _set_arg('moe_router_score_function', force=True)
+    _set_arg('moe_router_use_separate_weighter', force=True)
+    _set_arg('moe_router_selection_activation', force=True)
+    _set_arg('moe_weighter_activation', force=True)
+    _set_arg('moe_router_enable_bias', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
 
