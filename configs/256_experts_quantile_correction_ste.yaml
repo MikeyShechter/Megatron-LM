@@ -1,5 +1,5 @@
 job_details:
-  name: experts256_quantile_correction_ste
+  name: experts256_quantile_correction_ste_detach_threshold_smaller_coef
   output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
 
 parameters:
@@ -34,12 +34,14 @@ parameters:
   moe_use_global_lb: [true]
   moe_router_score_function: ["sqrtsoftplus"]
   moe_router_load_balancing_type: ["quantile_correction_ste"]
-  moe_aux_loss_coeff: [0.1, 0.01, 0.001]
+  moe_aux_loss_coeff: [0.0001, 0.00001]
   load_balance_ste_width: [0.0]
   load_balance_ste_type: ["rect"]
-  moe_learnable_bias_type: ["expert_bias"]
-  moe_learnable_bias_lr_mult: [0.1, 0.01]
-  moe_learnable_bias_pass_grad_through_scores: [true]
+  moe_learnable_bias_type: ["none", "expert_bias"]
+  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  # moe_learnable_bias_lr_mult: [0.1, 0.01]
+  moe_learnable_bias_pass_grad_through_scores: [false]
+  moe_load_balance_ste_detach_threshold: [true]
 
   optimizer: ["muon"]
   muon_scale_mode: ["shape_scaling"]

@@ -1,5 +1,5 @@
 job_details:
-  name: experts256_split_router_weighter_full_aux_loss_coef1
+  name: experts64_split_router_weighter_full_low_coef
   output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
 
 parameters:
@@ -31,12 +31,11 @@ parameters:
   squared_relu: [true]
 
   # ── MoE ──────────────────────────────────────────────────────────────────────────────
-  num_experts: [256]
-  moe_router_topk: [2]
+  num_experts: [64]
+  moe_router_topk: [8]
   moe_grouped_gemm: [true]
   moe_token_dispatcher_type: ["alltoall"]
   moe_ffn_hidden_size: [384]
-  moe_latent_size: [192]
   moe_router_dtype: ["fp32"]
 
   # Split routing architecture. The enable flag differs from its false class default;
@@ -44,21 +43,21 @@ parameters:
   moe_router_use_separate_weighter: [true]
   moe_router_selection_activation: ["none"]
   moe_weighter_activation: ["softmax"]
-  moe_router_enable_bias: [false, true]
+  moe_router_enable_bias: [false]
   moe_router_pass_grad_to_input: [false]
   moe_router_lr_mult: [1.0]
   moe_lm_loss_ste_normalized_relative: [true]
+  # moe_router_init_identical_to_weighter: [true]
 
   # Split routers always receive the LM assignment STE.
   moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["aux_loss"]
-  moe_aux_loss_coeff: [1.0]
-  load_balance_ste_type: ["rect"]
+  moe_router_load_balancing_type: ["centered_fsq"]
+  # moe_load_balance_ste_boundary_fraction: [0.001, 0.005, 0.01]
+  moe_load_balance_ste_detach_threshold: [true]
+  moe_aux_loss_coeff: [0.00001, 0.000001]
+  load_balance_ste_type: ["full"]
   load_balance_ste_width: [0.0]
   moe_ste_rect_poistion: ["topk"]
-
-  # moe_load_balance_ste_boundary_fraction: [0.0001, 0.001, 0.01]
-  # moe_load_balance_ste_detach_threshold: [true]
 
   # Do not combine the split router with either legacy selection-bias mechanism.
   moe_router_enable_expert_bias: [false]

@@ -720,7 +720,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_use_separate_weighter: bool = False
     """Use separate linear layers for hard expert selection and expert combine weights."""
 
-    moe_router_selection_activation: Literal['none', 'sigmoid', 'sqrtsoftplus'] = "none"
+    moe_router_init_identical_to_weighter: bool = False
+    """Initialize split-router weights from the independently initialized weighter weights.
+    When disabled, preserve the existing near-zero split-router initialization."""
+
+    moe_router_selection_activation: Literal['none', 'softmax', 'sigmoid', 'sqrtsoftplus'] = "none"
     """Activation applied to split-router scores before hard expert selection and its STE."""
 
     moe_weighter_activation: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"

@@ -41,7 +41,8 @@ def main() -> None:
     args.skip_task_eval = True
     args.eval_split_router_with_weighter = True
     args.eval_split_router_with_router_weights = True
-    args.multiple_validation_sets = False
+    args.multiple_validation_sets = True
+    args.validation_set_names = ["regular"]
     args.task_loss_eval_task_names = []
     if args.wandb_exp_name:
         args.wandb_exp_name = f"{args.wandb_exp_name}-router-weighter-eval"

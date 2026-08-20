@@ -110,6 +110,9 @@ class Router(ABC, MegatronModule):
             if self.use_separate_weighter:
                 torch.nn.init.normal_(self.weight, mean=0.0, std=1e-6)
                 self.config.init_method(self.weighter_weight)
+                if self.config.moe_router_init_identical_to_weighter:
+                    with torch.no_grad():
+                        self.weight.copy_(self.weighter_weight)
             elif self.config.init_moe_router_zero:
                 torch.nn.init.zeros_(self.weight)
             else:

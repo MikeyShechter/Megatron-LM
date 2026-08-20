@@ -378,8 +378,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
-    if getattr(args, "task_eval_tasks", None) and not getattr(args, "skip_task_eval", False):
-        task_valid_ds = load_prepared_task_loss_validation_datasets(args, config)
+    if getattr(args, "task_eval_tasks", None):
         regular_valid_ds = (
             []
             if valid_ds is None
@@ -395,8 +394,15 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
             regular_names = ["regular"] if len(regular_valid_ds) == 1 else [
                 f"regular_{index}" for index in range(len(regular_valid_ds))
             ]
-        valid_ds = regular_valid_ds + task_valid_ds
-        args.validation_set_names = regular_names + [dataset.name for dataset in task_valid_ds]
+        if getattr(args, "skip_task_eval", False):
+            valid_ds = regular_valid_ds
+            args.validation_set_names = regular_names
+        else:
+            task_valid_ds = load_prepared_task_loss_validation_datasets(args, config)
+            valid_ds = regular_valid_ds + task_valid_ds
+            args.validation_set_names = regular_names + [
+                dataset.name for dataset in task_valid_ds
+            ]
 
     print_rank_0("> finished creating GPT datasets ...")
 
@@ -406,15 +412,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 def configure_task_loss_eval_args(args: Any) -> None:
     """Route prepared task-loss datasets through named validation datasets."""
 
-    if getattr(args, "skip_task_eval", False):
-        return
-
     task_names = resolve_task_loss_task_names(getattr(args, "task_eval_tasks", None))
     if not task_names:
         return
 
     args.multiple_validation_sets = True
-    args.task_loss_eval_task_names = task_names
+    args.task_loss_eval_task_names = (
+        [] if getattr(args, "skip_task_eval", False) else task_names
+    )
 
 
 def get_embedding_ranks(pp_ranks: List[int]):

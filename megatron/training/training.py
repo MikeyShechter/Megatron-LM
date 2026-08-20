@@ -4415,15 +4415,6 @@ def evaluate_and_print_results(
             router_metrics_log = {}
 
         comparison_log = {}
-        if record_alternate_routing_batches:
-            if "lm loss" in total_loss_dict:
-                comparison_log["val/router/lm_loss"] = total_loss_dict["lm loss"].item()
-            for source_key, metric_name in (
-                ("vio/MaxVioGlobal", "MaxVioGlobal"),
-                ("vio/MaxVioGlobalWorstLayer", "MaxVioGlobalWorstLayer"),
-            ):
-                if source_key in router_metrics_log:
-                    comparison_log[f"val/router/{metric_name}"] = router_metrics_log[source_key]
 
         def _evaluate_alternate_routing(setter):
             consumed_valid_samples = args.consumed_valid_samples
