@@ -918,12 +918,21 @@ class TopKRouter(Router):
         """Return the tensor the STE margin is computed on, and whether it is biased.
 
         Without selection biases this stays logits (margin in logit space, gradients
-        flow to the router as before). With biases, selection happens on p + b, so
-        the true margin is in score space and includes the bias.
+        flow to the router as before). Softmax selection biases are additive in logit
+        space; sigmoid and sqrtsoftplus selection biases are additive in score space.
         """
         bias = self._selection_bias_for_margin(detached)
+        selection_score_function = (
+            self.router_selection_activation if self.use_separate_weighter else self.score_function
+        )
+
+        def selection_scores():
+            if selection_score_function == "softmax":
+                return logits.float()
+            return self._compute_selection_scores(logits)
+
         if self.use_separate_weighter:
-            scores = self._compute_selection_scores(logits)
+            scores = selection_scores()
             if detached:
                 scores = scores.detach()
             if bias is None:
@@ -931,7 +940,7 @@ class TopKRouter(Router):
             return scores + bias, True
         if bias is None:
             return logits, False
-        scores = self._compute_selection_scores(logits)
+        scores = selection_scores()
         if detached:
             scores = scores.detach()
         elif self.learnable_bias_type != "none" and not getattr(
@@ -1011,6 +1020,45 @@ class TopKRouter(Router):
         )
         relative_weights = relative_weights.to(dtype=probs.dtype)
         return probs + relative_weights - relative_weights.detach()
+
+    def _apply_counterfactual_routing_lm_ste(
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        selected_indices: torch.Tensor,
+        extra_indices: torch.Tensor,
+        accepted_routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attach the average selected-to-extra swap signal to the expert coefficients.
+
+        The added coefficients are zero in forward. Their backward pass compares every
+        extra expert output with every selected expert output, without using weighter values.
+        """
+        selection_scores, _ = self._margin_input_for_ste(logits, detached=False)
+        selected_scores = torch.gather(selection_scores, dim=-1, index=selected_indices)
+        extra_scores = torch.gather(selection_scores, dim=-1, index=extra_indices)
+
+        score_gaps = extra_scores.unsqueeze(-1) - selected_scores.unsqueeze(-2)
+        zero_forward_gaps = score_gaps - score_gaps.detach()
+
+        selected_accepted = torch.gather(
+            accepted_routing_map, dim=-1, index=selected_indices
+        )
+        extra_accepted = torch.gather(accepted_routing_map, dim=-1, index=extra_indices)
+        valid_pairs = extra_accepted.unsqueeze(-1) & selected_accepted.unsqueeze(-2)
+        if padding_mask is not None:
+            valid_pairs = valid_pairs & ~padding_mask.view(-1, 1, 1)
+        zero_forward_gaps = zero_forward_gaps * valid_pairs.to(zero_forward_gaps.dtype)
+
+        scale = 1.0 / (selected_indices.size(-1) * extra_indices.size(-1))
+        selected_coeffs = -zero_forward_gaps.sum(dim=-2) * scale
+        extra_coeffs = zero_forward_gaps.sum(dim=-1) * scale
+
+        surrogate_probs = torch.zeros_like(selection_scores)
+        surrogate_probs = surrogate_probs.scatter_add(1, selected_indices, selected_coeffs)
+        surrogate_probs = surrogate_probs.scatter_add(1, extra_indices, extra_coeffs)
+        return probs + surrogate_probs.to(dtype=probs.dtype)
 
     def _save_router_metrics(
         self,
@@ -1773,6 +1821,9 @@ class TopKRouter(Router):
         selection_topk_indices = None
         selection_topk_plus_one_indices = None
         split_selection_scores = None
+        counterfactual_selected_indices = None
+        counterfactual_extra_indices = None
+        counterfactual_routing_map = None
 
         # Calculate probs and routing_map for token dispatching
         if self.use_separate_weighter and self.routing_type not in (
@@ -1854,26 +1905,58 @@ class TopKRouter(Router):
             else:
                 probs, routing_map = routing_output
 
+        num_extra_experts = (
+            self.config.moe_router_lm_loss_extra_experts
+            if self.use_separate_weighter
+            else 0
+        )
+        if num_extra_experts > 0:
+            if selection_topk_indices is None:
+                selection_topk_indices = torch.topk(
+                    routing_map.to(dtype=torch.int32), k=self.topk, dim=-1
+                ).indices
+            counterfactual_selected_indices = selection_topk_indices
+            candidate_scores, _ = self._margin_input_for_ste(
+                logits_for_lm_ste, detached=True
+            )
+            candidate_scores = candidate_scores.masked_fill(routing_map, float('-inf'))
+            counterfactual_extra_indices = torch.topk(
+                candidate_scores, k=num_extra_experts, dim=-1, sorted=True
+            ).indices
+            extra_routing_map = torch.zeros_like(routing_map)
+            extra_routing_map.scatter_(1, counterfactual_extra_indices, True)
+            counterfactual_routing_map = routing_map | extra_routing_map
+
         # Preserve router intent so capacity clipping cannot hide imbalance in diagnostics.
         attempted_probs = probs
         attempted_routing_map = routing_map
+        dispatch_routing_map = (
+            counterfactual_routing_map
+            if counterfactual_routing_map is not None
+            else routing_map
+        )
         expert_capacity = None
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            dispatch_topk = self.topk + num_extra_experts
             expert_capacity = get_capacity(
-                num_tokens=attempted_routing_map.size(0) * self.topk,
+                num_tokens=attempted_routing_map.size(0) * dispatch_topk,
                 num_experts=self.config.num_moe_experts,
                 capacity_factor=self.config.moe_expert_capacity_factor,
             )
-            probs, routing_map = apply_router_token_dropping(
+            probs, dispatch_routing_map = apply_router_token_dropping(
                 probs,
-                routing_map,
-                router_topk=self.topk,
+                dispatch_routing_map,
+                router_topk=dispatch_topk,
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
+            if counterfactual_routing_map is not None:
+                routing_map = attempted_routing_map & dispatch_routing_map
+            else:
+                routing_map = dispatch_routing_map
             selection_topk_indices = None
             selection_topk_plus_one_indices = None
 
@@ -1891,7 +1974,19 @@ class TopKRouter(Router):
             and self.training
             and torch.is_grad_enabled()
         ):
-            if (
+            if counterfactual_routing_map is not None:
+                accepted_counterfactual_map = (
+                    counterfactual_routing_map & dispatch_routing_map
+                )
+                probs = self._apply_counterfactual_routing_lm_ste(
+                    probs,
+                    logits_for_lm_ste,
+                    counterfactual_selected_indices,
+                    counterfactual_extra_indices,
+                    accepted_counterfactual_map,
+                    padding_mask=padding_mask,
+                )
+            elif (
                 self.use_separate_weighter
                 and self.config.moe_lm_loss_ste_normalized_relative
             ):
@@ -2011,7 +2106,7 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        return probs, routing_map
+        return probs, dispatch_routing_map
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
@@ -2052,8 +2147,13 @@ class TopKRouter(Router):
                 self.learnable_bias_weight.data = self.learnable_bias_weight.data.to(
                     device=torch.cuda.current_device()
                 )
+            per_token_bias_input = (
+                input.detach()
+                if getattr(self.config, "detatch_per_token_bias_input", False)
+                else input
+            )
             self._per_token_bias = router_gating_linear(
-                input, self.learnable_bias_weight, None, torch.float32
+                per_token_bias_input, self.learnable_bias_weight, None, torch.float32
             )
             if self._learnable_bias_affects_expert_weights():
                 self._per_token_bias_for_load_balance = router_gating_linear(

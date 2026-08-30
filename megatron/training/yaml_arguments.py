@@ -435,6 +435,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         "moe_load_balance_gate_threshold",
         "metagrad_params",
         "metagrad_lr",
+        "detatch_per_token_bias_input",
     ):
         if hasattr(args, attr):
             setattr(config, attr, getattr(args, attr))

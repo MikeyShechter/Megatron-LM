@@ -78,6 +78,11 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+        self.router_topk = config.moe_router_topk + (
+            config.moe_router_lm_loss_extra_experts
+            if config.moe_router_use_separate_weighter
+            else 0
+        )
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
@@ -234,7 +239,6 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
-        self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
 
         # self.global_local_map: 2D tensor. A mask of mapping between global and local tokens where
@@ -489,7 +493,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
-            num_tokens = routing_map.size(0) * self.config.moe_router_topk
+            num_tokens = routing_map.size(0) * self.router_topk
             self.capacity = get_capacity(
                 num_tokens=num_tokens,
                 num_experts=self.num_experts,
@@ -526,7 +530,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         else:
             # For dropless training, output size is static (num_tokens * topk)
             # No explicit sync needed
-            self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
+            self.num_out_tokens = routing_map.size(0) * self.router_topk
         if self.ep_size > 1 or self.tp_size > 1:
             # ===================================================
             # Calculate input_splits, output_splits for alltoall/allgather in variable size.
@@ -1035,7 +1039,12 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
-            num_out_tokens = num_tokens * self.config.moe_router_topk
+            dispatch_topk = self.config.moe_router_topk + (
+                self.config.moe_router_lm_loss_extra_experts
+                if self.config.moe_router_use_separate_weighter
+                else 0
+            )
+            num_out_tokens = num_tokens * dispatch_topk
             # Drop and pad the input to capacity.
             self.capacity = get_capacity(
                 num_tokens=num_out_tokens,
@@ -1191,12 +1200,27 @@ class _DeepepManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        # Convert the format of routing map from multihot to indices.
-        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
-        # Mask the indices of dropped tokens with -1
-        if self.capacity_factor is not None:
-            mask = self.token_probs == 0
-            self.token_indices = self.token_indices.masked_fill(mask, -1)
+        # Convert the format of routing map from multihot to indices. Counterfactual
+        # experts have zero-valued forward coefficients, so select them from the routing
+        # map instead of from probability magnitude.
+        if (
+            self.config.moe_router_use_separate_weighter
+            and self.config.moe_router_lm_loss_extra_experts > 0
+        ):
+            _, self.token_indices = torch.topk(
+                routing_map.to(dtype=torch.int32), self.router_topk, dim=-1
+            )
+            self.token_probs = torch.gather(probs, dim=-1, index=self.token_indices)
+            selected = torch.gather(routing_map, dim=-1, index=self.token_indices)
+            self.token_indices = self.token_indices.masked_fill(~selected, -1)
+        else:
+            self.token_probs, self.token_indices = torch.topk(
+                probs, self.router_topk, dim=-1
+            )
+            # Mask the indices of dropped tokens with -1
+            if self.capacity_factor is not None:
+                mask = self.token_probs == 0
+                self.token_indices = self.token_indices.masked_fill(mask, -1)
 
     def dispatch(
         self,
@@ -1394,7 +1418,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager = _DeepepManager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
+                router_topk=self.tp_size * self.router_topk,
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )

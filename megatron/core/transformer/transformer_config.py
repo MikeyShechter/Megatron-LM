@@ -743,6 +743,11 @@ class TransformerConfig(ModelParallelConfig):
     """Use a rect-independent normalized-relative LM assignment STE for split routing.
     Every selected expert receives the local signal `p_e * grad_y dot (h_e - y)`."""
 
+    moe_router_lm_loss_extra_experts: int = 0
+    """Number of extra split-router experts to execute for the counterfactual LM routing STE.
+    The regular top-k experts determine the forward output. Extra experts are used only to
+    estimate the LM-loss effect of pairwise swaps with selected experts. Zero disables it."""
+
     moe_learnable_bias_sqrtsoftplus: bool = False
     """Apply sqrtsoftplus activation to learnable MoE routing bias outputs."""
 

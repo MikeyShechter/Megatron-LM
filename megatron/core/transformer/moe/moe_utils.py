@@ -1826,7 +1826,12 @@ def topk_selection_with_score_function(
 
     scores_for_selection = scores
     if expert_bias is not None:
-        scores_for_selection = scores_for_selection + expert_bias.float()
+        if score_function == "softmax":
+            # A softmax selection bias is additive in logit space. Keep the bias out of
+            # the returned scores so diagnostics still see the unbiased softmax values.
+            scores_for_selection = logits.float() + expert_bias.float()
+        else:
+            scores_for_selection = scores_for_selection + expert_bias.float()
 
     can_return_topk_plus_one = (
         return_topk_plus_one_indices
@@ -2075,19 +2080,22 @@ def topk_routing_with_score_function(
     # - The final probs are casted to the same dtype as the logits.
     if score_function == "softmax":
         if expert_bias is not None:
-            # Aux-loss-free routing with softmax: softmax across experts to get
-            # per-expert scores, add the per-expert bias for top-k selection only,
-            # and use the un-biased softmax scores as the routing weights.
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            # Add the selection-only bias in logit space. Compute combine weights from
+            # the unbiased logits so the bias affects assignment but not weighting.
             if precomputed_indices is not None:
                 top_indices = precomputed_indices
             else:
-                scores_for_routing = scores + expert_bias.float()
+                scores_for_routing = logits.float() + expert_bias.float()
                 top_values, top_indices = compute_topk(
                     scores_for_routing, topk_count, num_groups, group_topk
                 )
                 _, top_indices = _trim_topk_plus_one(top_values, top_indices)
-            probs = torch.gather(scores, dim=1, index=top_indices)
+            if use_pre_softmax:
+                scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                selected_logits = torch.gather(logits.float(), dim=1, index=top_indices)
+                probs = torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
         elif use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             if precomputed_indices is not None:

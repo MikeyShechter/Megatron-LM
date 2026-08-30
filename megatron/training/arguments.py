@@ -1831,6 +1831,7 @@ def core_transformer_config_from_args(args, config_class=None):
         "moe_use_global_lb",
         "moe_learnable_bias_type",
         "moe_learnable_bias_pass_grad_through_scores",
+        "detatch_per_token_bias_input",
         "moe_lm_loss_ste",
     ):
         if hasattr(args, attr):
@@ -3299,6 +3300,11 @@ def _add_moe_args(parser):
                        help='For learnable MoE routing bias load balancing: pass the LB '
                             'gradient through the base routing scores as well as the learned '
                             'biases. If unset, only the bias parameters receive the LB gradient.')
+    group.add_argument('--detatch-per-token-bias-input',
+                       action='store_true', default=False,
+                       dest='detatch_per_token_bias_input',
+                       help='Detach the input to the per-token learnable routing-bias projection. '
+                            'The projection weight still receives gradients.')
     group.add_argument('--moe-lm-loss-ste',
                        action='store_true', default=False,
                        dest='moe_lm_loss_ste',
