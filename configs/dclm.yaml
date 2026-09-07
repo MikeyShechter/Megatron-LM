@@ -1,6 +1,6 @@
 job_details:
-  name: experts64_quantile_correction_ste
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  name: experts64_no_lb
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
@@ -38,23 +38,24 @@ parameters:
   moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
   moe_router_dtype: ["fp32"]
   
-  moe_use_global_lb: [true]
-  moe_router_load_balancing_type: ["quantile_correction_ste"]
-  moe_aux_loss_coeff: [0.1, 0.01, 0.001]  # 0.1, 0.01, 0.001
-  moe_load_balance_ste_detach_threshold: [true, false]
+  # moe_use_global_lb: [true]
+  # moe_router_load_balancing_type: ["centered_fsq"]
+  # moe_aux_loss_coeff: [0.008, 0.004, 0.002]  # 0.1, 0.01, 0.001
+  # moe_load_balance_ste_detach_threshold: [true, false]
   
-  load_balance_ste_type: ["rect"]
+  # load_balance_ste_type: ["rect"]
   moe_router_score_function: ["sqrtsoftplus"]
-  moe_learnable_bias_pass_grad_through_scores: [false]
-  moe_learnable_bias_type: ["none", "expert_bias"]  #, 'none' 'per_token_expert_bias'
-  load_balance_ste_width: [0.0]
+  # moe_learnable_bias_pass_grad_through_scores: [false]
+  # moe_learnable_bias_type: ["per_token_bias"]
+  # detatch_per_token_bias_input: [true]
+  # load_balance_ste_width: [1.0, 0.1]
   # metagrad_params: ["width"]
   # metagrad_lr: [1.0e-1, 1.0, 10, 100]
   # moe_learnable_bias_sqrtsoftplus: [true]
   # moe_balance_update_rate: [0.0001, 0.00001]
   # moe_balance_target_vio: [0.4, 0.8]
 
-  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  # tie_learnable_bias_lr_to_aux_loss_coeff: [true]
 
   # moe_load_balance_gate_metric: ['maxvio'] # TODO, try with totalvio later
   # moe_load_balance_gate_threshold: [0.1, 0.3, 0.5, 0.7, 1.0]

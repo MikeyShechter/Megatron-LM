@@ -35,7 +35,7 @@ fi
 export CONF
 
 CONF_DIR=$(dirname "${CONF}")
-APPTAINER_BINDS="${REPO_DIR}:/workspace,/e/data1/datasets:/datasets,${CONF_DIR}:${CONF_DIR},${RUN_STORAGE}:${RUN_STORAGE},/e/project1/laionize/shechter1:/e/project1/laionize/shechter1,/dev/shm:/dev/shm"
+APPTAINER_BINDS="${REPO_DIR}:/workspace,/e/data1/datasets:/datasets,/e/data1/mmlaion:/e/data1/mmlaion,${CONF_DIR}:${CONF_DIR},${RUN_STORAGE}:${RUN_STORAGE},/e/project1/laionize/shechter1:/e/project1/laionize/shechter1,/dev/shm:/dev/shm"
 
 # W&B — offline so compute nodes don't need outbound network
 export WANDB_MODE=offline

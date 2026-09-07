@@ -1,11 +1,12 @@
 job_details:
-  name: basic_extra
+  name: experts2048_centered_fsq
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
-  data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
-  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
   vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
@@ -15,8 +16,8 @@ parameters:
   save_only_latest: [true]
   save_pre_decay: [true]
 
-  task-eval-tasks: ['dclm-core-22']
-  task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
+  # task-eval-tasks: ['dclm-core-22']
+  # task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
 
   # ── Model ─────────────────────────────────────────────────────────────────────
   num_layers: [12]                # = n_layer
@@ -28,42 +29,73 @@ parameters:
   squared_relu: [true]
 
   # ── MoE ──────────────────────────────────────────────────────────────────────
-  num_experts: [64]
-  moe_router_topk: [8]           # = top_k
+  num_experts: [2048]
+  moe_router_topk: [2]            # = top_k
   # Megatron load-balancing choices: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, none.
   moe_grouped_gemm: [true]
   moe_token_dispatcher_type: ["alltoall"]
-  # 768 * 0.5 = 384
-  moe_ffn_hidden_size: [384]      # = hidden_dim_scale_factor (computed and set explicitly)
+  # Keep the same per-expert shape as the 256-expert configuration.
+  moe_ffn_hidden_size: [384]
+  moe_latent_size: [192]
   moe_router_dtype: ["fp32"]
-  
-  # LIST_EXPS:
-  #   - moe_router_load_balancing_type: ["centered_fsq"]
-  #     load_balance_ste_width: [1.0]
-  #     moe_aux_loss_coeff: [0.01]
-  #   - moe_router_load_balancing_type: ["aux_loss"]
-  #     load_balance_ste_width: [0.0]
-  #     moe_aux_loss_coeff: [0.01]
-  
-  LIST_EXPS:
-    - moe_router_load_balancing_type: ["centered_fsq"]
-      load_balance_ste_width: [0.5, 0.1, 2.0, 5.0]
-      moe_aux_loss_coeff: [0.01, 0.001]
-    - moe_router_load_balancing_type: ["centered_fsq"]
-      load_balance_ste_width: [1.0]
-      moe_aux_loss_coeff: [0.001]
-    - moe_router_load_balancing_type: ["aux_loss"]
-      load_balance_ste_width: [0.0]
-      moe_aux_loss_coeff: [0.1, 0.001]
-  
+
+  moe_use_global_lb: [true]
+  moe_aux_loss_coeff: [0.1, 0.01, 0.001]
+  moe_router_score_function: ["softmax", "sigmoid", "sqrtsoftplus"] #, "sigmoid", "sqrtsoftplus"
+
+  moe_router_load_balancing_type: ["centered_fsq"]
+  # moe_load_balance_ste_detach_threshold: [true, false]
+  # moe_router_enable_expert_bias: [true]
+  # moe_router_bias_update_rate: [0.1, 0.01, 0.001]
+  load_balance_ste_width: [0.1, 1.0]
+  moe_learnable_bias_type: ['none', 'expert_bias', 'per_token_bias']
+  # moe_ste_rect_poistion: ['topk', 'midpoint']
+  load_balance_ste_type: ["rect"]  # , "triangle"
+
+  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  moe_learnable_bias_pass_grad_through_scores: [false]
+  detatch_per_token_bias_input: [true]
+
+  # LIST_LB:
+    # - moe_router_load_balancing_type: ["none"] # DeepSeek loss free
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [true]
+    #   moe_router_bias_update_rate: [0.0001]
+    #   moe_aux_loss_coeff: [0.0]
+    #   load_balance_ste_width: [0.0]
+    #   moe_learnable_bias_type: ['none']
+    # - moe_router_load_balancing_type: ["aux_loss"] # standard global aux loss
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [false]
+    #   moe_router_bias_update_rate: [0.0]
+    #   moe_aux_loss_coeff: [0.001]
+    #   load_balance_ste_width: [0.0]
+    #   moe_learnable_bias_type: ['none']
+    # - moe_router_load_balancing_type: ["centered_fsq"] # STE variants
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [false]
+    #   moe_router_bias_update_rate: [0.0]
+    #   moe_aux_loss_coeff: [0.001]
+    #   load_balance_ste_width: [0.1]
+    #   moe_learnable_bias_type: ['none', 'expert_bias', 'per_token_bias']
+
+  # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
+
+  # moe_balance_update_rate: [0.0001]
+  # moe_balance_target_vio: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+
 
   # ── Optimizer ────────────────────────────────────────────────────────────────
-  optimizer: ["muon"]
-  muon_scale_mode: ["shape_scaling"]
-  muon_nesterov: [true]
-  muon_momentum: [0.95]           # = momentum
-  lr: [0.02]                      # = lr_muon
-  decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;
+  # optimizer: ["muon"]
+  # muon_scale_mode: ["shape_scaling"]
+  # muon_nesterov: [true]
+  # muon_momentum: [0.95]           # = momentum
+  # lr: [0.02]                      # = lr_muon
+  # decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;
+  
+  optimizer: ["adam"]
+  lr: [0.001]
+  
                                   #   nanogpt had lr_embed=0.3 separately, not replicable here)
   min_lr: [1.0e-6]
   weight_decay: [0.0]
@@ -79,8 +111,8 @@ parameters:
   lr_wsd_decay_style: ["linear"]
 
   # ── Batch & iters ─────────────────────────────────────────────────────────────
-  micro_batch_size: [32]           # = device_batch_size
-  global_batch_size: [512]        # = batch_size
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
   train_iters: [6000]             # = num_iterations
   bf16: [true]
   seed: [1000]
@@ -91,7 +123,7 @@ parameters:
   # ── Parallelism ───────────────────────────────────────────────────────────────
   tensor_model_parallel_size: [1]
   pipeline_model_parallel_size: [1]
-  expert_model_parallel_size: [8]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
 
   # ── Eval & logging ────────────────────────────────────────────────────────────
   eval_interval: [150]            # = val_loss_every

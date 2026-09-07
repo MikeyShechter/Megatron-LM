@@ -1,6 +1,6 @@
 job_details:
   name: experts64_split_router_weighter_full_low_coef
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 job_details:
-  name: experts256_qb_projection_distillation
+  name: experts256_quantile_correction_softmax_bias_fixed
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
+  # Data
   data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
   data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
   split: ["98,1,1"]
@@ -13,9 +14,10 @@ parameters:
   null_tokenizer_pad_id: [-1]
   save_only_latest: [true]
   save_pre_decay: [true]
-  task-eval-tasks: ['dclm-core-22']
-  task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
+  task-eval-tasks: ["dclm-core-22"]
+  task-eval-data-dir: ["/e/project1/laionize/shechter1/core_megatron_datasets"]
 
+  # Model
   num_layers: [12]
   hidden_size: [768]
   num_attention_heads: [6]
@@ -24,6 +26,7 @@ parameters:
   max_position_embeddings: [1024]
   squared_relu: [true]
 
+  # MoE: rerun only the six softmax + expert-bias combinations affected by the bug.
   num_experts: [256]
   moe_router_topk: [2]
   moe_grouped_gemm: [true]
@@ -32,15 +35,15 @@ parameters:
   moe_latent_size: [192]
   moe_router_dtype: ["fp32"]
   moe_use_global_lb: [true]
-  moe_router_score_function: ["sqrtsoftplus"]
-  moe_router_load_balancing_type: ["qb_projection_distillation"]
   moe_aux_loss_coeff: [0.1, 0.01, 0.001]
-  load_balance_ste_width: [0.0]
-  moe_qb_projection_temperature: [1.0]
-  moe_qb_projection_score_function: ["softmax", "sigmoid", "sqrtsoftplus"]
+  moe_router_score_function: ["softmax"]
+  moe_router_pre_softmax: [false]
+  moe_router_load_balancing_type: ["quantile_correction_ste"]
+  moe_load_balance_ste_detach_threshold: [true, false]
+  moe_learnable_bias_type: ["expert_bias"]
   load_balance_ste_type: ["rect"]
-  moe_learnable_bias_type: ["none"]
 
+  # Optimizer
   optimizer: ["muon"]
   muon_scale_mode: ["shape_scaling"]
   muon_nesterov: [true]
@@ -53,11 +56,13 @@ parameters:
   adam_beta1: [0.9]
   adam_beta2: [0.95]
 
+  # LR schedule
   lr_decay_style: ["WSD"]
   lr_warmup_iters: [0]
   lr_wsd_decay_iters: [1714]
   lr_wsd_decay_style: ["linear"]
 
+  # Batch and iterations
   micro_batch_size: [32]
   global_batch_size: [512]
   train_iters: [6000]
@@ -67,10 +72,12 @@ parameters:
   attention_backend: ["unfused"]
   cross_entropy_loss_fusion: [false]
 
+  # Parallelism
   tensor_model_parallel_size: [1]
   pipeline_model_parallel_size: [1]
   expert_model_parallel_size: [8]
 
+  # Evaluation and logging
   eval_interval: [150]
   eval_iters: [20]
   save_interval: [150]

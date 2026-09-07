@@ -1,6 +1,6 @@
 job_details:
   name: centered_fsq_and_var_more_exps
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 job_details:
-  name: experts256_split_router_weighter_full_aux_loss_coef1
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  name: experts256_split_router_weighter_aux_loss_2extra_experts
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────────────
@@ -47,12 +47,13 @@ parameters:
   moe_router_enable_bias: [false, true]
   moe_router_pass_grad_to_input: [false]
   moe_router_lr_mult: [1.0]
-  moe_lm_loss_ste_normalized_relative: [true]
+  # moe_lm_loss_ste_normalized_relative: [true]
+  moe_router_lm_loss_extra_experts: [2]
 
   # Split routers always receive the LM assignment STE.
   moe_use_global_lb: [true]
   moe_router_load_balancing_type: ["aux_loss"]
-  moe_aux_loss_coeff: [1.0]
+  moe_aux_loss_coeff: [0.1, 0.01, 0.001]
   load_balance_ste_type: ["rect"]
   load_balance_ste_width: [0.0]
   moe_ste_rect_poistion: ["topk"]

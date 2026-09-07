@@ -1,6 +1,6 @@
 job_details:
   name: sweep_target_centered_fsq_start_from01
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────

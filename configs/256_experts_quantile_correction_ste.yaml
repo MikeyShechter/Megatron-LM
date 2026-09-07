@@ -1,6 +1,6 @@
 job_details:
   name: experts256_quantile_correction_ste_detach_threshold_smaller_coef
-  output_dir: /e/project1/laionize/shechter1/checkpoints/megatron/
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
