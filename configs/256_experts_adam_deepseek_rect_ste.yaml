@@ -1,0 +1,88 @@
+job_details:
+  name: experts256_adam_deepseek_rect_ste
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # Data
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]
+  null_tokenizer_pad_id: [-1]
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # Model
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # MoE
+  num_experts: [256]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  load_balance_ste_type: ["rect"]
+  moe_router_score_function: ["sigmoid"]
+  moe_learnable_bias_type: ["none"]
+
+  LIST_LB:
+    - moe_router_load_balancing_type: ["none"]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_rate: [0.01, 0.001]
+      moe_aux_loss_coeff: [0.0]
+      load_balance_ste_width: [0.0]
+    - moe_router_load_balancing_type: ["centered_fsq"]
+      moe_router_enable_expert_bias: [false]
+      moe_router_bias_update_rate: [0.0]
+      moe_aux_loss_coeff: [0.01]
+      load_balance_ste_width: [0.1, 1.0]
+
+  # Optimizer
+  optimizer: ["adam"]
+  lr: [0.001]
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # LR schedule
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]
+  lr_wsd_decay_style: ["linear"]
+
+  # Batch and iterations
+  micro_batch_size: [32]
+  global_batch_size: [512]
+  train_iters: [6000]
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # Parallelism
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [8]
+
+  # Evaluation and logging
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]
