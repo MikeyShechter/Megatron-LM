@@ -695,12 +695,16 @@ def _quantile_correction_delta_bias(
     topk: int,
     num_experts: int,
     reduce_group: Optional[torch.distributed.ProcessGroup],
+    mean_local: bool = False,
 ) -> torch.Tensor:
     """Return the stopped-gradient QB correction for each expert."""
     with torch.no_grad():
-        quantile_margin = _gather_valid_load_balance_margins(
-            margin, valid_tokens, num_experts, reduce_group
-        )
+        if mean_local:
+            quantile_margin = margin.detach().float()[valid_tokens.detach()]
+        else:
+            quantile_margin = _gather_valid_load_balance_margins(
+                margin, valid_tokens, num_experts, reduce_group
+            )
 
         num_valid_tokens = quantile_margin.size(0)
         target_assignments = num_valid_tokens * topk // num_experts
@@ -708,7 +712,12 @@ def _quantile_correction_delta_bias(
         target_boundary = torch.kthvalue(
             quantile_margin, kth_smallest, dim=0
         ).values
-        return -target_boundary
+        delta_bias = -target_boundary
+        if mean_local and reduce_group is not None and reduce_group.size() > 1:
+            torch.distributed.all_reduce(
+                delta_bias, op=torch.distributed.ReduceOp.AVG, group=reduce_group
+            )
+        return delta_bias
 
 
 def _fixed_boundary_radius(
@@ -834,6 +843,7 @@ def _quantile_correction_load_surrogate(
     delta_bias: Optional[torch.Tensor] = None,
     topk_plus_one_indices: Optional[torch.Tensor] = None,
     detach_threshold: bool = False,
+    mean_local: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the hard-load surrogate and its per-expert QB correction."""
     margin, valid_tokens = _load_balance_margin(
@@ -845,7 +855,12 @@ def _quantile_correction_load_surrogate(
     )
     if delta_bias is None:
         delta_bias = _quantile_correction_delta_bias(
-            margin, valid_tokens, topk, num_experts, reduce_group
+            margin,
+            valid_tokens,
+            topk,
+            num_experts,
+            reduce_group,
+            mean_local=mean_local,
         )
     forward_load = forward_load.to(device=margin.device, dtype=margin.dtype)
     ste_tokens_per_expert = _QuantileCorrectionLoadSTE.apply(
@@ -1064,6 +1079,7 @@ def direct_load_balancing_loss_func(
     load_balance_topk_indices: Optional[torch.Tensor] = None,
     load_balance_topk_plus_one_indices: Optional[torch.Tensor] = None,
     quantile_correction_delta_bias: Optional[torch.Tensor] = None,
+    quantile_correction_mean_local: bool = False,
     load_balance_ste_boundary_fraction: float = 0.0,
     load_balance_ste_detach_threshold: bool = False,
 ) -> torch.Tensor:
@@ -1111,6 +1127,7 @@ def direct_load_balancing_loss_func(
                     delta_bias=quantile_correction_delta_bias,
                     topk_plus_one_indices=load_balance_topk_plus_one_indices,
                     detach_threshold=load_balance_ste_detach_threshold,
+                    mean_local=quantile_correction_mean_local,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom

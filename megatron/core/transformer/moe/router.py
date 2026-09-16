@@ -661,6 +661,9 @@ class TopKRouter(Router):
         load_balance_ste_detach_threshold = getattr(
             self.config, "moe_load_balance_ste_detach_threshold", False
         )
+        quantile_correction_mean_local = getattr(
+            self.config, "quantile_correction_mean_local", False
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             quantile_correction_delta_bias = (
                 self._quantile_correction_delta_bias_cache
@@ -686,6 +689,7 @@ class TopKRouter(Router):
                 load_balance_topk_indices=topk_indices,
                 load_balance_topk_plus_one_indices=topk_plus_one_indices,
                 quantile_correction_delta_bias=quantile_correction_delta_bias,
+                quantile_correction_mean_local=quantile_correction_mean_local,
                 load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
                 load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
             )
@@ -713,6 +717,7 @@ class TopKRouter(Router):
                         load_balance_topk_indices=topk_indices,
                         load_balance_topk_plus_one_indices=topk_plus_one_indices,
                         quantile_correction_delta_bias=quantile_correction_delta_bias,
+                        quantile_correction_mean_local=quantile_correction_mean_local,
                         load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
                         load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
                     )
@@ -1171,6 +1176,7 @@ class TopKRouter(Router):
                 self.topk,
                 self.config.num_moe_experts,
                 reduce_group,
+                mean_local=getattr(self.config, "quantile_correction_mean_local", False),
             )
             self._quantile_correction_delta_bias_cache = quantile_delta_bias
             if not self.training:

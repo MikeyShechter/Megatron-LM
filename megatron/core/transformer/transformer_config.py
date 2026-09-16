@@ -845,6 +845,10 @@ class TransformerConfig(ModelParallelConfig):
     """Stop gradients through the token-dependent Top-K threshold used to construct
     margin-based load-balancing STEs. Forward margins and routing are unchanged."""
 
+    quantile_correction_mean_local: bool = False
+    """Compute each rank's quantile-correction bias locally and average the resulting
+    per-expert biases over the load-balancing group instead of gathering all margins."""
+
     metagrad_params: str = "none"
     """Meta-gradient-controlled load-balance parameters: none, width, coeff, or width_and_coeff."""
 

@@ -4373,11 +4373,12 @@ def evaluate_and_print_results(
                     task_loss_values.append(value)
                     wandb_writer.log({f"tasks/{validation_set_name}": value}, iteration)
                 else:
-                    val_prefix = (
-                        base_wandb_prefix
-                        if suffix == ""
-                        else f"{base_wandb_prefix}/{suffix.lstrip('-')}"
-                    )
+                    if suffix:
+                        val_prefix = f"{base_wandb_prefix}/{suffix.lstrip('-')}"
+                    elif base_wandb_prefix == "val":
+                        val_prefix = "val/regular"
+                    else:
+                        val_prefix = base_wandb_prefix
                     wandb_writer.log(
                         {
                             '{} validation{}'.format(key, suffix): value,
