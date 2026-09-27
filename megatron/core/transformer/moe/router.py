@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from megatron.core.fusions.fused_selected_row_linear import selected_row_linear
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -170,6 +171,20 @@ class Router(ABC, MegatronModule):
         elif self.config.moe_router_dtype == 'fp64':
             weighter_dtype = torch.float64
         return router_gating_linear(input, self.weighter_weight, None, weighter_dtype)
+
+    def selected_weighting(self, input: torch.Tensor, indices: torch.Tensor):
+        """Return split-weighter logits only for each token's selected experts."""
+        if self.weighter_weight.device.type == 'cpu':
+            self.weighter_weight.data = self.weighter_weight.data.to(
+                device=torch.cuda.current_device()
+            )
+
+        weighter_dtype = input.dtype
+        if self.config.moe_router_dtype == 'fp32':
+            weighter_dtype = torch.float32
+        elif self.config.moe_router_dtype == 'fp64':
+            weighter_dtype = torch.float64
+        return selected_row_linear(input, self.weighter_weight, indices, weighter_dtype)
 
     @abstractmethod
     def routing(self, logits: torch.Tensor):
@@ -907,6 +922,34 @@ class TopKRouter(Router):
             return torch.softmax(logits, dim=-1, dtype=torch.float32)
         scores = self._compute_selection_scores(logits)
         return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+    def _compute_selected_weighter_probs(self, selected_logits: torch.Tensor) -> torch.Tensor:
+        """Activate and normalize already-selected split-weighter logits."""
+        if self.weighter_activation == "softmax":
+            probs = torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
+        elif self.weighter_activation == "sigmoid":
+            probs = torch.sigmoid(selected_logits.float())
+            if self.topk > 1:
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
+        elif self.weighter_activation == "sqrtsoftplus":
+            probs = torch.nn.functional.softplus(selected_logits.float()).sqrt()
+            if self.topk > 1:
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            raise ValueError(f"Invalid split-weighter activation: {self.weighter_activation}")
+        return probs.type_as(selected_logits)
+
+    @staticmethod
+    def _scatter_selected_probs(
+        logits: torch.Tensor, indices: torch.Tensor, selected_probs: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter compact selected probabilities into the dispatcher's dense layout."""
+        if torch.are_deterministic_algorithms_enabled():
+            rows = torch.arange(logits.size(0), device=logits.device).unsqueeze(1)
+            probs = torch.zeros_like(logits)
+            probs.index_put_((rows, indices), selected_probs, accumulate=False)
+            return probs
+        return torch.zeros_like(logits).scatter(1, indices, selected_probs)
 
     def _selection_bias_for_margin(self, detached: bool):
         """Bias added to scores for top-k selection (learnable or DeepSeek), or None."""
@@ -1725,6 +1768,7 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         weighter_logits: Optional[torch.Tensor] = None,
+        weighter_input: Optional[torch.Tensor] = None,
     ):
         """Top-k routing function
 
@@ -1861,15 +1905,28 @@ class TopKRouter(Router):
                     self.config.init_moe_router_zero and not use_weighter_for_selection
                 ),
             )
-            weighting_logits = logits if moe_router_weighting_eval_enabled() else weighter_logits
-            probs, _ = topk_routing_with_score_function(
-                weighting_logits,
-                self.topk,
-                use_pre_softmax=False,
-                score_function=self.weighter_activation,
-                fused=False,
-                precomputed_indices=selection_topk_indices,
-            )
+            if moe_router_weighting_eval_enabled() or weighter_logits is not None:
+                weighting_logits = (
+                    logits if moe_router_weighting_eval_enabled() else weighter_logits
+                )
+                probs, _ = topk_routing_with_score_function(
+                    weighting_logits,
+                    self.topk,
+                    use_pre_softmax=False,
+                    score_function=self.weighter_activation,
+                    fused=False,
+                    precomputed_indices=selection_topk_indices,
+                )
+            else:
+                selected_weighter_logits = self.selected_weighting(
+                    weighter_input, selection_topk_indices
+                )
+                selected_probs = self._compute_selected_weighter_probs(
+                    selected_weighter_logits
+                )
+                probs = self._scatter_selected_probs(
+                    logits, selection_topk_indices, selected_probs
+                )
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "quantile_balancing":
@@ -2138,7 +2195,14 @@ class TopKRouter(Router):
         if self.use_separate_weighter and not self.config.moe_router_pass_grad_to_input:
             input = input.detach()
         logits = self.gating(input)
-        weighter_logits = self.weighting(weighter_input) if self.use_separate_weighter else None
+        needs_dense_weighter = self.use_separate_weighter and (
+            moe_weighter_routing_eval_enabled()
+            or (
+                not self.training
+                and moe_router_regular_validation_diagnostics_enabled()
+            )
+        )
+        weighter_logits = self.weighting(weighter_input) if needs_dense_weighter else None
         self._bias_adder_logits_for_load_balance = None
         if self._bias_adder_input_for_load_balance is not None:
             self._bias_adder_logits_for_load_balance = self._gating_with_detached_parameters(
@@ -2180,6 +2244,7 @@ class TopKRouter(Router):
             logits,
             padding_mask=padding_mask,
             weighter_logits=weighter_logits,
+            weighter_input=weighter_input if self.use_separate_weighter else None,
         )
 
         return probs, routing_map
@@ -2266,7 +2331,6 @@ class InferenceTopKRouter(TopKRouter):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
         if self.use_separate_weighter:
-            weighter_logits = self.weighting(input).squeeze(1)
             _, _, top_indices, _ = topk_selection_with_score_function(
                 logits,
                 self.topk,
@@ -2274,13 +2338,8 @@ class InferenceTopKRouter(TopKRouter):
                 expert_bias=self.expert_bias,
                 router_replay=self.router_replay,
             )
-            probs, top_indices = topk_routing_with_score_function(
-                weighter_logits,
-                self.topk,
-                score_function=self.weighter_activation,
-                dense_output=True,
-                precomputed_indices=top_indices,
-            )
+            selected_weighter_logits = self.selected_weighting(input, top_indices)
+            probs = self._compute_selected_weighter_probs(selected_weighter_logits)
             return probs.squeeze(1), top_indices.squeeze(1)
 
         precomputed_indices = None
