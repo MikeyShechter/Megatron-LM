@@ -5,7 +5,7 @@ job_details:
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
   data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
-  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/c4_gpt_neox"]
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
   vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.

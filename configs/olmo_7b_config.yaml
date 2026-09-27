@@ -7,7 +7,7 @@ parameters:
   # The paper uses OLMoE-mix-0924. This keeps the local pretokenized path used by
   # the existing JSC configs so the job is runnable in this workspace.
   data_path: ["/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
-  data_cache_path: ["/e/project1/laionize/shechter1/megatron_data_cache/c4_gpt_neox"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/c4_gpt_neox"]
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
   vocab_size: [50304]

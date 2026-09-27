@@ -1,11 +1,11 @@
 job_details:
-  name: experts2048_every2_quantile_correction_no_bias_smaller_coef
+  name: experts2048_every2_quantile_correction_with_bias_larger_coef
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
   # ── Data ─────────────────────────────────────────────────────────────────────
   data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
-  data_cache_path: ["/e/project1/reformo/shechter1/megatron_data_cache/dclm_gpt_neox"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
 
   split: ["98,1,1"]
   tokenizer_type: ["NullTokenizer"]
@@ -43,8 +43,8 @@ parameters:
   moe_router_dtype: ["fp32"]
 
   moe_use_global_lb: [true]
-  moe_aux_loss_coeff: [0.001, 0.0001, 0.00001]
-  moe_router_score_function: ["softmax", "sigmoid", "sqrtsoftplus"] #
+  moe_aux_loss_coeff: [0.1, 1.0]
+  moe_router_score_function: ["softmax", "sigmoid"] #
 
   moe_router_load_balancing_type: ["quantile_correction_ste"]
   quantile_correction_mean_local: [true]
@@ -52,13 +52,13 @@ parameters:
   # moe_router_enable_expert_bias: [true]
   # moe_router_bias_update_rate: [0.1, 0.01, 0.001]
   # load_balance_ste_width: [0.1]
-  moe_learnable_bias_type: ['none']  #, 'expert_bias', 'per_token_bias'
+  moe_learnable_bias_type: ['expert_bias', 'per_token_bias']  #, 
   # moe_ste_rect_poistion: ['topk', 'midpoint']
   load_balance_ste_type: ["rect"]  # , "triangle"
 
-  # tie_learnable_bias_lr_to_aux_loss_coeff: [true]
-  # moe_learnable_bias_pass_grad_through_scores: [false]
-  # detatch_per_token_bias_input: [true]
+  tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  moe_learnable_bias_pass_grad_through_scores: [false]
+  detatch_per_token_bias_input: [true]
 
   # LIST_LB:
     # - moe_router_load_balancing_type: ["none"] # DeepSeek loss free
