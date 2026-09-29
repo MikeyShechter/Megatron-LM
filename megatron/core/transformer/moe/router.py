@@ -72,6 +72,7 @@ class Router(ABC, MegatronModule):
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
         self.use_separate_weighter = self.config.moe_router_use_separate_weighter
+        self.extra_computation_width = self.config.moe_router_extra_computation
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -86,6 +87,20 @@ class Router(ABC, MegatronModule):
                 )
             )
             setattr(self.weight, 'is_split_moe_router_parameter', True)
+
+        self.extra_computation_fc1_weight = None
+        self.extra_computation_fc2_weight = None
+        if self.extra_computation_width > 0:
+            self.extra_computation_fc1_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.extra_computation_width, self.config.hidden_size), dtype=torch.float32
+                )
+            )
+            self.extra_computation_fc2_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.config.hidden_size, self.extra_computation_width), dtype=torch.float32
+                )
+            )
 
         router_has_bias = (
             self.config.moe_router_enable_bias
@@ -123,6 +138,9 @@ class Router(ABC, MegatronModule):
                     torch.nn.init.zeros_(self.bias)
                 else:
                     self.config.init_method(self.bias)
+            if self.extra_computation_fc1_weight is not None:
+                self.config.init_method(self.extra_computation_fc1_weight)
+                self.config.init_method(self.extra_computation_fc2_weight)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
         if self.weighter_weight is not None:
@@ -130,9 +148,53 @@ class Router(ABC, MegatronModule):
                 dtype=self.config.params_dtype
             )
             setattr(self.weighter_weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.extra_computation_fc1_weight is not None:
+            self.extra_computation_fc1_weight.data = self.extra_computation_fc1_weight.data.to(
+                dtype=self.config.params_dtype
+            )
+            self.extra_computation_fc2_weight.data = self.extra_computation_fc2_weight.data.to(
+                dtype=self.config.params_dtype
+            )
+            setattr(
+                self.extra_computation_fc1_weight,
+                'sequence_parallel',
+                self.config.sequence_parallel,
+            )
+            setattr(
+                self.extra_computation_fc2_weight,
+                'sequence_parallel',
+                self.config.sequence_parallel,
+            )
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
+
+    def _apply_extra_computation(
+        self, input: torch.Tensor, router_dtype: torch.dtype, detach_parameters: bool = False
+    ) -> torch.Tensor:
+        """Apply the optional residual bottleneck MLP to the router input."""
+        if self.extra_computation_fc1_weight is None:
+            return input
+
+        if self.extra_computation_fc1_weight.device.type == 'cpu':
+            device = torch.cuda.current_device()
+            self.extra_computation_fc1_weight.data = self.extra_computation_fc1_weight.data.to(
+                device=device
+            )
+            self.extra_computation_fc2_weight.data = self.extra_computation_fc2_weight.data.to(
+                device=device
+            )
+
+        fc1_weight = self.extra_computation_fc1_weight
+        fc2_weight = self.extra_computation_fc2_weight
+        if detach_parameters:
+            fc1_weight = fc1_weight.detach()
+            fc2_weight = fc2_weight.detach()
+
+        intermediate = router_gating_linear(input, fc1_weight, None, router_dtype)
+        intermediate = self.config.activation_func(intermediate)
+        residual = router_gating_linear(intermediate, fc2_weight, None, router_dtype)
+        return input + residual
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -155,6 +217,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
+        input = self._apply_extra_computation(input, router_dtype)
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
@@ -927,6 +990,7 @@ class TopKRouter(Router):
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
         bias = self.bias.detach() if self.bias is not None else None
+        input = self._apply_extra_computation(input, router_dtype, detach_parameters=True)
         return router_gating_linear(input, self.weight.detach(), bias, router_dtype)
 
     def _get_raw_learnable_routing_bias_components(self, for_load_balance: bool = False):

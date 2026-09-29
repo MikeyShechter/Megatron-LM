@@ -1,5 +1,5 @@
 job_details:
-  name: experts2048_every2_deepseek_smaller_rate
+  name: experts2048_every2_deepseek
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
@@ -44,13 +44,13 @@ parameters:
 
   moe_use_global_lb: [true]
   moe_aux_loss_coeff: [0.0]
-  moe_router_score_function: ["softmax", "sigmoid", "sqrtsoftplus"] #
-
+  moe_router_score_function: ["softmax", "sigmoid"] # , "sigmoid", "sqrtsoftplus"
+  moe_router_extra_computation: [1, 1024]
   moe_router_load_balancing_type: ["none"]
   # quantile_correction_mean_local: [true]
   # moe_load_balance_ste_detach_threshold: [true, false]
   moe_router_enable_expert_bias: [true]
-  moe_router_bias_update_rate: [0.001, 0.0001]
+  moe_router_bias_update_rate: [0.1, 0.01, 0.001]
   # load_balance_ste_width: [0.1]
   moe_learnable_bias_type: ['none']  #, 'expert_bias', 'per_token_bias'
   # moe_ste_rect_poistion: ['topk', 'midpoint']

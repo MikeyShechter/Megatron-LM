@@ -720,6 +720,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_use_separate_weighter: bool = False
     """Use separate linear layers for hard expert selection and expert combine weights."""
 
+    moe_router_extra_computation: int = 0
+    """Width of a residual bottleneck MLP applied before the router projection.
+    Zero disables the MLP and preserves the standard linear router."""
+
     moe_router_init_identical_to_weighter: bool = False
     """Initialize split-router weights from the independently initialized weighter weights.
     When disabled, preserve the existing near-zero split-router initialization."""
