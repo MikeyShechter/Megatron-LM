@@ -1,5 +1,5 @@
 job_details:
-  name: experts2048_every2_split_router_weighter_large_coef
+  name: experts2048_every2_split_router_weighter_rect_with_bias
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
@@ -43,11 +43,11 @@ parameters:
   moe_router_dtype: ["fp32"]
 
   moe_use_global_lb: [true]
-  moe_aux_loss_coeff: [1.0, 10.0]
+  moe_aux_loss_coeff: [0.01, 0.1, 1.0]
   # moe_router_score_function: ["sigmoid"]
 
-  moe_router_load_balancing_type: ["quantile_correction_ste", "aux_loss"]
-  quantile_correction_mean_local: [true]
+  moe_router_load_balancing_type: ["centered_fsq"]
+  # quantile_correction_mean_local: [true]
   
   moe_router_use_separate_weighter: [true]
   moe_router_selection_activation: ["none"]
@@ -56,15 +56,15 @@ parameters:
   moe_router_lr_mult: [1.0]
   moe_lm_loss_ste_normalized_relative: [true]
   moe_router_lm_loss_extra_experts: [0]
-  moe_router_enable_bias: [false, true]
+  moe_router_enable_bias: [true]
 
   eval_split_router_with_weighter: [true]
   eval_split_router_with_router_weights: [true]
 
   # moe_load_balance_ste_detach_threshold: [true, false]
   # moe_router_enable_expert_bias: [true]
-  # moe_router_bias_update_rate: [0.1, 0.01, 0.001]
-  # load_balance_ste_width: [0.1]
+  # moe_router_bias_update_rate: [0.1, 0.01, 0.001, 0.0001]
+  load_balance_ste_width: [0.1, 1.0]
   # moe_learnable_bias_type: ['expert_bias', 'per_token_bias']  #, 'expert_bias', 'per_token_bias'
   # moe_ste_rect_poistion: ['topk', 'midpoint']
   load_balance_ste_type: ["rect"]  # , "triangle"

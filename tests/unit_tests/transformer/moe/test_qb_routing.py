@@ -105,6 +105,117 @@ class TestQuantileBalancingRouter:
         assert routing_map.sum().item() == num_tokens * self.router.topk
 
     @pytest.mark.internal
+    def test_non_split_qb_selection_is_unchanged(self):
+        self.router = self.router.cuda()
+        self.router.eval()
+        self.router.qb_beta.copy_(
+            torch.linspace(-0.4, 0.3, self.num_moe_experts, device=self.router.qb_beta.device)
+        )
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        with torch.no_grad():
+            logits = self.router.gating(hidden_states).view(-1, self.num_moe_experts)
+            expected_indices = (logits.float() - self.router.qb_beta).topk(
+                self.router.topk, dim=1
+            ).indices
+            _, routing_map = self.router(hidden_states)
+
+        expected_map = torch.zeros_like(routing_map).scatter_(1, expected_indices, True)
+        assert torch.equal(routing_map, expected_map)
+
+    @pytest.mark.internal
+    def test_split_qb_uses_router_for_selection_and_weighter_for_weights(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=self.num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_use_separate_weighter=True,
+            moe_router_selection_activation="none",
+            moe_weighter_activation="softmax",
+            moe_router_dtype="fp32",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.num_moe_experts, moe_grouped_gemm=False
+        )
+        router = cast(Router, MoELayer(config, submodules.mlp.submodules).router).cuda()
+        router.eval()
+        router.qb_beta.copy_(
+            torch.linspace(-0.4, 0.3, self.num_moe_experts, device=router.qb_beta.device)
+        )
+        hidden_states = torch.randn((32, 2, config.hidden_size)).cuda().bfloat16()
+
+        with torch.no_grad():
+            router_logits = router.gating(hidden_states).view(-1, self.num_moe_experts)
+            expected_indices = (router_logits.float() - router.qb_beta).topk(
+                router.topk, dim=1
+            ).indices
+            ste_scores, ste_scores_are_biased = router._margin_input_for_ste(
+                router_logits, detached=True
+            )
+            weighter_logits = router.weighting(hidden_states).view(-1, self.num_moe_experts)
+            selected_weighter_logits = weighter_logits.gather(1, expected_indices)
+            selected_probs = torch.softmax(selected_weighter_logits, dim=-1, dtype=torch.float32)
+            expected_probs = torch.zeros_like(router_logits).scatter_(
+                1, expected_indices, selected_probs
+            )
+
+            probs, routing_map = router(hidden_states)
+
+        expected_map = torch.zeros_like(routing_map).scatter_(1, expected_indices, True)
+        assert ste_scores_are_biased
+        torch.testing.assert_close(ste_scores, router_logits.float() - router.qb_beta)
+        assert torch.equal(routing_map, expected_map)
+        torch.testing.assert_close(probs, expected_probs, rtol=2e-3, atol=2e-3)
+
+    @pytest.mark.internal
+    def test_split_qb_accumulates_bias_update_and_trains_both_branches(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=self.num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_use_separate_weighter=True,
+            moe_router_selection_activation="none",
+            moe_weighter_activation="softmax",
+            moe_router_dtype="fp32",
+            moe_lm_loss_ste_normalized_relative=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.num_moe_experts, moe_grouped_gemm=False
+        )
+        router = cast(Router, MoELayer(config, submodules.mlp.submodules).router).cuda()
+        router.train()
+        hidden_states = torch.randn((32, 2, config.hidden_size)).cuda().bfloat16()
+
+        probs, _ = router(hidden_states)
+        expert_values = torch.arange(
+            self.num_moe_experts, device=probs.device, dtype=probs.dtype
+        )
+        (probs * expert_values).sum().backward()
+
+        assert router.qb_beta_count.item() == 1
+        assert router.qb_beta_accum.abs().sum().item() > 0
+        assert router.weight.grad is not None
+        assert router.weight.grad.abs().sum().item() > 0
+        assert router.weighter_weight.grad is not None
+        assert router.weighter_weight.grad.abs().sum().item() > 0
+
+    @pytest.mark.internal
     def test_qb_beta_accumulates_in_training(self):
         self.router = self.router.cuda()
         self.router.train()

@@ -520,6 +520,62 @@ class TopKRouter(Router):
             precomputed_indices=indices,
         )
 
+    def split_quantile_balancing(
+        self, logits: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select split-router experts with the quantile-balancing bias.
+
+        Unlike :meth:`quantile_balancing`, this returns only the router's hard assignment;
+        the separate weighter supplies the combine weights in ``routing``.
+        """
+        assert (
+            not self.config.moe_router_fusion
+        ), "Quantile balancing routing does not support moe_router_fusion."
+        assert (
+            self.config.moe_router_num_groups is None and self.config.moe_router_group_topk is None
+        ), "Quantile balancing routing does not support group-limited routing."
+
+        selection_scores = self._compute_selection_scores(logits)
+        local_num_tokens = selection_scores.shape[0]
+        gather_group = self.tp_cp_group
+        gather_size = gather_group.size() if gather_group is not None else 1
+        should_update_beta = self.training and torch.is_grad_enabled()
+
+        with torch.no_grad():
+            scores_fp32 = selection_scores.detach().to(dtype=torch.float32)
+
+            if gather_size > 1:
+                full_scores = torch.empty(
+                    (local_num_tokens * gather_size, self.config.num_moe_experts),
+                    dtype=scores_fp32.dtype,
+                    device=scores_fp32.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    full_scores, scores_fp32.contiguous(), group=gather_group
+                )
+                gather_rank = torch.distributed.get_rank(group=gather_group)
+            else:
+                full_scores = scores_fp32
+                gather_rank = 0
+
+            full_indices, beta_local = qb_dual_update(
+                full_scores, self.topk, self.qb_beta, update_beta=should_update_beta
+            )
+            if should_update_beta:
+                self.qb_beta_accum.add_(beta_local)
+                self.qb_beta_count.add_(1)
+
+            if gather_size > 1:
+                indices = full_indices[
+                    gather_rank * local_num_tokens : (gather_rank + 1) * local_num_tokens
+                ].contiguous()
+            else:
+                indices = full_indices
+
+            routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter_(1, indices, True)
+
+        return selection_scores, routing_map, indices
+
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
         If the auxiliary loss type is not found, return 0.0.
@@ -969,6 +1025,12 @@ class TopKRouter(Router):
         flow to the router as before). Softmax selection biases are additive in logit
         space; sigmoid and sqrtsoftplus selection biases are additive in score space.
         """
+        if self.use_separate_weighter and self.qb_beta is not None:
+            scores = self._compute_selection_scores(logits)
+            if detached:
+                scores = scores.detach()
+            return scores - self.qb_beta, True
+
         bias = self._selection_bias_for_margin(detached)
         selection_score_function = (
             self.router_selection_activation if self.use_separate_weighter else self.score_function
@@ -1927,6 +1989,52 @@ class TopKRouter(Router):
                 probs = self._scatter_selected_probs(
                     logits, selection_topk_indices, selected_probs
                 )
+        elif self.use_separate_weighter and self.routing_type == "quantile_balancing":
+            assert (
+                padding_mask is None
+            ), "Quantile balancing routing does not support padding masks yet."
+            use_weighter_for_selection = moe_weighter_routing_eval_enabled()
+            if use_weighter_for_selection:
+                (
+                    split_selection_scores,
+                    routing_map,
+                    selection_topk_indices,
+                    _,
+                ) = topk_selection_with_score_function(
+                    weighter_logits,
+                    self.topk,
+                    score_function=self.weighter_activation,
+                    router_replay=self.router_replay,
+                )
+            else:
+                (
+                    split_selection_scores,
+                    routing_map,
+                    selection_topk_indices,
+                ) = self.split_quantile_balancing(logits)
+
+            if moe_router_weighting_eval_enabled() or weighter_logits is not None:
+                weighting_logits = (
+                    logits if moe_router_weighting_eval_enabled() else weighter_logits
+                )
+                probs, _ = topk_routing_with_score_function(
+                    weighting_logits,
+                    self.topk,
+                    use_pre_softmax=False,
+                    score_function=self.weighter_activation,
+                    fused=False,
+                    precomputed_indices=selection_topk_indices,
+                )
+            else:
+                selected_weighter_logits = self.selected_weighting(
+                    weighter_input, selection_topk_indices
+                )
+                selected_probs = self._compute_selected_weighter_probs(
+                    selected_weighter_logits
+                )
+                probs = self._scatter_selected_probs(
+                    logits, selection_topk_indices, selected_probs
+                )
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "quantile_balancing":
@@ -2331,13 +2439,17 @@ class InferenceTopKRouter(TopKRouter):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
         if self.use_separate_weighter:
-            _, _, top_indices, _ = topk_selection_with_score_function(
-                logits,
-                self.topk,
-                score_function=self.router_selection_activation,
-                expert_bias=self.expert_bias,
-                router_replay=self.router_replay,
-            )
+            if self.qb_beta is not None:
+                selection_scores = self._compute_selection_scores(logits)
+                top_indices = (selection_scores - self.qb_beta).topk(self.topk, dim=1).indices
+            else:
+                _, _, top_indices, _ = topk_selection_with_score_function(
+                    logits,
+                    self.topk,
+                    score_function=self.router_selection_activation,
+                    expert_bias=self.expert_bias,
+                    router_replay=self.router_replay,
+                )
             selected_weighter_logits = self.selected_weighting(input, top_indices)
             probs = self._compute_selected_weighter_probs(selected_weighter_logits)
             return probs.squeeze(1), top_indices.squeeze(1)
