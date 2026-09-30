@@ -170,7 +170,7 @@ class Router(ABC, MegatronModule):
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
 
     def _apply_extra_computation(
-        self, input: torch.Tensor, router_dtype: torch.dtype, detach_parameters: bool = False
+        self, input: torch.Tensor, detach_parameters: bool = False
     ) -> torch.Tensor:
         """Apply the optional residual bottleneck MLP to the router input."""
         if self.extra_computation_fc1_weight is None:
@@ -191,9 +191,20 @@ class Router(ABC, MegatronModule):
             fc1_weight = fc1_weight.detach()
             fc2_weight = fc2_weight.detach()
 
-        intermediate = router_gating_linear(input, fc1_weight, None, router_dtype)
+        extra_computation_dtype = input.dtype
+        if self.extra_computation_width == 1:
+            intermediate = (input * fc1_weight.squeeze(0)).sum(dim=-1, keepdim=True)
+        else:
+            intermediate = router_gating_linear(
+                input, fc1_weight, None, extra_computation_dtype
+            )
         intermediate = self.config.activation_func(intermediate)
-        residual = router_gating_linear(intermediate, fc2_weight, None, router_dtype)
+        if self.extra_computation_width == 1:
+            residual = intermediate * fc2_weight.squeeze(-1)
+        else:
+            residual = router_gating_linear(
+                intermediate, fc2_weight, None, extra_computation_dtype
+            )
         return input + residual
 
     def gating(self, input: torch.Tensor):
@@ -217,7 +228,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        input = self._apply_extra_computation(input, router_dtype)
+        input = self._apply_extra_computation(input)
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
@@ -990,7 +1001,7 @@ class TopKRouter(Router):
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
         bias = self.bias.detach() if self.bias is not None else None
-        input = self._apply_extra_computation(input, router_dtype, detach_parameters=True)
+        input = self._apply_extra_computation(input, detach_parameters=True)
         return router_gating_linear(input, self.weight.detach(), bias, router_dtype)
 
     def _get_raw_learnable_routing_bias_components(self, for_load_balance: bool = False):

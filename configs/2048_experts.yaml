@@ -1,5 +1,5 @@
 job_details:
-  name: experts2048_every2_deepseek
+  name: experts2048_every2_extra_router_compute_deepseek
   output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
 
 parameters:
