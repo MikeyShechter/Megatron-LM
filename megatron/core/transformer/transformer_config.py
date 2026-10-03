@@ -641,6 +641,10 @@ class TransformerConfig(ModelParallelConfig):
     micro-batch level.
     - "fsq": Fractional-squared routed-load loss with optional STE.
     - "centered_fsq": Centered fractional-squared routed-load loss with optional STE.
+    - "exact_jump_ste": Centered fractional-squared routed-load loss whose backward pass
+      uses the exact discrete-loss jump weight for each assignment margin.
+    - "coordinate_perturbation_ste": Centered fractional-squared routed-load loss whose
+      backward pass uses exact one-score perturbation loss differences.
     - "quantile_correction_ste": Centered fractional-squared routed-load loss whose
       backward pass uses the batch's per-expert Quantile Balancing correction.
     - "fixed_number_boundary_ste": Centered fractional-squared routed-load loss whose
@@ -1482,6 +1486,8 @@ class TransformerConfig(ModelParallelConfig):
                         "aux_loss",
                         "fsq",
                         "centered_fsq",
+                        "exact_jump_ste",
+                        "coordinate_perturbation_ste",
                         "quantile_correction_ste",
                         "fixed_number_boundary_ste",
                         "centered_fsq_and_var",
@@ -1497,7 +1503,8 @@ class TransformerConfig(ModelParallelConfig):
                     ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
-                            "fsq, centered_fsq, quantile_correction_ste, "
+                            "fsq, centered_fsq, exact_jump_ste, "
+                            "coordinate_perturbation_ste, quantile_correction_ste, "
                             "fixed_number_boundary_ste, centered_fsq_and_var, "
                             "noisy_centered_fsq, maxvio, maxviosq, totalvio, seq_aux_loss, "
                             "global_aux_loss, quantile_balancing, qb_projection_distillation or "
@@ -1507,6 +1514,8 @@ class TransformerConfig(ModelParallelConfig):
                 "aux_loss",
                 "fsq",
                 "centered_fsq",
+                "exact_jump_ste",
+                "coordinate_perturbation_ste",
                 "quantile_correction_ste",
                 "fixed_number_boundary_ste",
                 "centered_fsq_and_var",
@@ -1522,7 +1531,8 @@ class TransformerConfig(ModelParallelConfig):
             ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
-                    "fsq, centered_fsq, quantile_correction_ste, fixed_number_boundary_ste, "
+                    "fsq, centered_fsq, exact_jump_ste, coordinate_perturbation_ste, "
+                    "quantile_correction_ste, fixed_number_boundary_ste, "
                     "centered_fsq_and_var, noisy_centered_fsq, maxvio, maxviosq, totalvio, "
                     "seq_aux_loss, global_aux_loss, quantile_balancing, "
                     "qb_projection_distillation or none load balancing"

@@ -2164,6 +2164,12 @@ def _shift_moe_aux_loss_coeff(coeff, delta):
     return _clamp_moe_aux_loss_coeff(coeff + delta)
 
 
+def _scale_moe_aux_loss_coeff(coeff, factor):
+    if isinstance(coeff, list):
+        return [value * factor for value in coeff]
+    return coeff * factor
+
+
 def _set_moe_aux_loss_coeff(args, coeff):
     args.moe_aux_loss_coeff = coeff
     if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
@@ -2561,16 +2567,23 @@ def _maybe_update_moe_balance_control_from_vio(
     update_rate = getattr(args, 'moe_balance_update_rate', 0.0)
     target_vio = getattr(args, 'moe_balance_target_vio', 0.0)
     delta = update_rate if current_vio > target_vio else -update_rate
+    multiplicative = getattr(args, 'moe_balance_update_mode', 'additive') == 'multiplicative'
 
     if getattr(args, 'moe_router_enable_expert_bias', False):
-        new_update_rate = max(0.0, args.moe_router_bias_update_rate + delta)
+        if multiplicative:
+            new_update_rate = args.moe_router_bias_update_rate * math.exp(delta)
+        else:
+            new_update_rate = max(0.0, args.moe_router_bias_update_rate + delta)
         args.moe_router_bias_update_rate = new_update_rate
         if model_config is not None:
             model_config.moe_router_bias_update_rate = new_update_rate
         return
 
     old_coeff = args.moe_aux_loss_coeff
-    new_coeff = _shift_moe_aux_loss_coeff(old_coeff, delta)
+    if multiplicative:
+        new_coeff = _scale_moe_aux_loss_coeff(old_coeff, math.exp(delta))
+    else:
+        new_coeff = _shift_moe_aux_loss_coeff(old_coeff, delta)
 
     _set_moe_aux_loss_coeff(args, new_coeff)
     if model_config is not None:
@@ -2801,6 +2814,8 @@ def training_log(
         for load_balancing_type in (
             "fsq",
             "centered_fsq",
+            "exact_jump_ste",
+            "coordinate_perturbation_ste",
             "quantile_correction_ste",
             "fixed_number_boundary_ste",
             "centered_fsq_and_var",
@@ -2837,7 +2852,9 @@ def training_log(
             pg_collection=pg_collection,
         )
         should_update_moe_balance_control = (
-            getattr(args, 'moe_balance_update_rate', 0.0) != 0.0 and not skipped_iter
+            getattr(args, 'moe_balance_update_rate', 0.0) != 0.0
+            and not skipped_iter
+            and iteration >= getattr(args, 'moe_balance_update_start_iter', 0)
         )
         router_metrics_log = track_moe_router_metrics(
             loss_scale=moe_loss_scale,

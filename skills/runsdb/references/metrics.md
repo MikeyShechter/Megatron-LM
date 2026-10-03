@@ -52,8 +52,15 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
 - `train/router_balance/max_vio_sequence_mean|worst`: MaxVio of each sequence's own expert loads; mean / max.
 - `train/ste_bandwidth`: the scheduled STE width at this step (0 for STE type `full`). It is logged even when no
   STE loss is active.
-- `train/moe_aux_loss_coeff`: the current coefficient. It changes only via the MaxVio controller
-  (`--moe-balance-update-rate`/`--moe-balance-target-vio`) or metagrad.
+- `train/moe_aux_loss_coeff`: the current coefficient. It changes only via the MaxVio controller or metagrad. The
+  controller reads each step's train MaxVioGlobal and moves the coefficient up when it is above
+  `--moe-balance-target-vio`, down otherwise:
+  - `--moe-balance-update-rate r` sets the step size.
+  - `--moe-balance-update-mode additive` (default) adds or subtracts r, clamped at 0.
+  - `--moe-balance-update-mode multiplicative` (added 2026-10-01) multiplies by e^±r.
+  - `--moe-balance-update-start-iter X` (added 2026-10-01) holds the initial value until iteration X.
+
+  With `--moe-router-enable-expert-bias` the controller moves `moe_router_bias_update_rate` instead.
 - `train/moe_router_bias_update_rate`: the DeepSeek expert-bias update rate. Logged only with
   `--moe-router-enable-expert-bias`.
 - `train/token_dropping/*`: logged only with a capacity factor. `train/metagrad_*`: logged only with `--metagrad-params`.
@@ -62,8 +69,16 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
 ## vio/* (regular validation set only, at each eval; U:3214-3226)
 - `vio/MaxVioGlobal`: per-layer MaxVio from loads pooled over the whole eval pass; mean over layers.
 - `vio/MaxVioGlobalWorstLayer`: max over layers. `vio/TotalVioGlobal`: per layer Σ|f_e − 1/E|/(1/E); mean over layers.
+- `vio/MinVioGlobal` (added 2026-10-03): per layer (n̄ − min_e n_e)/n̄ = 1 − min_e f_e·E, from the same pooled loads;
+  mean over layers. 0 = the least-loaded expert gets its fair share; 1 = some expert gets nothing.
+  `vio/MinVioGlobalWorstLayer`: max over layers.
 - `vio/MaxVio/Layer N`: per layer, N = 0-based global layer index. Dense layers are absent (with moe_layer_freq=2,
   only every other layer appears).
+- Low-load tail (added 2026-10-02), from the same pooled eval loads. Each expert's load is taken relative to its fair
+  share (f_e·E, 1 = balanced); the per-layer values are averaged over layers:
+  - `vio/ZeroLoadFracGlobal`: fraction of experts with no assignment in the whole eval pass (unused experts).
+  - `vio/LowLoadFracGlobal`: fraction of experts below 10% of their fair share (almost unused).
+  - `vio/LoadP10Global`: 10th percentile of f_e·E over experts.
 - The train-time MaxVioGlobal is not logged; it only drives the coefficient controller.
 
 ## val/* (at every eval and once after training; T:4211-4511)
@@ -87,13 +102,45 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
 ## ste/* (regular validation only; R:1318-1353, U:596-647, U:3248-3275)
 - Margin = selection score (incl. any selection bias) minus the top-k threshold, where the threshold comes from
   `--moe-ste-rect-poistion`: `topk` (lowest selected), `topk_plus_one`, `midpoint` or `exact_margin`.
-- Radius r = width/2 for `rect`.
+- Radius r = width/2 for `rect`, and width (the full support) for `higher_order_rect`.
 - `ste/all_layers/in_rect_frac`: fraction of selected (token, expert) pairs with |margin| < r. It is 1 for STE
   `full` and 0 for tanh/triangle or width 0.
 - `ste/all_layers/all_experts_in_rect_frac`: the fraction over all (token, expert) pairs, all E experts, with
   |margin| < r. Added 2026-08-02.
 - `ste/all_layers/avg_over_rect|max_over_rect`: per (layer, expert), the fraction of tokens selecting it with
   margin ≥ r (deep inside the selection, so no STE gradient); mean / max over layers × experts.
+
+**Window shape and coverage (added 2026-10-01)**
+
+These are logged only for STE `rect` or `higher_order_rect` with width > 0; they are absent otherwise, while the
+keys above log 0. Margins of exactly 0 are left out, because they belong to the expert that sets the threshold under
+`topk` / `topk_plus_one`. For `exact_margin`, `window_frac_1r` equals `all_experts_in_rect_frac`; for `topk` it is
+`all_experts_in_rect_frac` − 1/E.
+
+- `ste/all_layers/window_frac_half_r|1r|2r|4r`: the fraction of all (token, expert) pairs with 0 < |margin| < m·r,
+  for m = 0.5, 1, 2, 4.
+  - What it is for: checking, within one run, whether occupancy grows linearly with the window. The rect gradient per
+    token is ∝ 1/w, so w only cancels out of the total LB gradient while the margin density is flat across the window.
+  - Reading `window_frac_1r / window_frac_half_r`:
+    - ≈ 2: the density is flat at this scale (λ and w separate);
+    - ≫ 2: the density rises away from the boundary, and occupancy grows faster than w;
+    - ≈ 1: the window is saturated.
+  - `window_frac_2r / window_frac_1r` predicts what doubling w would do on the same logits.
+  - Unit conversion: `window_frac_1r` × E = experts near the boundary per token, and × (tokens per step) / E =
+    in-window tokens per expert per step (×256 in the every2 setup).
+- `ste/all_layers/window_expert_tokens_rel_p10`: per-expert coverage.
+  - Definition: per (layer, expert), the number of in-window pairs at radius r over the eval pass, divided by that
+    expert's balanced share of assignments (assignments / E). It reports the 10th percentile over experts, averaged
+    over layers. The mean over experts is `window_frac_1r` × E / K.
+  - What it is for: a low value means a tail of experts with few tokens near the boundary, which a fixed-width STE
+    can barely move.
+- `ste/all_layers/window_experts_empty_frac`: the fraction of (layer, expert) pairs with no in-window pair at
+  radius r over the whole eval pass. These experts get no STE gradient at all.
+- How to use them: check after the first evals of a sweep, e.g.
+  `q.py curve ste/all_layers/window_frac_1r --sweep X --steps 150,300,600`.
+  - An empty window (`window_frac_1r` × E ≲ 0.3), or `window_experts_empty_frac` above ~0.01, early in training
+    means w is too small for the router's logit scale.
+  - Comparing these keys across widths and variants tells you whether two runs had comparable windows.
 
 ## Logits, biases, weighter, quantile correction (regular validation only)
 - `router_logits/top1|top2|avg_pre_activation`: per-token largest and second-largest logit, and the mean over all

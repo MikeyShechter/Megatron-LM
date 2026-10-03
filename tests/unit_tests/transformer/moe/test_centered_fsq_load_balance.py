@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.moe.moe_utils import (
+    _HigherOrderRectangularIndicatorSTE,
     _RectangularIndicatorSTE,
     _TanhSTE,
     _TriangleSTE,
@@ -45,7 +46,12 @@ def _reference_direct_load_balance_from_load(load_frac, num_experts, load_balanc
     num_experts_tensor = load_frac.new_tensor(float(num_experts))
     if load_balancing_type == "fsq":
         return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
-    if load_balancing_type in ("centered_fsq", "centered_fsq_and_var"):
+    if load_balancing_type in (
+        "centered_fsq",
+        "exact_jump_ste",
+        "coordinate_perturbation_ste",
+        "centered_fsq_and_var",
+    ):
         return 1.0 + num_experts_tensor * torch.square(load_frac - expected_frac).sum(dim=-1)
     if load_balancing_type == "maxvio":
         return 1.0 + (torch.amax(load_frac, dim=-1) - expected_frac) / expected_frac
@@ -82,7 +88,7 @@ def _reference_centered_fsq_loss(
     if load_balance_ste_type == "tanh" or load_balance_ste_width > 0.0:
         ste_rect_poistion = (
             load_balance_ste_rect_poistion
-            if load_balance_ste_type in ("rect", "triangle")
+            if load_balance_ste_type in ("rect", "higher_order_rect", "triangle")
             else "topk"
         )
         margin, valid_tokens = _load_balance_margin(logits, routing_map, ste_rect_poistion)
@@ -90,6 +96,10 @@ def _reference_centered_fsq_loss(
             soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
         elif load_balance_ste_type == "triangle":
             soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
+        elif load_balance_ste_type == "higher_order_rect":
+            soft_mask = _HigherOrderRectangularIndicatorSTE.apply(
+                margin, load_balance_ste_width
+            )
         else:
             soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
         soft_mask = soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
@@ -128,7 +138,9 @@ def _loss_and_grad(loss_fn, logits):
     return loss.detach(), grad.detach()
 
 
-@pytest.mark.parametrize("ste_rect_poistion", ["topk", "topk_plus_one", "midpoint"])
+@pytest.mark.parametrize(
+    "ste_rect_poistion", ["topk", "topk_plus_one", "midpoint", "exact_margin"]
+)
 def test_load_balance_margin_can_detach_threshold_gradient(ste_rect_poistion):
     routing_map = torch.tensor([[True, True, False]])
     upstream_grad = torch.tensor([[1.0, 2.0, 3.0]])
@@ -148,6 +160,22 @@ def test_load_balance_margin_can_detach_threshold_gradient(ste_rect_poistion):
 
     torch.testing.assert_close(detached_grad, upstream_grad)
     assert not torch.equal(attached_grad, detached_grad)
+
+
+def test_exact_margin_uses_leave_one_out_topk_boundary():
+    logits = torch.tensor([[3.0, 2.0, 1.0]])
+    routing_map = torch.tensor([[True, True, False]])
+
+    margin, valid_tokens = _load_balance_margin(
+        logits,
+        routing_map,
+        "exact_margin",
+        topk_indices=torch.tensor([[0, 1]]),
+        topk_plus_one_indices=torch.tensor([[2]]),
+    )
+
+    torch.testing.assert_close(margin, torch.tensor([[2.0, 1.0, -1.0]]))
+    assert torch.equal(valid_tokens, torch.tensor([True]))
 
 
 def test_centered_fsq_threshold_detachment_changes_only_backward():
@@ -268,6 +296,117 @@ def test_triangle_ste_uses_piecewise_second_order_gradient():
     expected_grad = torch.tensor([0.0, 0.0, 0.25, 0.5, 0.25, 0.0, 0.0])
     torch.testing.assert_close(soft_mask, expected_forward)
     torch.testing.assert_close(grad, expected_grad)
+
+
+def test_higher_order_rect_ste_uses_fourth_order_gradient():
+    bandwidth = 2.0
+    margin = torch.tensor(
+        [-2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    soft_mask = _HigherOrderRectangularIndicatorSTE.apply(margin, bandwidth)
+    grad = torch.autograd.grad(soft_mask.sum(), margin)[0]
+
+    expected_forward = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    expected_grad = torch.tensor(
+        [
+            0.0,
+            -1.0 / 12.0,
+            7.0 / 12.0,
+            7.0 / 12.0,
+            7.0 / 12.0,
+            -1.0 / 12.0,
+            0.0,
+        ]
+    )
+    torch.testing.assert_close(soft_mask, expected_forward)
+    torch.testing.assert_close(grad, expected_grad)
+
+
+@pytest.mark.parametrize(
+    "load_balancing_type", ["exact_jump_ste", "coordinate_perturbation_ste"]
+)
+@pytest.mark.parametrize(
+    "load_balance_ste_type,expected_kernel",
+    [("rect", 2.0), ("higher_order_rect", 7.0 / 3.0)],
+)
+def test_exact_estimators_match_single_near_boundary_swap(
+    load_balancing_type, load_balance_ste_type, expected_kernel
+):
+    logits = torch.tensor([[0.1, 0.0], [2.0, 0.0]], requires_grad=True)
+    routing_map = torch.tensor([[True, False], [True, False]])
+
+    loss = direct_load_balancing_loss_func(
+        load_balancing_type=load_balancing_type,
+        logits=logits,
+        routing_map=routing_map,
+        tokens_per_expert=routing_map.sum(dim=0),
+        total_num_tokens=2,
+        topk=1,
+        num_experts=2,
+        moe_aux_loss_coeff=1.0,
+        load_balance_ste_width=0.5,
+        load_balance_ste_type=load_balance_ste_type,
+        load_balance_ste_rect_poistion="exact_margin",
+        load_balance_topk_indices=torch.tensor([[0], [0]]),
+        load_balance_topk_plus_one_indices=torch.tensor([[1], [1]]),
+    )
+    grad = torch.autograd.grad(loss, logits)[0]
+
+    torch.testing.assert_close(loss, torch.tensor(2.0))
+    torch.testing.assert_close(
+        grad, torch.tensor([[expected_kernel, -expected_kernel], [0.0, 0.0]])
+    )
+
+
+@pytest.mark.parametrize(
+    "load_balancing_type", ["exact_jump_ste", "coordinate_perturbation_ste"]
+)
+def test_exact_estimators_have_zero_gradient_when_a_swap_cannot_change_loss(
+    load_balancing_type,
+):
+    logits = torch.tensor([[0.1, 0.0]], requires_grad=True)
+    routing_map = torch.tensor([[True, False]])
+
+    loss = direct_load_balancing_loss_func(
+        load_balancing_type=load_balancing_type,
+        logits=logits,
+        routing_map=routing_map,
+        tokens_per_expert=routing_map.sum(dim=0),
+        total_num_tokens=1,
+        topk=1,
+        num_experts=2,
+        moe_aux_loss_coeff=1.0,
+        load_balance_ste_width=0.5,
+        load_balance_ste_type="rect",
+        load_balance_ste_rect_poistion="exact_margin",
+    )
+    grad = torch.autograd.grad(loss, logits)[0]
+
+    torch.testing.assert_close(loss, torch.tensor(2.0))
+    torch.testing.assert_close(grad, torch.zeros_like(logits))
+
+
+def test_coordinate_perturbation_requires_exact_margin():
+    logits = torch.tensor([[0.1, 0.0]], requires_grad=True)
+    routing_map = torch.tensor([[True, False]])
+
+    with pytest.raises(ValueError, match="requires moe_ste_rect_poistion=exact_margin"):
+        direct_load_balancing_loss_func(
+            load_balancing_type="coordinate_perturbation_ste",
+            logits=logits,
+            routing_map=routing_map,
+            tokens_per_expert=routing_map.sum(dim=0),
+            total_num_tokens=1,
+            topk=1,
+            num_experts=2,
+            moe_aux_loss_coeff=1.0,
+            load_balance_ste_width=0.5,
+            load_balance_ste_type="rect",
+            load_balance_ste_rect_poistion="topk",
+        )
 
 
 def test_centered_fsq_forward_value_for_arbitrary_load():
@@ -450,6 +589,9 @@ def test_centered_fsq_topk_threshold_reuse_closely_matches_reference_global_coun
         ("rect", "topk", 1.0),
         ("rect", "topk_plus_one", 1.0),
         ("rect", "midpoint", 1.0),
+        ("rect", "exact_margin", 1.0),
+        ("higher_order_rect", "topk", 1.0),
+        ("higher_order_rect", "exact_margin", 1.0),
         ("triangle", "topk", 1.0),
         ("triangle", "topk_plus_one", 1.0),
         ("triangle", "midpoint", 1.0),
@@ -526,6 +668,9 @@ def test_centered_fsq_surrogate_matches_reference_for_ste_variants(
         ("rect", "topk", 1.0),
         ("rect", "topk_plus_one", 1.0),
         ("rect", "midpoint", 1.0),
+        ("rect", "exact_margin", 1.0),
+        ("higher_order_rect", "topk", 1.0),
+        ("higher_order_rect", "exact_margin", 1.0),
         ("triangle", "topk", 1.0),
         ("triangle", "topk_plus_one", 1.0),
         ("triangle", "midpoint", 1.0),

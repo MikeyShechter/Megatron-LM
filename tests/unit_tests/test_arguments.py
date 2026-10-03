@@ -103,6 +103,31 @@ def test_centered_fsq_load_balance_args(monkeypatch):
     assert args.moe_load_balance_ste_width == 0.5
 
 
+def test_exact_load_balance_variant_args(monkeypatch):
+    args = _parse_args(
+        monkeypatch,
+        [
+            '--moe-router-load-balancing-type',
+            'exact_jump_ste',
+            'coordinate_perturbation_ste',
+            '--moe-aux-loss-coeff',
+            '0.01',
+            '0.02',
+            '--load-balance-ste-type',
+            'higher_order_rect',
+            '--ste-rect-poistion',
+            'exact_margin',
+        ],
+    )
+
+    assert args.moe_router_load_balancing_type == [
+        'exact_jump_ste',
+        'coordinate_perturbation_ste',
+    ]
+    assert args.moe_load_balance_ste_type == 'higher_order_rect'
+    assert args.moe_ste_rect_poistion == 'exact_margin'
+
+
 def test_flat_config_injects_centered_fsq_load_balance(monkeypatch, tmp_path):
     config_path = tmp_path / 'spec.yaml'
     config_path.write_text(

@@ -81,6 +81,12 @@ _MOE_ROUTER_METRIC_SPECS = {
     "ste_all_experts_in_rect_count": "scalar",
     "ste_selected_count": "scalar",
     "ste_over_rect_count": "expert",
+    "ste_window_call_count": "scalar",
+    "ste_window_count_half_r": "scalar",
+    "ste_window_count_1r": "scalar",
+    "ste_window_count_2r": "scalar",
+    "ste_window_count_4r": "scalar",
+    "ste_window_expert_count": "expert",
     "quantile_delta_bias_sum": "expert",
     "quantile_delta_bias_count": "scalar",
     "quantile_affected_entry_count": "scalar",
@@ -295,6 +301,31 @@ class _RectangularIndicatorSTE(torch.autograd.Function):
         return grad_margin.to(dtype=margin.dtype), None
 
 
+def _higher_order_rect_ste_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+    abs_margin = margin.abs()
+    inner_window = (abs_margin < bandwidth * 0.5).to(dtype=torch.float32)
+    outer_window = (abs_margin < bandwidth).to(dtype=torch.float32)
+    return (8.0 * inner_window - outer_window) / (6.0 * bandwidth)
+
+
+class _HigherOrderRectangularIndicatorSTE(torch.autograd.Function):
+    """Hard indicator with a fourth-order central-difference backward kernel."""
+
+    @staticmethod
+    def forward(ctx, margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
+        ctx.bandwidth = float(bandwidth)
+        ctx.save_for_backward(margin)
+        return (margin >= 0).to(dtype=margin.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (margin,) = ctx.saved_tensors
+        grad_margin = grad_output.float() * _higher_order_rect_ste_grad(
+            margin.float(), ctx.bandwidth
+        )
+        return grad_margin.to(dtype=margin.dtype), None
+
+
 def _triangle_ste_grad(margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
     normalized_margin = margin / bandwidth
     return torch.clamp(1.0 - normalized_margin.abs(), min=0.0) / bandwidth
@@ -360,6 +391,9 @@ class _LoadBalanceLoadSTE(torch.autograd.Function):
         elif ctx.ste_type == "triangle_width_sensitivity":
             ste_grad = _triangle_ste_width_grad(margin_float, ctx.bandwidth)
             ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
+        elif ctx.ste_type == "higher_order_rect":
+            ste_grad = _higher_order_rect_ste_grad(margin_float, ctx.bandwidth)
+            ste_grad = ste_grad * valid_mask.to(dtype=ste_grad.dtype)
         else:
             half_width = ctx.bandwidth * 0.5
             ste_grad = ((margin_float.abs() < half_width) & valid_mask).to(dtype=torch.float32)
@@ -388,6 +422,8 @@ class _TanhSTE(torch.autograd.Function):
 DIRECT_LOAD_BALANCING_LOSS_TYPES = (
     "fsq",
     "centered_fsq",
+    "exact_jump_ste",
+    "coordinate_perturbation_ste",
     "quantile_correction_ste",
     "fixed_number_boundary_ste",
     "centered_fsq_and_var",
@@ -472,6 +508,8 @@ def _direct_load_balance_from_load(
         return num_experts_tensor * torch.square(load_frac).sum(dim=-1)
     if load_balancing_type in (
         "centered_fsq",
+        "exact_jump_ste",
+        "coordinate_perturbation_ste",
         "quantile_correction_ste",
         "fixed_number_boundary_ste",
         "centered_fsq_and_var",
@@ -513,6 +551,54 @@ def _direct_load_balance_gate(
     return (gate_metric > threshold).to(dtype=hard_load_frac.dtype)
 
 
+def _load_balance_exact_margin_and_competitor(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    topk_indices: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return leave-one-out Top-K margins and the competing expert indices."""
+    routing_map = routing_map.bool()
+    valid_tokens = routing_map.any(dim=-1)
+    logits = logits.float()
+
+    if topk_indices is not None:
+        selected_logits = torch.gather(logits, dim=-1, index=topk_indices)
+        topk_offset = selected_logits.argmin(dim=-1, keepdim=True)
+        topk_threshold = torch.gather(selected_logits, dim=-1, index=topk_offset)
+        topk_boundary_indices = torch.gather(topk_indices, dim=-1, index=topk_offset)
+    else:
+        selected_logits = logits.masked_fill(~routing_map, float('inf'))
+        topk_result = selected_logits.min(dim=-1, keepdim=True)
+        topk_threshold = topk_result.values
+        topk_boundary_indices = topk_result.indices
+    topk_threshold = torch.where(
+        valid_tokens.unsqueeze(-1), topk_threshold, torch.zeros_like(topk_threshold)
+    )
+
+    if topk_plus_one_indices is not None:
+        topk_plus_one_boundary_indices = topk_plus_one_indices
+        topk_plus_one_threshold = torch.gather(
+            logits, dim=-1, index=topk_plus_one_boundary_indices
+        )
+    else:
+        unselected_logits = logits.masked_fill(routing_map, float('-inf'))
+        topk_plus_one_result = unselected_logits.max(dim=-1, keepdim=True)
+        topk_plus_one_threshold = topk_plus_one_result.values
+        topk_plus_one_boundary_indices = topk_plus_one_result.indices
+
+    threshold = torch.where(routing_map, topk_plus_one_threshold, topk_threshold)
+    competitor_indices = torch.where(
+        routing_map,
+        topk_plus_one_boundary_indices.expand_as(routing_map),
+        topk_boundary_indices.expand_as(routing_map),
+    )
+    if detach_threshold:
+        threshold = threshold.detach()
+    return logits - threshold, valid_tokens, competitor_indices
+
+
 def _load_balance_margin(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
@@ -521,6 +607,16 @@ def _load_balance_margin(
     topk_plus_one_indices: Optional[torch.Tensor] = None,
     detach_threshold: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if ste_rect_poistion == "exact_margin":
+        margin, valid_tokens, _ = _load_balance_exact_margin_and_competitor(
+            logits,
+            routing_map,
+            topk_indices=topk_indices,
+            topk_plus_one_indices=topk_plus_one_indices,
+            detach_threshold=detach_threshold,
+        )
+        return margin, valid_tokens
+
     routing_map = routing_map.bool()
     valid_tokens = routing_map.any(dim=-1)
     logits = logits.float()
@@ -587,6 +683,10 @@ def load_balance_ste_soft_mask(
         soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
     elif load_balance_ste_type == "triangle":
         soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
+    elif load_balance_ste_type == "higher_order_rect":
+        soft_mask = _HigherOrderRectangularIndicatorSTE.apply(
+            margin, load_balance_ste_width
+        )
     else:
         soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
     return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
@@ -1060,6 +1160,109 @@ def _noisy_centered_fsq_loss(
     )
 
 
+def _load_balance_ste_mask_from_margin(
+    margin: torch.Tensor,
+    routing_map: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    load_balance_ste_type: str,
+    load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
+) -> torch.Tensor:
+    """Apply a load-balancing STE to a precomputed routing margin."""
+    if load_balance_ste_type == "full":
+        hard_mask = routing_map.to(dtype=margin.dtype)
+        soft_mask = hard_mask + margin - margin.detach()
+    elif load_balance_ste_type == "tanh":
+        soft_mask = _TanhSTE.apply(margin, load_balance_tanh_ste_slope)
+    elif load_balance_ste_type == "triangle":
+        soft_mask = _TriangleSTE.apply(margin, load_balance_ste_width)
+    elif load_balance_ste_type == "higher_order_rect":
+        soft_mask = _HigherOrderRectangularIndicatorSTE.apply(
+            margin, load_balance_ste_width
+        )
+    else:
+        soft_mask = _RectangularIndicatorSTE.apply(margin, load_balance_ste_width)
+    return soft_mask * valid_tokens.unsqueeze(-1).to(dtype=soft_mask.dtype)
+
+
+def _exact_squared_load_ste_loss(
+    load_balancing_type: str,
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    hard_load_frac: torch.Tensor,
+    denom: torch.Tensor,
+    num_experts: int,
+    load_balance_ste_width: float,
+    load_balance_ste_type: str,
+    load_balance_tanh_ste_slope: float,
+    ste_rect_poistion: str,
+    topk_indices: Optional[torch.Tensor],
+    topk_plus_one_indices: Optional[torch.Tensor],
+    detach_threshold: bool,
+) -> torch.Tensor:
+    """Hard centered-FSQ forward with an exact discrete-jump STE backward."""
+    hard_loss = _direct_load_balance_from_load(
+        hard_load_frac, num_experts, "centered_fsq"
+    )
+    ste_enabled = (
+        load_balance_ste_type in ("full", "tanh") or load_balance_ste_width > 0.0
+    )
+    if not ste_enabled:
+        return hard_loss
+
+    coordinate_perturbation = load_balancing_type == "coordinate_perturbation_ste"
+    if coordinate_perturbation and ste_rect_poistion != "exact_margin":
+        raise ValueError(
+            "coordinate_perturbation_ste requires moe_ste_rect_poistion=exact_margin"
+        )
+
+    competitor_indices = None
+    if coordinate_perturbation:
+        margin, valid_tokens, competitor_indices = (
+            _load_balance_exact_margin_and_competitor(
+                logits,
+                routing_map,
+                topk_indices=topk_indices,
+                topk_plus_one_indices=topk_plus_one_indices,
+                detach_threshold=True,
+            )
+        )
+    else:
+        margin, valid_tokens = _load_balance_margin(
+            logits,
+            routing_map,
+            ste_rect_poistion,
+            topk_indices=topk_indices,
+            topk_plus_one_indices=topk_plus_one_indices,
+            detach_threshold=detach_threshold,
+        )
+
+    ste_mask = _load_balance_ste_mask_from_margin(
+        margin,
+        routing_map,
+        valid_tokens,
+        load_balance_ste_type,
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+    )
+    routing_float = routing_map.to(dtype=torch.float32)
+    global_counts = tokens_per_expert.float()
+    other_token_counts = global_counts.unsqueeze(0) - routing_float
+    jump_weight = other_token_counts
+    if coordinate_perturbation:
+        competitor_counts = global_counts[competitor_indices]
+        competitor_assignments = torch.gather(
+            routing_float, dim=-1, index=competitor_indices
+        )
+        competitor_other_token_counts = competitor_counts - competitor_assignments
+        jump_weight = other_token_counts - competitor_other_token_counts
+
+    scale = hard_load_frac.new_tensor(2.0 * float(num_experts)) / torch.square(denom)
+    surrogate = scale * (jump_weight.detach() * ste_mask.float()).sum()
+    return hard_loss + surrogate - surrogate.detach()
+
+
 def direct_load_balancing_loss_func(
     load_balancing_type: str,
     logits: torch.Tensor,
@@ -1094,11 +1297,28 @@ def direct_load_balancing_loss_func(
     ste_valid_tokens = None
     ste_rect_poistion = (
         load_balance_ste_rect_poistion
-        if load_balance_ste_type in ("rect", "triangle")
+        if load_balance_ste_type in ("rect", "higher_order_rect", "triangle")
         else "topk"
     )
 
-    if load_balancing_type == "noisy_centered_fsq":
+    if load_balancing_type in ("exact_jump_ste", "coordinate_perturbation_ste"):
+        loss = _exact_squared_load_ste_loss(
+            load_balancing_type,
+            logits,
+            routing_map,
+            tokens_per_expert,
+            hard_load_frac,
+            denom,
+            num_experts,
+            load_balance_ste_width,
+            load_balance_ste_type,
+            load_balance_tanh_ste_slope,
+            load_balance_ste_rect_poistion,
+            load_balance_topk_indices,
+            load_balance_topk_plus_one_indices,
+            load_balance_ste_detach_threshold,
+        )
+    elif load_balancing_type == "noisy_centered_fsq":
         loss = _noisy_centered_fsq_loss(
             logits,
             routing_map,
@@ -3000,12 +3220,23 @@ def _build_moe_router_metrics_log(
     vio_prefixes = _validation_metric_prefixes(prefix, "vio")
     if vio_prefixes:
         active_max_vio = max_vio_per_layer[active_layers]
+        # Low-load tail: load relative to the fair share (1 = balanced), per layer, then mean over layers.
+        active_rel_load = load_frac[active_layers] * num_experts
+        zero_load_frac = (active_rel_load == 0).float().mean(dim=-1).mean()
+        low_load_frac = (active_rel_load < 0.1).float().mean(dim=-1).mean()
+        load_p10 = torch.quantile(active_rel_load, 0.1, dim=-1).mean()
+        active_min_vio = 1.0 - active_rel_load.min(dim=-1).values  # (n̄ - min_i n_i) / n̄
         for vio_prefix in vio_prefixes:
             log[f"{vio_prefix}/MaxVioGlobal"] = float(active_max_vio.mean().item())
             log[f"{vio_prefix}/MaxVioGlobalWorstLayer"] = float(active_max_vio.max().item())
+            log[f"{vio_prefix}/MinVioGlobal"] = float(active_min_vio.mean().item())
+            log[f"{vio_prefix}/MinVioGlobalWorstLayer"] = float(active_min_vio.max().item())
             log[f"{vio_prefix}/TotalVioGlobal"] = float(
                 total_vio_per_layer[active_layers].mean().item()
             )
+            log[f"{vio_prefix}/ZeroLoadFracGlobal"] = float(zero_load_frac.item())
+            log[f"{vio_prefix}/LowLoadFracGlobal"] = float(low_load_frac.item())
+            log[f"{vio_prefix}/LoadP10Global"] = float(load_p10.item())
             for layer_idx in torch.nonzero(active_layers, as_tuple=False).flatten().tolist():
                 log[f"{vio_prefix}/MaxVio/Layer {layer_idx}"] = float(
                     max_vio_per_layer[layer_idx].item()
@@ -3059,6 +3290,31 @@ def _build_moe_router_metrics_log(
             )
             log[f"{ste_prefix}/all_layers/max_over_rect"] = float(max_over_rect.item())
             log[f"{ste_prefix}/all_layers/avg_over_rect"] = float(avg_over_rect.item())
+
+        # Window occupancy at several radii and per-expert coverage (rect-type STEs only).
+        ste_window_call_count = metrics.get("ste_window_call_count")
+        if ste_window_call_count is not None and ste_window_call_count.sum().item() > 0:
+            pair_count = token_count.sum().clamp(min=1.0) * num_experts
+            window_fracs = {
+                name: metrics[f"ste_window_count_{name}"].float().sum() / pair_count
+                for name in ("half_r", "1r", "2r", "4r")
+            }
+            window_expert_count = metrics["ste_window_expert_count"].float()[active_layers]
+            balanced_load = (assignment_count[active_layers] / num_experts).clamp(min=1.0)
+            relative_window_tokens = window_expert_count / balanced_load.unsqueeze(-1)
+            window_tokens_p10 = torch.quantile(relative_window_tokens, 0.1, dim=-1).mean()
+            window_empty_frac = (window_expert_count == 0).float().mean()
+            for ste_prefix in ste_prefixes:
+                for name, window_frac in window_fracs.items():
+                    log[f"{ste_prefix}/all_layers/window_frac_{name}"] = float(
+                        window_frac.item()
+                    )
+                log[f"{ste_prefix}/all_layers/window_expert_tokens_rel_p10"] = float(
+                    window_tokens_p10.item()
+                )
+                log[f"{ste_prefix}/all_layers/window_experts_empty_frac"] = float(
+                    window_empty_frac.item()
+                )
 
     return log
 

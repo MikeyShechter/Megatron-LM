@@ -870,8 +870,13 @@ class TopKRouter(Router):
             if (
                 self._metagrad_tracks("width")
                 and load_balancing_type
-                not in ("quantile_correction_ste", "fixed_number_boundary_ste")
-                and load_balance_ste_type != "full"
+                not in (
+                    "exact_jump_ste",
+                    "coordinate_perturbation_ste",
+                    "quantile_correction_ste",
+                    "fixed_number_boundary_ste",
+                )
+                and load_balance_ste_type not in ("full", "higher_order_rect")
             ):
                 metagrad_width_loss = direct_load_balancing_width_sensitivity_loss_func(
                     load_balancing_type=load_balancing_type,
@@ -1314,6 +1319,11 @@ class TopKRouter(Router):
         ste_all_experts_in_rect_count = token_count.new_tensor(0.0)
         ste_selected_count = tokens_per_expert.sum()
         ste_over_rect_count = torch.zeros_like(tokens_per_expert)
+        ste_window_call_count = token_count.new_tensor(0.0)
+        ste_window_counts = {
+            name: token_count.new_tensor(0.0) for name in ("half_r", "1r", "2r", "4r")
+        }
+        ste_window_expert_count = torch.zeros_like(tokens_per_expert)
         quantile_delta_bias = None
         quantile_affected_entry_count = token_count.new_tensor(0.0)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
@@ -1326,7 +1336,7 @@ class TopKRouter(Router):
             )
         elif (
             (not self.training)
-            and load_balance_ste_type == "rect"
+            and load_balance_ste_type in ("rect", "higher_order_rect")
             and load_balance_ste_width > 0.0
         ):
             # True margin: biased scores when selection biases are active, else logits.
@@ -1335,13 +1345,32 @@ class TopKRouter(Router):
             margin, _ = _load_balance_margin(
                 margin_input, attempted_routing_map, ste_rect_poistion
             )
-            half_width = load_balance_ste_width * 0.5
-            selected_in_rect = attempted_routing_map & (margin.abs() < half_width)
-            all_experts_in_rect = valid_tokens.unsqueeze(-1) & (margin.abs() < half_width)
-            selected_over_rect = attempted_routing_map & (margin >= half_width)
+            support_radius = load_balance_ste_width * (
+                1.0 if load_balance_ste_type == "higher_order_rect" else 0.5
+            )
+            selected_in_rect = attempted_routing_map & (margin.abs() < support_radius)
+            all_experts_in_rect = valid_tokens.unsqueeze(-1) & (
+                margin.abs() < support_radius
+            )
+            selected_over_rect = attempted_routing_map & (margin >= support_radius)
             ste_in_rect_count = selected_in_rect.float().sum()
             ste_all_experts_in_rect_count = all_experts_in_rect.float().sum()
             ste_over_rect_count = selected_over_rect.float().sum(dim=0)
+
+            # Occupancy at 0.5/1/2/4 x the support radius, and per-expert counts at 1x.
+            # Margins of exactly 0 belong to the expert that sets the threshold
+            # (topk / topk_plus_one), so they are left out.
+            abs_margin = margin.abs()
+            boundary_entries = valid_tokens.unsqueeze(-1) & (margin != 0)
+            for name, radius_mult in (("half_r", 0.5), ("2r", 2.0), ("4r", 4.0)):
+                ste_window_counts[name] = (
+                    boundary_entries & (abs_margin < radius_mult * support_radius)
+                ).float().sum()
+            ste_window_expert_count = (
+                boundary_entries & (abs_margin < support_radius)
+            ).float().sum(dim=0)
+            ste_window_counts["1r"] = ste_window_expert_count.sum()
+            ste_window_call_count = token_count.new_tensor(1.0)
 
         if self.has_aux_loss_type("quantile_correction_ste"):
             margin_input, _ = self._margin_input_for_ste(logits, detached=True)
@@ -1469,6 +1498,16 @@ class TopKRouter(Router):
         )
         save_to_router_metrics_tracker(
             "ste_over_rect_count", ste_over_rect_count, layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "ste_window_call_count", ste_window_call_count, layer_number, num_layers
+        )
+        for name, count in ste_window_counts.items():
+            save_to_router_metrics_tracker(
+                f"ste_window_count_{name}", count, layer_number, num_layers
+            )
+        save_to_router_metrics_tracker(
+            "ste_window_expert_count", ste_window_expert_count, layer_number, num_layers
         )
         if quantile_delta_bias is not None:
             save_to_router_metrics_tracker(
@@ -1995,12 +2034,14 @@ class TopKRouter(Router):
                 quantile_correction_enabled
                 or (
                     fixed_boundary_enabled
-                    and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+                    and load_balance_ste_rect_poistion
+                    in ("topk_plus_one", "midpoint", "exact_margin")
                 )
                 or (
-                    load_balance_ste_type in ("rect", "triangle")
+                    load_balance_ste_type in ("rect", "higher_order_rect", "triangle")
                     and load_balance_ste_width > 0.0
-                    and load_balance_ste_rect_poistion in ("topk_plus_one", "midpoint")
+                    and load_balance_ste_rect_poistion
+                    in ("topk_plus_one", "midpoint", "exact_margin")
                 )
             )
         )

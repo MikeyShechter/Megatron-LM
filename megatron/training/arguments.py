@@ -1425,6 +1425,16 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+    load_balancing_types = (
+        args.moe_router_load_balancing_type
+        if isinstance(args.moe_router_load_balancing_type, list)
+        else [args.moe_router_load_balancing_type]
+    )
+    if "coordinate_perturbation_ste" in load_balancing_types:
+        assert args.moe_ste_rect_poistion == "exact_margin", (
+            "--moe-router-load-balancing-type coordinate_perturbation_ste requires "
+            "--moe-ste-rect-poistion exact_margin"
+        )
     if getattr(args, 'tie_learnable_bias_lr_to_aux_loss_coeff', False):
         assert getattr(args, 'moe_learnable_bias_lr_mult', None) is None, (
             "--moe-learnable-bias-lr-mult cannot be used with "
@@ -3199,6 +3209,8 @@ def _add_moe_args(parser):
                            'aux_loss',
                            'fsq',
                            'centered_fsq',
+                           'exact_jump_ste',
+                           'coordinate_perturbation_ste',
                            'quantile_correction_ste',
                            'fixed_number_boundary_ste',
                            'centered_fsq_and_var',
@@ -3214,7 +3226,7 @@ def _add_moe_args(parser):
                            'none',
                        ],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "fsq", "centered_fsq", "quantile_correction_ste", "fixed_number_boundary_ste", "centered_fsq_and_var", "noisy_centered_fsq", "maxvio", "maxviosq", and "totalvio" correspond to direct routed-load losses; "qb_projection_distillation" trains raw router logits against a QB-corrected Top-K target; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" uses dual coordinate descent on a per-expert bias to handle load balance internally; and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "fsq", "centered_fsq", "exact_jump_ste", "coordinate_perturbation_ste", "quantile_correction_ste", "fixed_number_boundary_ste", "centered_fsq_and_var", "noisy_centered_fsq", "maxvio", "maxviosq", and "totalvio" correspond to direct routed-load losses; "qb_projection_distillation" trains raw router logits against a QB-corrected Top-K target; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" uses dual coordinate descent on a per-expert bias to handle load balance internally; and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-balance-update-rate', type=float, default=0.0,
@@ -3225,9 +3237,21 @@ def _add_moe_args(parser):
                             'update logic.')
     group.add_argument('--moe-balance-target-vio', type=float, default=0.0,
                        help='Target MaxVioGlobal for moe_balance_update_rate.')
+    group.add_argument('--moe-balance-update-mode', type=str,
+                       choices=['additive', 'multiplicative'], default='additive',
+                       help='How moe_balance_update_rate changes the balance-control knob. '
+                            '"additive" adds or subtracts the rate (clamped at 0). '
+                            '"multiplicative" multiplies the knob by exp(rate) or exp(-rate), '
+                            'i.e. an additive step on its log, so the knob must start above 0.')
+    group.add_argument('--moe-balance-update-start-iter', type=int, default=0,
+                       help='Iteration from which moe_balance_update_rate updates the '
+                            'balance-control knob. Before it the knob keeps its initial value. '
+                            'The default 0 updates from the first iteration.')
     group.add_argument('--moe-load-balance-ste-type', '--load-balance-ste-type',
-                       type=str, choices=['rect', 'full', 'tanh', 'triangle'], default='rect',
+                       type=str, choices=['rect', 'higher_order_rect', 'full', 'tanh', 'triangle'], default='rect',
                        help='Surrogate gradient operator for direct routed-load balancing losses. '
+                            '"higher_order_rect" uses the fourth-order central-difference '
+                            'combination of width-w and width-2w rectangles. '
                             '"full" uses hard assignments in forward and an identity derivative '
                             'for every valid token-expert score.')
     group.add_argument('--moe-load-balance-ste-schedule', '--load-balance-ste-schedule',
@@ -3240,11 +3264,12 @@ def _add_moe_args(parser):
                        dest='moe_load_balance_ste_width_end',
                        help='Ending effective STE width for scheduled direct load balancing.')
     group.add_argument('--moe-ste-rect-poistion', '--ste-rect-poistion',
-                       type=str, choices=['topk', 'topk_plus_one', 'midpoint'],
+                       type=str, choices=['topk', 'topk_plus_one', 'midpoint', 'exact_margin'],
                        default='topk',
                        dest='moe_ste_rect_poistion',
                        help='Center location for the finite STE window used by direct '
-                            'routed-load balancing losses.')
+                            'routed-load balancing losses. "exact_margin" compares selected '
+                            'experts with Top-K+1 and unselected experts with Top-K.')
     group.add_argument('--moe-load-balance-gate-metric', '--load-balance-gate-metric',
                        type=str, choices=['none', 'maxvio', 'totalvio'],
                        default='none',
