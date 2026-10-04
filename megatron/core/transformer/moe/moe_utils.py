@@ -59,6 +59,7 @@ _MOE_ROUTER_METRICS_TRACKER: dict = {}
 _MOE_ROUTER_REGULAR_VALIDATION_DIAGNOSTICS_ENABLED = False
 _MOE_WEIGHTER_ROUTING_EVAL_ENABLED = False
 _MOE_ROUTER_WEIGHTING_EVAL_ENABLED = False
+_MOE_ROUTER_EVAL_SELECTION_RANKS: Optional[Tuple[int, ...]] = None
 _MOE_METAGRAD_LOSSES: dict[str, list[torch.Tensor]] = {}
 _MOE_METAGRAD_STATE: dict = {
     "raw": {},
@@ -113,6 +114,8 @@ _MOE_ROUTER_METRIC_SPECS = {
     "capacity_max_load_ratio_sum": "scalar",
     "capacity_max_load_ratio_max": "scalar",
     "overflowed_expert_fraction_sum": "scalar",
+    "lm_ste_extras_better_count": "scalar",
+    "lm_ste_extras_token_count": "scalar",
 }
 
 _MOE_ROUTER_MAX_METRICS = {
@@ -193,6 +196,17 @@ def set_moe_router_weighting_eval_enabled(enabled: bool) -> None:
 def moe_router_weighting_eval_enabled() -> bool:
     """Return whether split-router logits currently determine combine weights."""
     return _MOE_ROUTER_WEIGHTING_EVAL_ENABLED
+
+
+def set_moe_router_eval_selection_ranks(ranks: Optional[Tuple[int, ...]]) -> None:
+    """Route every token to the experts at these 1-based router-score ranks in an eval pass."""
+    global _MOE_ROUTER_EVAL_SELECTION_RANKS
+    _MOE_ROUTER_EVAL_SELECTION_RANKS = None if ranks is None else tuple(ranks)
+
+
+def moe_router_eval_selection_ranks() -> Optional[Tuple[int, ...]]:
+    """Return the router-score ranks that replace the top-k in the current eval pass, if any."""
+    return _MOE_ROUTER_EVAL_SELECTION_RANKS
 
 
 def switch_load_balancing_loss_func(
@@ -2830,6 +2844,50 @@ def save_to_router_metrics_tracker(
         tracker[name][layer_number - 1] += value
 
 
+class LMSTESignalTracker(torch.autograd.Function):
+    """Identity on router scores that records the LM STE verdict in backward.
+
+    `kind` is "extra" for the extra experts and "selected" for the top-k experts; the columns are
+    sorted by router score. Per rank, an expert counts as preferred when the LM STE gradient on its
+    own score is negative, i.e. gradient descent raises it. For the extra experts, a token also
+    counts as preferring its extras when the summed gradient on their scores is negative.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        scores: torch.Tensor,
+        valid: torch.Tensor,
+        kind: str,
+        layer_number: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(valid)
+        ctx.kind = kind
+        ctx.layer_number = layer_number
+        ctx.num_layers = num_layers
+        return scores
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        (valid,) = ctx.saved_tensors
+        grad = grad_output.float()
+        stats = [
+            (f"lm_ste_{ctx.kind}_rank_better_count", (valid & (grad < 0)).float().sum(dim=0)),
+            (f"lm_ste_{ctx.kind}_rank_count", valid.float().sum(dim=0)),
+        ]
+        if ctx.kind == "extra":
+            valid_tokens = valid.any(dim=-1)
+            extras_better = valid_tokens & (grad.sum(dim=-1) < 0)
+            stats += [
+                ("lm_ste_extras_better_count", extras_better.float().sum()),
+                ("lm_ste_extras_token_count", valid_tokens.float().sum()),
+            ]
+        for name, value in stats:
+            save_to_router_metrics_tracker(name, value, ctx.layer_number, ctx.num_layers)
+        return grad_output, None, None, None, None
+
+
 def clear_moe_router_metrics_tracker() -> None:
     """Clear the MoE router metrics tracker."""
     tracker = get_moe_router_metrics_tracker()
@@ -3067,6 +3125,26 @@ def _build_moe_router_metrics_log(
         log[f"{effective_prefix}/router_values/f_p_l1"] = float(
             _mean_active(f_p_l1_per_layer, active_layers).item()
         )
+        # Recorded in backward, so these only appear for training.
+        lm_ste_extras_token_count = metrics["lm_ste_extras_token_count"].float().sum()
+        if lm_ste_extras_token_count.item() > 0:
+            log[f"{effective_prefix}/lm_ste/extras_better_frac"] = float(
+                (
+                    metrics["lm_ste_extras_better_count"].float().sum()
+                    / lm_ste_extras_token_count
+                ).item()
+            )
+            # Per-rank counts have one entry per expert rank, so they are not in the specs.
+            for kind, log_name in (("extra", "extras"), ("selected", "selected")):
+                rank_better_count = metrics[f"lm_ste_{kind}_rank_better_count"].float().sum(dim=0)
+                rank_count = metrics[f"lm_ste_{kind}_rank_count"].float().sum(dim=0)
+                for rank, (better, count) in enumerate(
+                    zip(rank_better_count.tolist(), rank_count.tolist()), start=1
+                ):
+                    if count > 0:
+                        log[f"{effective_prefix}/lm_ste/{log_name}_better_frac_rank{rank}"] = (
+                            better / count
+                        )
 
         dispatch_count = metrics["dispatch_count"].float().sum()
         sequence_count = metrics["sequence_count"].float().sum()

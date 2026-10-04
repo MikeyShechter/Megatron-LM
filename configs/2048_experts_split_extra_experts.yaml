@@ -1,0 +1,161 @@
+# Split router-weighter trained by the counterfactual LM routing STE on m=2 extra experts:
+# replacement vs weighted_replacement vs addition, with the standard aux_loss LB and a softmax weighter.
+# Base: configs/2048_experts_split_router_weighter.yaml. Changed from the base: the name, aux_loss in place of
+# centered_fsq + rect (STE width reset to 0, as in the aux_loss reference runs), softmax weighter only,
+# moe_router_lm_loss_extra_experts 0 -> 2, the new moe_router_lm_loss_extra_experts_signal sweep, and
+# aux coeff [0.1, 1.0]. In the 26-09-16/17 split aux_loss sweeps (softmax weighter, router bias on) 0.1 and 1.0
+# were the best coefficients: val 3.2174 / 3.2079, MaxVio 1.5 / 1.4. Those runs used the normalized-relative
+# LM signal without extra experts and are the references: z9rg2k7y (0.1) and 0nl5u4q1 (1.0).
+job_details:
+  name: experts2048_every2_split_router_weighter_extra_experts_aux
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # task-eval-tasks: ['dclm-core-22']
+  # task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]                # = n_layer
+  hidden_size: [768]              # = n_embd
+  num_attention_heads: [6]        # = n_head
+  disable_bias_linear: [true]
+  seq_length: [1024]              # = sequence_length
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+
+  num_experts: [2048]
+  moe_router_topk: [2]            # = top_k
+  # Megatron load-balancing choices: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, none.
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  # Keep the same per-expert shape as the 256-expert configuration.
+  moe_ffn_hidden_size: [384]
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+
+  moe_use_global_lb: [true]
+  moe_aux_loss_coeff: [0.1, 1.0]
+  # moe_router_score_function: ["sigmoid"]
+
+  moe_router_load_balancing_type: ["aux_loss"]
+  # quantile_correction_mean_local: [true]
+  
+  moe_router_use_separate_weighter: [true]
+  moe_router_selection_activation: ["none"]
+  moe_weighter_activation: ["softmax"]
+  moe_router_pass_grad_to_input: [false]
+  moe_router_lr_mult: [1.0]
+  moe_lm_loss_ste_normalized_relative: [true]   # inactive: the extra-experts signal replaces it
+  moe_router_lm_loss_extra_experts: [2]
+  moe_router_lm_loss_extra_experts_signal: ["replacement", "weighted_replacement", "addition"]
+  moe_router_enable_bias: [true]
+
+  eval_split_router_with_weighter: [true]
+  eval_split_router_with_router_weights: [true]
+
+  # moe_load_balance_ste_detach_threshold: [true, false]
+  # moe_router_enable_expert_bias: [true]
+  # moe_router_bias_update_rate: [0.1, 0.01, 0.001, 0.0001]
+  load_balance_ste_width: [0.0]   # unused by aux_loss and by the extra-experts LM signal
+  # moe_learnable_bias_type: ['expert_bias', 'per_token_bias']  #, 'expert_bias', 'per_token_bias'
+  # moe_ste_rect_poistion: ['topk', 'midpoint']
+  load_balance_ste_type: ["rect"]  # , "triangle"
+
+  # tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+  # moe_learnable_bias_pass_grad_through_scores: [false]
+  # detatch_per_token_bias_input: [true]
+
+  # LIST_LB:
+    # - moe_router_load_balancing_type: ["none"] # DeepSeek loss free
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [true]
+    #   moe_router_bias_update_rate: [0.0001]
+    #   moe_aux_loss_coeff: [0.0]
+    #   load_balance_ste_width: [0.0]
+    #   moe_learnable_bias_type: ['none']
+    # - moe_router_load_balancing_type: ["aux_loss"] # standard global aux loss
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [false]
+    #   moe_router_bias_update_rate: [0.0]
+    #   moe_aux_loss_coeff: [0.001]
+    #   load_balance_ste_width: [0.0]
+    #   moe_learnable_bias_type: ['none']
+    # - moe_router_load_balancing_type: ["centered_fsq"] # STE variants
+    #   moe_router_score_function: ["sqrtsoftplus"]
+    #   moe_router_enable_expert_bias: [false]
+    #   moe_router_bias_update_rate: [0.0]
+    #   moe_aux_loss_coeff: [0.001]
+    #   load_balance_ste_width: [0.1]
+    #   moe_learnable_bias_type: ['none', 'expert_bias', 'per_token_bias']
+
+  # load_balance_ste_schedule: ["linear", "cosine", "exponential", "constant"]
+
+  # moe_balance_update_rate: [0.0001]
+  # moe_balance_target_vio: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]           # = momentum
+  lr: [0.02]                      # = lr_muon
+  decoupled_lr: [0.002]           # = lr_head (Megatron uses one value for both embed+head;
+
+  # optimizer: ["adam"]
+  # lr: [0.001]
+  
+                                  #   nanogpt had lr_embed=0.3 separately, not replicable here)
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  # WSD (Warmup-Stable-Decay) is Megatron's equivalent of nanogpt's warmdown.
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]            # = warmup_iters
+  lr_wsd_decay_iters: [1714]      # = warmdown_iters
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]             # = num_iterations
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]            # = val_loss_every
+  eval_iters: [20]                # structural diff: iteration count, not token count
+                                  # 20 * 512 * 1024 ≈ 10M tokens ≈ original val_tokens
+  save_interval: [150]            # = save_every
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]

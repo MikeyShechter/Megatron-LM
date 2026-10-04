@@ -50,6 +50,28 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
 - `train/router_balance/max_vio_dispatch_mean|worst`: MaxVio of each individual router call (one rank-local
   micro-batch × one layer); mean / max over calls. Measures local, per-batch balance, unlike `vio/*`.
 - `train/router_balance/max_vio_sequence_mean|worst`: MaxVio of each sequence's own expert loads; mean / max.
+- `train/lm_ste/extras_better_frac` (added 2026-10-03): split router with `--moe-router-lm-loss-extra-experts` m > 0
+  only. The fraction of tokens whose LM STE pushes their m extra experts (the top-m unselected experts by router
+  score) up on net: the summed STE gradient on the extras' router scores is negative. "Better" follows
+  `--moe-router-lm-loss-extra-experts-signal` (h_e = expert output, y = MoE output, g = grad of the LM loss wrt y):
+  - `replacement`: the mean over (selected i, extra j) pairs of ⟨g, h_j − h_i⟩ is negative.
+  - `weighted_replacement`: the mean over pairs of ⟨g, y_ij − y⟩ is negative, where y_ij is the weighter mixture with
+    j in place of i.
+  - `addition`: Σ_j w_j·⟨g, h_j − y⟩ < 0. Since 2026-10-03 ~19:30, w_j = q_j/(Z + q_j), the weight j would get
+    when added at full weight (q = weighter weights, Z = their total over the selected experts). The first addition
+    runs (26-10-03-…extra_experts_aux, runs 002 and 005) used q_j/Z and diverged.
+
+  Tokens without a valid extra (padding, capacity drops) are excluded. Pooled over layers and micro-batches. It is
+  recorded in backward, so there is no val/test version (U:2847-2888, U:3128-3148, R:1215-1413).
+- `train/lm_ste/extras_better_frac_rank{r}` (added 2026-10-03), r = 1..m: the same per runner-up rank r (extras are
+  sorted by router score): the fraction of tokens where the STE gradient on the rank-r extra's own score is
+  negative. Replacement: ⟨g, h_j − mean_i h_i⟩ < 0. Weighted replacement: Σ_i ⟨g, y_ij − y⟩ < 0. Addition:
+  ⟨g, h_j − y⟩ < 0. Shows whether ranks beyond the first carry signal, i.e. whether a larger m is worth its compute.
+- `train/lm_ste/selected_better_frac_rank{r}` (added 2026-10-04), r = 1..K: the same for the selected experts, by
+  router-score rank: the fraction of tokens where the LM STE gradient on the rank-r selected expert's score is
+  negative (the STE pushes it up). With `addition` and K=2 the two selected experts always get opposite signs
+  (h_1 − y and h_2 − y point in opposite directions), so rank 1 and rank 2 sum to about 1 and rank 1 is the
+  fraction of tokens where the router's first choice beats its second to first order (U:2847-2888).
 - `train/ste_bandwidth`: the scheduled STE width at this step (0 for STE type `full`). It is logged even when no
   STE loss is active.
 - `train/moe_aux_loss_coeff`: the current coefficient. It changes only via the MaxVio controller or metagrad. The
@@ -93,6 +115,10 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
     plain single-router MoE built from the weighter. Gated by `--eval-split-router-with-weighter`.
   - `val/router_both/*`: the router selects and also weights (the router logits go through
     `moe_weighter_activation`). Gated by `--eval-split-router-with-router-weights`.
+  - `val/router_ranks_<a>_<b>/lm_loss` (added 2026-10-04): each token goes to the experts at router-score ranks
+    a, b instead of its top-k, and the weighter weights them as usual. One key per rank set of
+    `--eval-router-selection-ranks "a,b c,d"` (regular validation only; T:4346-4356, T:4520-4532, R:2248-2261). Used by `tools/eval_routing_ranks.py`, whose runs go to the separate wandb project
+    megatron-moe-analysis.
   - `val/router/*` (2026-08-09 to 08-20 only): a copy of the regular-mode numbers.
 - Before 2026-06-08, every eval set (test included) wrote router stats under plain `val`/`vio`/`ste`, so later
   sets overwrote earlier ones at the same step. Before 2026-06-07, the test loss also went to `val/lm_loss`.

@@ -222,6 +222,7 @@ from megatron.core.transformer.moe.moe_utils import (
     moe_metagrad_enabled,
     set_moe_metagrad_prev_sensitivities,
     set_moe_router_regular_validation_diagnostics_enabled,
+    set_moe_router_eval_selection_ranks,
     set_moe_router_weighting_eval_enabled,
     set_moe_weighter_routing_eval_enabled,
     track_moe_metrics,
@@ -4342,7 +4343,19 @@ def evaluate_and_print_results(
             and getattr(args, "eval_split_router_with_router_weights", False)
             and getattr(args, "moe_router_use_separate_weighter", False)
         )
-        record_alternate_routing_batches = compare_router_and_weighter or compare_router_both
+        eval_rank_sets = (
+            [
+                tuple(int(rank) for rank in rank_set.split(","))
+                for rank_set in args.eval_router_selection_ranks.split()
+            ]
+            if collect_regular_validation_router_diagnostics
+            and getattr(args, "eval_router_selection_ranks", None)
+            and getattr(args, "moe_router_use_separate_weighter", False)
+            else []
+        )
+        record_alternate_routing_batches = (
+            compare_router_and_weighter or compare_router_both or bool(eval_rank_sets)
+        )
         eval_iterator = (
             _record_validation_iterator(iterator)
             if record_alternate_routing_batches
@@ -4503,6 +4516,20 @@ def evaluate_and_print_results(
                     comparison_log[f"val/router_both/{metric_name}"] = (
                         router_both_metrics_log[source_key]
                     )
+
+        for rank_set in eval_rank_sets:
+            rank_loss_dict, _, rank_timelimit = _evaluate_alternate_routing(
+                lambda enabled, rank_set=rank_set: set_moe_router_eval_selection_ranks(
+                    rank_set if enabled else None
+                )
+            )
+            if rank_timelimit:
+                return
+            if "lm loss" in rank_loss_dict:
+                rank_name = "_".join(str(rank) for rank in rank_set)
+                comparison_log[f"val/router_ranks_{rank_name}/lm_loss"] = rank_loss_dict[
+                    "lm loss"
+                ].item()
 
         if comparison_log:
             if writer:

@@ -10,6 +10,7 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     DIRECT_LOAD_BALANCING_LOSS_TYPES,
+    LMSTESignalTracker,
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     _load_balance_margin,
@@ -24,6 +25,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_load_balance_ste_params,
     get_tokens_per_expert_and_token_count,
     load_balance_ste_soft_mask,
+    moe_router_eval_selection_ranks,
     moe_router_regular_validation_diagnostics_enabled,
     moe_router_weighting_eval_enabled,
     moe_weighter_routing_eval_enabled,
@@ -1219,18 +1221,18 @@ class TopKRouter(Router):
         extra_indices: torch.Tensor,
         accepted_routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        weighter_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Attach the average selected-to-extra swap signal to the expert coefficients.
 
-        The added coefficients are zero in forward. Their backward pass compares every
-        extra expert output with every selected expert output, without using weighter values.
+        The added coefficients are zero in forward. In backward, every pair of a selected
+        expert i and an extra expert j contributes a swap signal with opposite signs to the
+        two router scores, averaged over the K*m pairs. Without `weighter_input` the signal
+        is `grad_y dot (h_j - h_i)`, which uses no weighter values. With it, the signal is
+        `grad_y dot (y_ij - y)`, the first-order change in the LM loss when the weighter
+        mixture uses j in place of i.
         """
         selection_scores, _ = self._margin_input_for_ste(logits, detached=False)
-        selected_scores = torch.gather(selection_scores, dim=-1, index=selected_indices)
-        extra_scores = torch.gather(selection_scores, dim=-1, index=extra_indices)
-
-        score_gaps = extra_scores.unsqueeze(-1) - selected_scores.unsqueeze(-2)
-        zero_forward_gaps = score_gaps - score_gaps.detach()
 
         selected_accepted = torch.gather(
             accepted_routing_map, dim=-1, index=selected_indices
@@ -1239,16 +1241,176 @@ class TopKRouter(Router):
         valid_pairs = extra_accepted.unsqueeze(-1) & selected_accepted.unsqueeze(-2)
         if padding_mask is not None:
             valid_pairs = valid_pairs & ~padding_mask.view(-1, 1, 1)
+
+        selected_scores = self._track_lm_ste_signal(
+            torch.gather(selection_scores, dim=-1, index=selected_indices),
+            valid_pairs.any(dim=-2),
+            "selected",
+        )
+        extra_scores = self._track_lm_ste_signal(
+            torch.gather(selection_scores, dim=-1, index=extra_indices),
+            valid_pairs.any(dim=-1),
+            "extra",
+        )
+
+        score_gaps = extra_scores.unsqueeze(-1) - selected_scores.unsqueeze(-2)
+        zero_forward_gaps = score_gaps - score_gaps.detach()
         zero_forward_gaps = zero_forward_gaps * valid_pairs.to(zero_forward_gaps.dtype)
 
         scale = 1.0 / (selected_indices.size(-1) * extra_indices.size(-1))
-        selected_coeffs = -zero_forward_gaps.sum(dim=-2) * scale
-        extra_coeffs = zero_forward_gaps.sum(dim=-1) * scale
+        if weighter_input is None:
+            selected_coeffs = -zero_forward_gaps.sum(dim=-2) * scale
+            extra_coeffs = zero_forward_gaps.sum(dim=-1) * scale
+        else:
+            selected_coeffs, extra_coeffs = self._weighted_swap_coeffs(
+                zero_forward_gaps * scale,
+                weighter_input,
+                selected_indices,
+                extra_indices,
+                selected_accepted,
+            )
 
         surrogate_probs = torch.zeros_like(selection_scores)
         surrogate_probs = surrogate_probs.scatter_add(1, selected_indices, selected_coeffs)
         surrogate_probs = surrogate_probs.scatter_add(1, extra_indices, extra_coeffs)
         return probs + surrogate_probs.to(dtype=probs.dtype)
+
+    def _weighted_swap_coeffs(
+        self,
+        pair_gaps: torch.Tensor,
+        weighter_input: torch.Tensor,
+        selected_indices: torch.Tensor,
+        extra_indices: torch.Tensor,
+        selected_accepted: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Expert coefficients whose LM gradient is the weighter-mixture swap signal.
+
+        `pair_gaps[:, j, i]` is the zero-forward gap between the scores of extra expert j and
+        selected expert i. With weighter weights q, Z = sum of q over the selected experts,
+        g_i = q_i / Z and Z_ij = Z - q_i + q_j, its backward multiplier is
+        `grad_y dot (y_ij - y) = q_j/Z_ij v_j - g_i v_i + (q_i - q_j)/Z_ij sum_{l != i} g_l v_l`,
+        where v_e = grad_y dot h_e is the gradient of the coefficient of expert e.
+        """
+        num_selected = selected_indices.size(-1)
+        with torch.no_grad():
+            weights = self._compute_selected_weighter_probs(
+                self.selected_weighting(
+                    weighter_input, torch.cat([selected_indices, extra_indices], dim=-1)
+                )
+            ).float()
+        selected_weights = weights[:, :num_selected] * selected_accepted.to(weights.dtype)
+        extra_weights = weights[:, num_selected:].unsqueeze(-1)
+
+        if self.weighter_activation == "softmax" or self.topk > 1:
+            total = selected_weights.sum(dim=-1, keepdim=True) + 1e-20
+            swapped_total = (total - selected_weights).unsqueeze(-2) + extra_weights
+            selected_gates = selected_weights / total
+            extra_coeffs = (pair_gaps * extra_weights / swapped_total).sum(dim=-1)
+            # Swapping i for j rescales the share of every other selected expert l.
+            share_shift = (
+                pair_gaps * (selected_weights.unsqueeze(-2) - extra_weights) / swapped_total
+            ).sum(dim=-2)
+            other_coeffs = selected_gates * (
+                share_shift.sum(dim=-1, keepdim=True) - share_shift
+            )
+        else:
+            # A top-1 sigmoid or sqrtsoftplus weighter does not normalize, so y_ij - y is
+            # q_j h_j - q_i h_i.
+            selected_gates = selected_weights
+            extra_coeffs = (pair_gaps * extra_weights).sum(dim=-1)
+            other_coeffs = 0.0
+
+        selected_coeffs = -pair_gaps.sum(dim=-2) * selected_gates + other_coeffs
+        return selected_coeffs, extra_coeffs
+
+    def _apply_counterfactual_addition_lm_ste(
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        weighter_input: torch.Tensor,
+        selected_indices: torch.Tensor,
+        extra_indices: torch.Tensor,
+        accepted_routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attach the rect-STE addition signal to the selected and the extra experts.
+
+        A selected expert i receives `g_i * grad_y dot (h_i - y)`, the derivative of the LM loss
+        with respect to softly including it in the weighter mixture (the normalized-relative
+        signal). An extra expert j receives `q_j / (Z + q_j) / m * grad_y dot (h_j - y)`, where q
+        are the weighter weights and Z is their total over the selected experts: the first-order
+        change in the loss when j is added to the mixture at full weight, divided by m to keep
+        the LM signal's scale relative to LB as m changes. The derivative's weight q_j / Z grows
+        exponentially with the weighter-logit gap and made training diverge; q_j / (Z + q_j) is
+        at most 1. Compared with the rect STE, the fixed set of extra experts replaces the
+        window. The added coefficients are zero in forward, and the weighter values are detached.
+        """
+        selection_scores, _ = self._margin_input_for_ste(logits, detached=False)
+        num_selected = selected_indices.size(-1)
+        evaluated_indices = torch.cat([selected_indices, extra_indices], dim=-1)
+
+        evaluated_accepted = torch.gather(accepted_routing_map, dim=-1, index=evaluated_indices)
+        if padding_mask is not None:
+            evaluated_accepted = evaluated_accepted & ~padding_mask.unsqueeze(-1)
+        selected_accepted = evaluated_accepted[:, :num_selected]
+        # An extra expert is compared with the mixture, so it needs an accepted selected expert.
+        extra_accepted = evaluated_accepted[:, num_selected:] & selected_accepted.any(
+            dim=-1, keepdim=True
+        )
+        evaluated_accepted = torch.cat([selected_accepted, extra_accepted], dim=-1)
+
+        selected_scores = self._track_lm_ste_signal(
+            torch.gather(selection_scores, dim=-1, index=selected_indices),
+            selected_accepted,
+            "selected",
+        )
+        extra_scores = self._track_lm_ste_signal(
+            torch.gather(selection_scores, dim=-1, index=extra_indices),
+            extra_accepted,
+            "extra",
+        )
+
+        normalize = self.weighter_activation == "softmax" or self.topk > 1
+        with torch.no_grad():
+            # Proportional to the unnormalized weighter weights, and equal to them when the
+            # weighter does not normalize (top-1 sigmoid or sqrtsoftplus).
+            weights = self._compute_selected_weighter_probs(
+                self.selected_weighting(weighter_input, evaluated_indices)
+            ).float()
+            weights = weights * evaluated_accepted.to(dtype=weights.dtype)
+            selected_gates = weights[:, :num_selected]
+            extra_gates = weights[:, num_selected:]
+            if normalize:
+                selected_total = selected_gates.sum(dim=-1, keepdim=True)
+                selected_gates = selected_gates / (selected_total + 1e-20)
+                extra_gates = extra_gates / (selected_total + extra_gates + 1e-20)
+            extra_gates = extra_gates / extra_indices.size(-1)
+
+        selected_coeffs = selected_gates * (selected_scores - selected_scores.detach())
+        extra_coeffs = extra_gates * (extra_scores - extra_scores.detach())
+        if normalize:
+            # Measure every signal against the current output y = sum_i g_i h_i.
+            selected_coeffs = selected_coeffs - selected_gates * (
+                selected_coeffs.sum(dim=-1, keepdim=True) + extra_coeffs.sum(dim=-1, keepdim=True)
+            )
+
+        surrogate_probs = torch.zeros_like(selection_scores)
+        surrogate_probs = surrogate_probs.scatter_add(1, selected_indices, selected_coeffs)
+        surrogate_probs = surrogate_probs.scatter_add(1, extra_indices, extra_coeffs)
+        return probs + surrogate_probs.to(dtype=probs.dtype)
+
+    def _track_lm_ste_signal(
+        self, scores: torch.Tensor, valid: torch.Tensor, kind: str
+    ) -> torch.Tensor:
+        """Count, in backward, how often the LM STE raises the "selected" or "extra" experts."""
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        if self.is_mtp_layer:
+            layer_number = self.layer_number + self.config.num_layers
+        else:
+            layer_number = self.layer_number
+        return LMSTESignalTracker.apply(scores, valid, kind, layer_number, num_layers)
 
     def _save_router_metrics(
         self,
@@ -2083,6 +2245,20 @@ class TopKRouter(Router):
                     self.config.init_moe_router_zero and not use_weighter_for_selection
                 ),
             )
+            eval_selection_ranks = moe_router_eval_selection_ranks()
+            if eval_selection_ranks is not None and not self.training:
+                # Alternate eval pass: use the experts at these router-score ranks in place of
+                # the top-k; the weighter then weights the chosen experts as usual.
+                rank_scores, _ = self._margin_input_for_ste(logits, detached=True)
+                ranked_indices = torch.topk(
+                    rank_scores, k=max(eval_selection_ranks), dim=-1
+                ).indices
+                selection_topk_indices = ranked_indices[
+                    :, [rank - 1 for rank in eval_selection_ranks]
+                ]
+                routing_map = torch.zeros_like(routing_map).scatter_(
+                    1, selection_topk_indices, True
+                )
             if moe_router_weighting_eval_enabled() or weighter_logits is not None:
                 weighting_logits = (
                     logits if moe_router_weighting_eval_enabled() else weighter_logits
@@ -2265,14 +2441,31 @@ class TopKRouter(Router):
                 accepted_counterfactual_map = (
                     counterfactual_routing_map & dispatch_routing_map
                 )
-                probs = self._apply_counterfactual_routing_lm_ste(
-                    probs,
-                    logits_for_lm_ste,
-                    counterfactual_selected_indices,
-                    counterfactual_extra_indices,
-                    accepted_counterfactual_map,
-                    padding_mask=padding_mask,
-                )
+                extra_experts_signal = self.config.moe_router_lm_loss_extra_experts_signal
+                if extra_experts_signal == "addition":
+                    probs = self._apply_counterfactual_addition_lm_ste(
+                        probs,
+                        logits_for_lm_ste,
+                        weighter_input,
+                        counterfactual_selected_indices,
+                        counterfactual_extra_indices,
+                        accepted_counterfactual_map,
+                        padding_mask=padding_mask,
+                    )
+                else:
+                    probs = self._apply_counterfactual_routing_lm_ste(
+                        probs,
+                        logits_for_lm_ste,
+                        counterfactual_selected_indices,
+                        counterfactual_extra_indices,
+                        accepted_counterfactual_map,
+                        padding_mask=padding_mask,
+                        weighter_input=(
+                            weighter_input
+                            if extra_experts_signal == "weighted_replacement"
+                            else None
+                        ),
+                    )
             elif (
                 self.use_separate_weighter
                 and self.config.moe_lm_loss_ste_normalized_relative

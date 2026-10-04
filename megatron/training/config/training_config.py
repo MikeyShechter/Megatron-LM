@@ -145,6 +145,12 @@ class ValidationConfig:
     """On regular validation data, replay the same batches with the split router performing both
     expert selection and combine weighting, using moe_weighter_activation for valid weights."""
 
+    eval_router_selection_ranks: Optional[str] = None
+    """Split routers only: on regular validation data, also replay the same batches with every token
+    routed to the experts at these router-score ranks in place of its top-k, and log
+    val/router_ranks_<ranks>/lm_loss. Rank sets are separated by spaces and ranks by commas, for
+    example "1,3 3,4"; each set lists moe_router_topk ranks."""
+
     test_mode: bool = False
     """Run all real-time test alongside the experiment."""
 

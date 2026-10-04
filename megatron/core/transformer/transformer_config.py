@@ -754,7 +754,22 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_lm_loss_extra_experts: int = 0
     """Number of extra split-router experts to execute for the counterfactual LM routing STE.
     The regular top-k experts determine the forward output. Extra experts are used only to
-    estimate the LM-loss effect of pairwise swaps with selected experts. Zero disables it."""
+    estimate the LM-loss routing signal chosen by moe_router_lm_loss_extra_experts_signal.
+    Zero disables it."""
+
+    moe_router_lm_loss_extra_experts_signal: Literal[
+        'replacement', 'weighted_replacement', 'addition'
+    ] = 'replacement'
+    """Counterfactual LM routing signal computed from the extra split-router experts.
+    'replacement' averages the pairwise swap signal `grad_y dot (h_extra - h_selected)` over all
+    selected-extra pairs, without weighter values. 'weighted_replacement' averages
+    `grad_y dot (y_swap - y)` instead, the first-order change in the LM loss when the weighter
+    mixture uses the extra expert in place of the selected one. 'addition' gives every selected
+    expert `g_i * grad_y dot (h_i - y)`, the derivative of softly including it in the weighter
+    mixture, and every extra expert `q_j / (Z + q_j) / m * grad_y dot (h_j - y)`, the change when
+    it is added at full weight (q are the weighter weights, Z their total over the selected
+    experts). This is the rect STE signal on a fixed set of extra experts, with a unit slope in
+    place of 1/width."""
 
     moe_learnable_bias_sqrtsoftplus: bool = False
     """Apply sqrtsoftplus activation to learnable MoE routing bias outputs."""
