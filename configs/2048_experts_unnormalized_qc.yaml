@@ -1,0 +1,115 @@
+# Unnormalized quantile correction (height 1 in each expert's window) without a split router: 9 runs.
+# Sigmoid, no bias: lambda 0.01 / 0.1 / 1 (normalized: 3.2383 @ 1.0 at 0.01, collapsed at 0.1 and 1).
+# Sigmoid + per-token bias, LR tied to lambda (as eblyy2pd): lambda 0.1 / 1 (normalized: 3.218 @ 0.63, 3.2481 @ 0.50).
+# Softmax, no bias: lambda 0.001 / 0.01 / 0.1 / 1 (normalized: 3.296 @ 23 at 0.001, collapsed from 0.01 on).
+# Copy of 2048_experts_fd_base.yaml. Changed: name; LB type, QC flags, width 0 (unused); LIST_GROUP (score function inside).
+job_details:
+  name: experts2048_every2_unnormalized_qc
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+  num_experts: [2048]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]      # same per-expert shape as the 256-expert configuration
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+
+  # ── Load balancing: unnormalized quantile correction ──────────────────────────
+  moe_router_load_balancing_type: ["quantile_correction_ste"]
+  quantile_correction_unnormalized: [true]
+  quantile_correction_mean_local: [true]
+  load_balance_ste_type: ["rect"]
+  load_balance_ste_width: [0.0]
+  moe_ste_rect_poistion: ["topk"]
+
+  # ── Groups: same 5 keys in every entry ────────────────────────────────────────
+  LIST_GROUP:
+    - moe_router_score_function: ["sigmoid"]                  # sigmoid, no bias: 3 runs
+      moe_learnable_bias_type: ["none"]
+      tie_learnable_bias_lr_to_aux_loss_coeff: [false]
+      detatch_per_token_bias_input: [false]
+      moe_aux_loss_coeff: [0.01, 0.1, 1.0]
+    - moe_router_score_function: ["sigmoid"]                  # sigmoid, per-token bias, as eblyy2pd: 2 runs
+      moe_learnable_bias_type: ["per_token_bias"]
+      tie_learnable_bias_lr_to_aux_loss_coeff: [true]
+      detatch_per_token_bias_input: [true]
+      moe_aux_loss_coeff: [0.1, 1.0]
+    - moe_router_score_function: ["softmax"]                  # softmax, no bias: 4 runs
+      moe_learnable_bias_type: ["none"]
+      tie_learnable_bias_lr_to_aux_loss_coeff: [false]
+      detatch_per_token_bias_input: [false]
+      moe_aux_loss_coeff: [0.001, 0.01, 0.1, 1.0]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]

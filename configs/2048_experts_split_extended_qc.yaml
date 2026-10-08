@@ -1,0 +1,109 @@
+# Extended-window quantile correction with the split router-weighter: 3 lambdas x 2 heights = 6 runs.
+# The window covers every token on the far side of the QB-corrected boundary (all tokens unselected after the
+# correction for overloaded experts, all selected after it for underloaded ones). Height 1/width or 1.
+# Same split setup as the best normalized run pj2yuna0 (softmax weighter, router bias, lambda 0.1: 3.2186 @ 0.53).
+# Copy of 2048_experts_fd_base.yaml. Changed: name; the split-router keys; LB type, QC flags, width 0 (unused), lambda.
+job_details:
+  name: experts2048_every2_split_extended_qc
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+  num_experts: [2048]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]      # same per-expert shape as the 256-expert configuration
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  moe_router_score_function: ["softmax"]
+  moe_learnable_bias_type: ["none"]
+
+  # ── Split router-weighter (as pj2yuna0) ───────────────────────────────────────
+  moe_router_use_separate_weighter: [true]
+  moe_weighter_activation: ["softmax"]
+  moe_router_enable_bias: [true]
+  moe_lm_loss_ste_normalized_relative: [true]
+  eval_split_router_with_weighter: [true]
+  eval_split_router_with_router_weights: [true]
+
+  # ── Load balancing: extended-window quantile correction, both heights ───────────────────────────────
+  moe_router_load_balancing_type: ["quantile_correction_ste"]
+  quantile_correction_extended_window: [true]
+  quantile_correction_unnormalized: [false, true]   # height 1/width (false) or 1 (true)
+  quantile_correction_mean_local: [true]
+  moe_aux_loss_coeff: [0.001, 0.01, 0.1]
+  load_balance_ste_type: ["rect"]
+  load_balance_ste_width: [0.0]
+  moe_ste_rect_poistion: ["topk"]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]
