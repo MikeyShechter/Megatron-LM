@@ -83,8 +83,42 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
   - `--moe-balance-update-start-iter X` (added 2026-10-01) holds the initial value until iteration X.
 
   With `--moe-router-enable-expert-bias` the controller moves `moe_router_bias_update_rate` instead.
-- `train/moe_router_bias_update_rate`: the DeepSeek expert-bias update rate. Logged only with
+- `train/moe_router_bias_update_rate`: the DeepSeek expert-bias update rate; with
+  `--moe-router-bias-update-type id` it is ID Balancing's integral gain K_i, and with `proportional` (added
+  2026-10-06) the u of Loss-Free's b += u·e, e = n̄ − n_e in token counts of the global batch. Logged only with
   `--moe-router-enable-expert-bias`.
+- `train/id_balancing/gate_frac` (added 2026-10-04): logged only with `--moe-router-bias-update-type id`. Per layer,
+  the fraction of experts whose derivative gate was open in this step's bias update: g_e = 1[e_prev·(e − e_prev) > 0],
+  with e = (n̄ − n_e)/n̄ from the step's global token counts, i.e. the expert's load error grew without crossing
+  zero. Mean over layers. 0 at the first step. The paper (arXiv 2609.39137, Fig. 4a) sees about 0.38 early and 0.25
+  later (U:3333-3343, U:3677-3713, R:2105).
+- `train/expert_bias/{abs_delta,std,range}` (added 2026-10-04): the balancing bias of the loss-free methods, i.e.
+  `expert_bias` with `--moe-router-enable-expert-bias` (`sign` or `id` update) or `qb_beta` with
+  `quantile_balancing`. Per layer, at this step's global-batch update, then mean over layers:
+  - `abs_delta`: mean over experts of |Δb_e − mean_e Δb_e|. The common shift is removed because it does not change
+    routing (ID and QB biases are zero-mean anyway; DeepSeek `sign` is not). With `sign` this is ≈ the update rate by
+    construction. The paper's bias-drift plot (Fig. 5a) is |Δb| between checkpoints 1k steps apart instead.
+  - `std`: standard deviation of the bias over experts after the update.
+  - `range`: max − min of the bias over experts. Compare to the score scale: a range above 1 with sigmoid scores
+    can override the router entirely.
+
+  Bias units are those of the selection scores: sigmoid/sqrtsoftplus scores, or logits for softmax
+  (U:3318-3331, R:2105). For `quantile_balancing` the bias is on the logits for every score function, unless
+  `moe_router_quantile_balancing_on_scores` (added 2026-10-07) puts it on the activated scores. With `--moe-router-expert-bias-post-softmax` (added 2026-10-06) the softmax bias is added
+  to the softmax probabilities, so its units are probabilities, and `vio/QBShift*` are then in probability units
+  too.
+- `train/vio/*` (added 2026-10-04): per-step load violations of the step's global batch (attempted assignments
+  summed over micro-batches and ranks), the per-step metrics of the ID Balancing paper (Eq. 13). Unlike `vio/*`
+  they are logged every iteration, so early spikes are visible; take max over steps from `raw()`, since the
+  `train` table averages over 50-step windows.
+  - `train/vio/MaxVioBatch`: per-layer MaxVio, mean over layers. The same value the MaxVio controller reads.
+    `train/vio/MaxVioBatchWorstLayer`: max over layers.
+  - `train/vio/MinVioBatch`: per layer 1 − E·min_e f_e, mean over layers. `train/vio/MinVioBatchWorstLayer`: max over
+    layers.
+  - `train/vio/Top10PctShare`: share of assignments that go to the busiest ⌈0.1·E⌉ experts (205 for E=2048); mean
+    over layers. ≈ 0.10 when balanced (paper Fig. 4c).
+
+  (U:3304-3316)
 - `train/token_dropping/*`: logged only with a capacity factor. `train/metagrad_*`: logged only with `--metagrad-params`.
 - `train/quantile_correction/*`: present in a few old runs only; the definition is not in the current code.
 
@@ -101,7 +135,19 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
   - `vio/ZeroLoadFracGlobal`: fraction of experts with no assignment in the whole eval pass (unused experts).
   - `vio/LowLoadFracGlobal`: fraction of experts below 10% of their fair share (almost unused).
   - `vio/LoadP10Global`: 10th percentile of f_e·E over experts.
-- The train-time MaxVioGlobal is not logged; it only drives the coefficient controller.
+  - `vio/ZeroLoadFrac/Layer N` (added 2026-10-04): the unused-expert fraction per layer, N as in `vio/MaxVio/Layer N`.
+- Distance to balance in logit units (added 2026-10-05, every run, regular validation only):
+  `vio/QBShiftAbsP50Global`, `vio/QBShiftAbsP90Global`, `vio/QBShiftAbsMaxGlobal`, and
+  `vio/QBShiftAbsP50/Layer N`.
+  - Per expert: the Quantile-Balancing shift δb_e that would give it exactly its fair share N·K/E, holding the
+    token thresholds fixed (margins vs the (K+1)-th score; the same δb_e quantile correction uses). It is the
+    signed mean over the eval calls, then its absolute value; P50 / P90 / max over experts, mean over layers.
+  - Units are those of the selection scores (logits without selection biases). Compare it with the rect half-width
+    r = w/2: when most experts need to move by more than r, a fixed window cannot reach the tokens that must flip.
+  - Computed from each rank's local micro-batch and averaged over the load-balancing group
+    (`quantile_correction_mean_local` style); quantile-correction runs reuse their own δb_e.
+- The train-time MaxVio is logged per step as `train/vio/MaxVioBatch` since 2026-10-04 (see train/*); before
+  that it only drove the coefficient controller.
 
 ## val/* (at every eval and once after training; T:4211-4511)
 - `val/regular/lm_loss`: LM loss on the held-out regular validation set.
@@ -162,6 +208,23 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
     can barely move.
 - `ste/all_layers/window_experts_empty_frac`: the fraction of (layer, expert) pairs with no in-window pair at
   radius r over the whole eval pass. These experts get no STE gradient at all.
+- Per layer (added 2026-10-04): `ste/window_frac_{half_r,1r,2r,4r}/Layer N` and
+  `ste/window_experts_empty_frac/Layer N`, the same quantities for MoE layer N (0-based global layer index, as in
+  `vio/MaxVio/Layer N`). The rect STE balances layer by layer: a layer's window stays empty until its logits
+  compress to the window scale, then fills within ~100 steps (c7ckylsu: layers 2–10 at step ~810, layer 0 never), so
+  the all-layer averages can hide one stuck layer.
+- Which side of the boundary the window spends its gradient on (added 2026-10-05; rect and higher_order_rect only).
+  The load error sign of each expert comes from its pooled eval load n_e vs its fair share q = assignments / E.
+  - `ste/all_layers/window_useful_frac` (and `ste/window_useful_frac/Layer N`): the fraction of in-window pairs on
+    the useful side, i.e. selected pairs of overloaded experts and unselected pairs of underloaded experts: the
+    pairs whose flip would reduce the load error. The rest of the window pushes pairs that change no load away from
+    the boundary. Quantile correction is 1 by construction.
+  - `ste/all_layers/window_need_coverage_p10|median`: per expert, useful in-window pairs / |n_e − q| (the flips
+    that are needed); 10th percentile and median over experts, mean over layers. Values ≫ 1 mean the window holds
+    far more pairs than balance needs; 0 means the STE gives that expert nothing to fix it with.
+  - `ste/all_layers/window_unreachable_frac` (and `ste/window_unreachable_frac/Layer N`): the fraction of experts
+    off balance by at least 10% of q with no useful in-window pair at all. These experts can only recover through
+    other experts' gradients (the dead-expert phase).
 - How to use them: check after the first evals of a sweep, e.g.
   `q.py curve ste/all_layers/window_frac_1r --sweep X --steps 150,300,600`.
   - An empty window (`window_frac_1r` × E ≲ 0.3), or `window_experts_empty_frac` above ~0.01, early in training
@@ -172,6 +235,9 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
 - `router_logits/top1|top2|avg_pre_activation`: per-token largest and second-largest logit, and the mean over all
   logits, before the activation. They include learnable `*_weight` biases but never the DeepSeek expert bias; with
   a split router they are the selection head's logits. `weighter_logits/*`: the same for the weighter's logits.
+- `router_logits/std_pre_activation` (added 2026-10-05, and `router_logits/std_pre_activation/Layer N`): the
+  standard deviation of a token's router logits over all experts, averaged over tokens (and layers for the
+  all-layer key). The direct measure of logit compression; compare with the STE half-width r.
 - `router_bias/expert/*`: the learnable per-expert bias (top1/top2/mean over experts).
 - `router_bias/token/*`: the per-token bias from the learnable projection. `router_bias/both/*`: the token +
   expert sum.
@@ -182,10 +248,70 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   - `weighted_vs_assignment_l1` = Σ_e |W_e − f_e|, combine-weight mass vs load
   - `per_expert_mean_selected_weight_min|max`
 - `quantile_correction/delta_b_e/{mean,max,min}`: the per-expert shift that would give every expert exactly N·K/E
-  tokens (from topk_plus_one margins); mean / max / min over (layer, expert). Logged only with
-  `quantile_correction_ste`.
+  tokens (from topk_plus_one margins, or exact margins with `quantile_correction_exact_margin`); mean / max / min
+  over (layer, expert). Logged only with `quantile_correction_ste`.
 - `quantile_correction/affected_token_expert_fraction`: the fraction of (token, expert) pairs whose selection would
-  flip under that shift.
+  flip under that shift. This is the fraction of pairs inside the quantile-correction windows. Each expert's window
+  holds exactly |n_e − q| tokens, so it equals Σ_e |n_e − q| / (N·E) = K·TotalVio / E² on the same batch (about
+  1–2× the eval-pooled `vio/TotalVioGlobal` value, since each eval batch is noisier than the pooled loads).
+- `quantile_correction/ste_height_max` (added 2026-10-05): the largest per-token STE height 1/|δb_e| over experts
+  with a non-empty window, i.e. 1 / (the narrowest window). With `quantile_correction_unnormalized` the height is
+  1 everywhere, and this key is still 1 / (the narrowest window).
+- Config `quantile_correction_unnormalized` (added 2026-10-05): the quantile-correction STE uses height 1 inside each
+  expert's window instead of 1/|δb_e|, so the window width does not set the gradient scale. Each expert's total STE
+  weight is then |n_e − q| (the number of flips needed) instead of about the token density at its boundary.
+- Config `quantile_correction_extended_window` (added 2026-10-06): each expert's quantile-correction STE window
+  extends from the tokens the QB shift flips to every token on the far side of the QB-corrected boundary. For an
+  overloaded expert, that is all tokens unselected after the correction (about N − q tokens). For an underloaded
+  expert, it is all tokens selected after it (q tokens). Independent of `quantile_correction_unnormalized`: the
+  normalized height is 1/width, where the width runs from the corrected boundary to the farthest token in the window
+  over the load-balancing batch, so it is much smaller than 1/|δb_e|. `quantile_correction/ste_height_max` and
+  `affected_token_expert_fraction` still describe the flip window, not the extended one.
+- Config `quantile_correction_count_normalized` (added 2026-10-06): scales each expert's STE height by
+  q / (tokens in its window), q = its fair share of the load-balancing batch, so every expert's window carries
+  a total weight of q. With height 1, each expert's total push is then 2λ(f_e − 1/E): it depends only on the load
+  error, not on the batch size or the window size (the q factor cancels the loss's 1/(T·K)). Combines with
+  `quantile_correction_unnormalized` (height 1 vs 1/width) and `quantile_correction_extended_window`.
+- Config `quantile_correction_exact_margin` (added 2026-10-07): quantile-correction margins against the expert each
+  pair would swap with, i.e. the runner-up for selected pairs and the token's weakest selected expert for unselected
+  pairs (the `exact_margin` position), instead of against the runner-up for every pair. Each expert's window then
+  holds exactly the |n_e − q| tokens that a bias on that expert alone would flip. Against the runner-up, each token's
+  runner-up sits at margin exactly 0. An underloaded expert short by fewer tokens than it is runner-up for (about
+  q/K) then gets δb_e = 0 and an empty window. In a toy at E=2048 ratios this hit 23–71% of underloaded experts, more
+  near balance and with more tokens. It likely also explains the very large `quantile_correction/ste_height_max`
+  values with `quantile_correction_mean_local`.
+- Config `moe_quantile_estimator` (added 2026-10-07): how per-expert quantiles of the global batch are computed for
+  `quantile_balancing` (`qb_beta`), quantile correction (δb_e) and the `fixed_number_boundary_ste` radius.
+  - `legacy` (default): the previous estimate of each method. QB averages per-rank quantiles (Su/Dial); QC gathers
+    every margin, or averages per-rank quantiles with `quantile_correction_mean_local`; fixed-N gathers every
+    margin (about 4 GB per layer per step at E=2048).
+  - `histogram`: Kimi K3 (tech report App. D). Per-expert histograms with `moe_quantile_histogram_bins` uniform
+    bins (default 1000) are all-reduced, and the quantile is interpolated linearly inside the selected bin; the
+    error is at most one bin width. For QB on sigmoid scores the bins span [min(qb_beta) − 1, max(qb_beta) + 1]
+    as in Kimi K3; otherwise each expert's global min/max (one extra small all-reduce).
+  - `exact`: Exact Quantile Balancing (arXiv 2609.28053). Two all-reduced 256-bin histograms over the bfloat16 bit
+    pattern give the exact quantile of the bfloat16-rounded values.
+
+  Both new estimators are partition invariant and all-reduce only counts. QB pools its margins over the step's
+  microbatches and the data-parallel group at finalize (the bias applies from the next step); QC and fixed-N compute
+  theirs in the forward pass over the load-balancing group.
+- Config `moe_router_quantile_balancing_on_scores` (added 2026-10-07): quantile balancing on the activated scores
+  instead of the logits. Top-k is taken on `score_function(logits) − qb_beta`, so `qb_beta` and
+  `train/expert_bias/*` are in score units. With sigmoid this is Kimi K3's recipe. The combine weights stay the
+  unbiased scores. Plain router only.
+- Config `moe_load_balance_ste_post_activation` (added 2026-10-07): the STE load-balancing gradient enters at the
+  normalized router scores π (the aux-loss scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by
+  their sum) instead of the logits. Which tokens get gradient still comes from the logit margins. With a margin
+  kernel, the gradient goes to π_te − π_ref against the same threshold expert (π_te alone with
+  `moe_load_balance_ste_detach_threshold`). With the full STE and `centered_fsq`, the gradient is exactly the aux
+  loss's at top-k 2. Applies to `centered_fsq` (rect, triangle, tanh, higher_order_rect, full),
+  `quantile_correction_ste` and `fixed_number_boundary_ste`. It has no effect with a selection bias (DeepSeek or a
+  selection-only learnable bias).
+- Config `moe_load_balance_ste_mass_normalized` (added 2026-10-07): every expert's STE kernel is scaled to a total
+  mass of T, the tokens in the load-balancing batch (the full STE's mass). Each expert's total push is then the same
+  for the same load error, whatever the kernel; the kernel only spreads it over tokens. Windowed kernels get height
+  T / (tokens in the window). For quantile correction this replaces the height options (1/|δb_e|, unnormalized,
+  count-normalized). Same load-balancing types as the post-activation option.
 
 ## Downstream tasks (validation sets added after "regular"; run at every eval; `--skip-task-eval` turns them off)
 - `--task-eval-tasks dclm-core-22` means 20 lm-eval-harness tasks:

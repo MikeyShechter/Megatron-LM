@@ -21,7 +21,11 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import (
+    get_id_balancing_updated_expert_bias,
+    get_updated_expert_bias,
+    qb_global_beta,
+)
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -329,6 +333,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
             if getattr(module, 'qb_beta_accum', None) is not None:
                 module.qb_beta_accum.zero_()
                 module.qb_beta_count.zero_()
+            if getattr(module, 'qb_margin_buffer', None):
+                module.qb_margin_buffer.clear()
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
@@ -338,6 +344,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     """
     tokens_per_expert_list = []
     expert_bias_list = []
+    router_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             # Only update expert_bias if this module is in the training mode. There are special
@@ -347,17 +354,41 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             if hasattr(module, 'expert_bias') and module.training:
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+                router_list.append(module)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
-    )
+    if config.moe_router_bias_update_type == "id":
+        stacked_prev_error = torch.stack(
+            [router.expert_bias_prev_error for router in router_list], dim=0
+        )
+        stacked_updated_expert_bias, stacked_error, stacked_gate = (
+            get_id_balancing_updated_expert_bias(
+                stacked_tokens_per_expert,
+                stacked_expert_bias,
+                stacked_prev_error,
+                config.moe_router_bias_update_rate,
+                config.moe_router_bias_derivative_rate,
+            )
+        )
+        for router, error in zip(router_list, stacked_error):
+            router.expert_bias_prev_error.copy_(error)
+    else:
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            stacked_tokens_per_expert,
+            stacked_expert_bias,
+            config.moe_router_bias_update_rate,
+            proportional=config.moe_router_bias_update_type == "proportional",
+        )
+        stacked_gate = [None] * len(router_list)
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    for router, updated_expert_bias, gate in zip(
+        router_list, stacked_updated_expert_bias, stacked_gate
+    ):
+        router.save_bias_update_metrics(router.expert_bias, updated_expert_bias, gate)
+        router.expert_bias.copy_(updated_expert_bias)
 
 
 def _update_router_qb_beta(
@@ -369,32 +400,58 @@ def _update_router_qb_beta(
     qb_beta_list = []
     qb_beta_accum_list = []
     qb_beta_count_list = []
+    router_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if getattr(module, 'qb_beta_accum', None) is not None and module.training:
                 qb_beta_list.append(module.qb_beta)
                 qb_beta_accum_list.append(module.qb_beta_accum)
                 qb_beta_count_list.append(module.qb_beta_count)
+                router_list.append(module)
 
     if len(qb_beta_list) == 0:
         return
 
     stacked_beta = torch.stack(qb_beta_list, dim=0)
-    local_avg_list = [
-        accum / count.clamp(min=1).to(accum.dtype)
-        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
-    ]
-    stacked_local_avg = torch.stack(local_avg_list, dim=0)
+    estimator = config.moe_quantile_estimator
+    if estimator == "legacy":
+        local_avg_list = [
+            accum / count.clamp(min=1).to(accum.dtype)
+            for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
+        ]
+        stacked_local_avg = torch.stack(local_avg_list, dim=0)
 
-    torch.distributed.all_reduce(
-        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
-    )
+        torch.distributed.all_reduce(
+            stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+        )
+    else:
+        # Quantile of the pooled global batch: every rank's margins from this step's
+        # microbatches, combined through all-reduced histograms (Kimi K3 or EQB).
+        global_beta_list = []
+        for router in router_list:
+            margins = torch.cat(router.qb_margin_buffer, dim=0)
+            router.qb_margin_buffer.clear()
+            global_beta_list.append(
+                qb_global_beta(
+                    margins,
+                    router.topk,
+                    config.num_moe_experts,
+                    dp_cp_group,
+                    estimator,
+                    num_bins=config.moe_quantile_histogram_bins,
+                    value_range=(
+                        router.qb_histogram_value_range() if estimator == "histogram" else None
+                    ),
+                )
+            )
+        stacked_local_avg = torch.stack(global_beta_list, dim=0)
 
     ema = config.moe_router_quantile_balancing_ema
     stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
     stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
 
-    for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+    for router, qb_beta, new_beta in zip(router_list, qb_beta_list, stacked_new_beta):
+        router.save_bias_update_metrics(qb_beta, new_beta)
         qb_beta.copy_(new_beta)
 
 

@@ -793,11 +793,56 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    moe_router_bias_update_type: Literal['sign', 'id', 'proportional'] = 'sign'
+    """Expert-bias update rule used with `moe_router_enable_expert_bias`, once per global batch.
+    "sign" is DeepSeek's b += rate * sign(e). "proportional" is the b += rate * e variant of
+    Loss-Free Balancing (https://arxiv.org/abs/2408.15664, Sec. 4.3 and App. C), with e =
+    mean_load - load in assigned-token counts of the global batch, as in their Algorithm 1.
+    "id" is ID Balancing (https://arxiv.org/abs/2609.39137):
+    b += rate * e + derivative_rate * g * (e - e_prev),
+    then b -= mean(b), where e = (mean_load - load) / mean_load is the normalized load error and
+    g = 1[e_prev * (e - e_prev) > 0] opens only while the imbalance is growing."""
+
+    moe_router_bias_derivative_rate: float = 0.0
+    """Derivative gain K_d of ID Balancing (`moe_router_bias_update_type` "id"). The integral gain
+    K_i is `moe_router_bias_update_rate`. The paper uses K_i = K_d = 6e-3 with sigmoid scores."""
+
+    moe_router_expert_bias_post_softmax: bool = False
+    """With the softmax score function, add the expert bias of `moe_router_enable_expert_bias` to
+    the softmax probabilities over all experts before top-k, as Loss-Free Balancing does
+    (https://arxiv.org/abs/2408.15664, Eq. 3 with a softmax gate), instead of to the logits.
+    The bias then has probability units. Sigmoid and sqrtsoftplus always add it to the scores.
+    Plain router only; the split router keeps its own selection rule."""
+
     moe_router_quantile_balancing_ema: float = 0.0
     """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
     updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
     no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+
+    moe_router_quantile_balancing_on_scores: bool = False
+    """Quantile balancing on the activated router scores instead of the logits: top-k is taken
+    on `score_function(logits) - qb_beta`, and the margins and bias are in score units. With
+    sigmoid this is Kimi K3's recipe (bias added to the sigmoid scores). The combine weights stay
+    the unbiased scores either way. Plain router only; the split router always uses its
+    selection scores."""
+
+    moe_quantile_estimator: Literal['legacy', 'histogram', 'exact'] = 'legacy'
+    """How per-expert quantiles of the global batch are computed for quantile balancing
+    (`qb_beta`), quantile correction (delta_b) and the fixed-number boundary radius.
+    "legacy" keeps each method's previous estimate: quantile balancing averages per-rank
+    quantiles; quantile correction gathers every margin or, with
+    `quantile_correction_mean_local`, averages per-rank quantiles; the boundary radius gathers
+    every margin. "histogram" pools per-expert histograms over the load-balancing group and
+    interpolates inside the selected bin (Kimi K3, App. D; error at most one bin width).
+    "exact" pools two 256-bin histograms over the bfloat16 bit pattern and returns the exact
+    quantile of the bfloat16-rounded values (Exact Quantile Balancing, arXiv 2609.28053). Both
+    are partition invariant and all-reduce only histogram counts."""
+
+    moe_quantile_histogram_bins: int = 1000
+    """Number of uniform bins for `moe_quantile_estimator` "histogram". Kimi K3 uses 1000. With
+    sigmoid-score quantile balancing the bins span [min(qb_beta) - 1, max(qb_beta) + 1], as in
+    Kimi K3; otherwise they span each expert's global min/max (one extra small all-reduce)."""
 
     moe_qb_projection_temperature: float = 1.0
     """Temperature used only by the QB projection distillation probability transform."""
@@ -871,6 +916,51 @@ class TransformerConfig(ModelParallelConfig):
     quantile_correction_mean_local: bool = False
     """Compute each rank's quantile-correction bias locally and average the resulting
     per-expert biases over the load-balancing group instead of gathering all margins."""
+
+    quantile_correction_unnormalized: bool = False
+    """Give the quantile-correction STE derivative height 1 inside each expert's window instead
+    of 1/|delta_b_e|, so the window width (the per-expert QB shift) does not change the scale."""
+
+    quantile_correction_extended_window: bool = False
+    """Extend each expert's quantile-correction STE window from the tokens whose assignment the QB
+    shift flips to every token on the far side of the QB-corrected boundary: all tokens selected
+    after the correction for underloaded experts, all tokens unselected after it for overloaded
+    experts. Independent of quantile_correction_unnormalized: the normalized height is
+    1/width, where the width spans from the corrected boundary to the farthest token in the
+    window over the load-balancing batch."""
+
+    quantile_correction_count_normalized: bool = False
+    """Scale each expert's quantile-correction STE height by q / (tokens in its window), with q
+    its fair share of the load-balancing batch, so every expert's window carries a total weight
+    of q. Combines with quantile_correction_unnormalized and quantile_correction_extended_window."""
+
+    quantile_correction_exact_margin: bool = False
+    """Measure quantile-correction margins against the expert each pair would swap with: the
+    runner-up for selected pairs and the token's weakest selected expert for unselected pairs
+    (the `exact_margin` position), instead of against the runner-up for every pair. Then each
+    expert's window holds exactly the |n_e - q| tokens that a bias on that expert alone would
+    flip. Against the runner-up, every token's runner-up sits at margin exactly 0, and an
+    underloaded expert short by fewer tokens than it is runner-up for gets delta_b = 0 and no
+    window."""
+
+    moe_load_balance_ste_post_activation: bool = False
+    """Send the STE load-balancing gradient into the normalized router scores (the aux-loss
+    scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by their sum over
+    experts) instead of the logits. Which tokens get gradient, and how much, still comes from the
+    logit-space margins; with a margin kernel the gradient goes to the score margin against the
+    same threshold expert (detached with `moe_load_balance_ste_detach_threshold`). With the full
+    STE and `centered_fsq` this is exactly the aux loss (at top-k 2; 2/k times it otherwise).
+    Applies to `centered_fsq` (rect, triangle, tanh, higher_order_rect, full),
+    `quantile_correction_ste` and `fixed_number_boundary_ste`. Has no effect when a selection
+    bias (DeepSeek or a selection-only learnable bias) is active."""
+
+    moe_load_balance_ste_mass_normalized: bool = False
+    """Scale each expert's STE kernel to a total mass of T, the number of tokens in the
+    load-balancing batch (the mass of the full STE). Every kernel then gives each expert the same
+    total push for the same load error, and the kernel only decides how it is spread over tokens.
+    For windowed kernels the height becomes T / (tokens in the window). Applies to the same
+    load-balancing types as `moe_load_balance_ste_post_activation`. For quantile correction it
+    replaces the height options (unnormalized, count-normalized, 1/|delta_b|)."""
 
     metagrad_params: str = "none"
     """Meta-gradient-controlled load-balance parameters: none, width, coeff, or width_and_coeff."""

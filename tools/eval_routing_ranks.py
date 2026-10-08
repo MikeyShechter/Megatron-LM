@@ -1,11 +1,12 @@
 #!/e/project1/laionize/shechter1/miniforge3/envs/megatron-submit/bin/python
 """Evaluate a trained split-router run with tokens routed to lower router ranks, and read its LM STE signal.
 
-  eval_routing_ranks.py submit <run dir> [--ranks "1,3 3,4"] [--iters 20]   write a spec and sbatch it
-  eval_routing_ranks.py report <analysis dir>                                print the results
+  eval_routing_ranks.py submit <run dir> [--ranks "1,3 3,4"] [--iters 20] [--signal S]   write a spec, sbatch it
+  eval_routing_ranks.py report <analysis dir>                                              print the results
 
 The job loads the run's latest checkpoint and trains --iters more iterations with every learning rate at 0, so
-the weights don't change; these iterations log the run's LM STE metrics (train/lm_ste/*) on the trained model.
+the weights don't change; these iterations log the LM STE metrics (train/lm_ste/*) on the trained model, for the
+run's own moe_router_lm_loss_extra_experts_signal or the one given by --signal.
 The final validation then evaluates eval_iters batches with the usual top-k routing and replays the same batches
 with each rank set routed instead (--eval-router-selection-ranks). The test eval uses the top-k.
 Nothing is written to the run dir: the outputs go to ANALYSIS_ROOT/<set>_<run>, and wandb logs offline to the
@@ -30,7 +31,7 @@ def cmd_submit(a):
     run_dir = Path(a.run_dir).resolve()
     spec = yaml.safe_load((run_dir / "spec.yaml").read_text())
     iteration = int((run_dir / "latest_checkpointed_iteration.txt").read_text())
-    out = ANALYSIS_ROOT / f"{run_dir.parent.name}_{run_dir.name}"
+    out = ANALYSIS_ROOT / f"{run_dir.parent.name}_{run_dir.name}{'_' + a.signal if a.signal else ''}"
     out.mkdir(parents=True)
     spec.pop("output_dir")  # it sets both save and load to the run dir
     spec.update(
@@ -49,6 +50,8 @@ def cmd_submit(a):
         wandb_save_dir=str(out / "wandb"),
         run_name=f"eval_routing_ranks_{out.name}",
     )
+    if a.signal:
+        spec["moe_router_lm_loss_extra_experts_signal"] = a.signal
     (out / "spec.yaml").write_text(yaml.safe_dump(spec, sort_keys=True))
     subprocess.run(
         ["sbatch", f"--output={out}/%j.out", f"--error={out}/%j.out",
@@ -118,6 +121,8 @@ def main():
     p.add_argument("run_dir")
     p.add_argument("--ranks", default="1,3 3,4", help='rank sets for the replayed evals, e.g. "1,3 3,4"')
     p.add_argument("--iters", type=int, default=20, help="zero-LR training iterations for the STE metrics")
+    p.add_argument("--signal", choices=["replacement", "weighted_replacement", "addition"],
+                   help="LM STE signal to measure, if not the run's own (the weights don't depend on it)")
     p = sub.add_parser("report")
     p.add_argument("analysis_dir")
     a = ap.parse_args()

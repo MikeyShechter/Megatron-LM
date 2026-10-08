@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.moe_utils import (
     moe_metagrad_enabled,
     qb_dual_update,
     qb_projection_distillation_loss_func,
+    quantile_correction_margin_position,
     router_gating_linear,
     save_to_aux_losses_tracker,
     save_to_metagrad_losses_tracker,
@@ -332,6 +333,12 @@ class TopKRouter(Router):
         self.input_jitter = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        # Loss-Free Balancing's softmax gate: the expert bias is added to softmax probabilities.
+        self.expert_bias_post_softmax = (
+            self.enable_expert_bias
+            and self.config.moe_router_expert_bias_post_softmax
+            and not self.use_separate_weighter
+        )
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
@@ -350,6 +357,16 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            if self.config.moe_router_bias_update_type == "id":
+                # ID Balancing's derivative term needs the previous global batch's load error.
+                self.register_buffer(
+                    'expert_bias_prev_error',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -407,6 +424,14 @@ class TopKRouter(Router):
             self.qb_beta = None
             self.qb_beta_accum = None
             self.qb_beta_count = None
+        # With a global quantile estimator, QB keeps the step's margins (one [tokens, experts]
+        # tensor per microbatch) until finalize pools them over the data-parallel group.
+        self.qb_margin_buffer = []
+        self.qb_on_scores = (
+            self.routing_type == "quantile_balancing"
+            and self.config.moe_router_quantile_balancing_on_scores
+            and not self.use_separate_weighter
+        )
 
         # Learnable routing biases (selection-only or routing-weight variants).
         self.learnable_bias_type = getattr(self.config, "moe_learnable_bias_type", "none")
@@ -501,6 +526,11 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'expert_bias_prev_error'):
+            if self.expert_bias_prev_error.dtype != torch.float32:
+                self.expert_bias_prev_error.data = self.expert_bias_prev_error.data.to(
+                    torch.float32
+                )
         if hasattr(self, 'qb_beta') and self.qb_beta is not None:
             if self.qb_beta.dtype != torch.float32:
                 self.qb_beta.data = self.qb_beta.data.to(torch.float32)
@@ -572,12 +602,10 @@ class TopKRouter(Router):
                 full_logits = logits_fp32
                 gather_rank = 0
 
-            full_indices, beta_local = qb_dual_update(
-                full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
+            qb_scores = (
+                self._compute_selection_scores(full_logits) if self.qb_on_scores else full_logits
             )
-            if should_update_beta:
-                self.qb_beta_accum.add_(beta_local)
-                self.qb_beta_count.add_(1)
+            full_indices = self._qb_select_and_record(qb_scores, should_update_beta)
 
             if gather_size > 1:
                 indices = full_indices[
@@ -595,6 +623,42 @@ class TopKRouter(Router):
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
         )
+
+    def _qb_select_and_record(self, scores: torch.Tensor, update_beta: bool) -> torch.Tensor:
+        """Top-k on `scores - qb_beta`; in training, also record what the bias update needs.
+
+        The legacy estimator accumulates this batch's own quantile. "histogram" and "exact" keep
+        the margins, so that finalize can take the quantile of the global batch.
+        """
+        if self.config.moe_quantile_estimator == "legacy":
+            indices, beta_local = qb_dual_update(
+                scores, self.topk, self.qb_beta, update_beta=update_beta
+            )
+            if update_beta:
+                self.qb_beta_accum.add_(beta_local)
+                self.qb_beta_count.add_(1)
+            return indices
+        indices, margins = qb_dual_update(
+            scores, self.topk, self.qb_beta, update_beta=update_beta, return_margins=True
+        )
+        if update_beta:
+            self.qb_margin_buffer.append(margins)
+        return indices
+
+    def qb_histogram_value_range(self):
+        """Kimi K3's histogram range for sigmoid scores, or None (use each expert's min/max).
+
+        With scores in (0, 1), every margin `s - alpha` lies in [min(qb_beta) - 1,
+        max(qb_beta) + 1], because the cutoff alpha is itself some expert's score minus its bias.
+        """
+        if self.use_separate_weighter:
+            score_function = self.router_selection_activation
+        else:
+            score_function = self.score_function if self.qb_on_scores else None
+        if score_function != "sigmoid":
+            return None
+        beta = self.qb_beta.float()
+        return (beta.min() - 1.0, beta.max() + 1.0)
 
     def split_quantile_balancing(
         self, logits: torch.Tensor
@@ -634,12 +698,7 @@ class TopKRouter(Router):
                 full_scores = scores_fp32
                 gather_rank = 0
 
-            full_indices, beta_local = qb_dual_update(
-                full_scores, self.topk, self.qb_beta, update_beta=should_update_beta
-            )
-            if should_update_beta:
-                self.qb_beta_accum.add_(beta_local)
-                self.qb_beta_count.add_(1)
+            full_indices = self._qb_select_and_record(full_scores, should_update_beta)
 
             if gather_size > 1:
                 indices = full_indices[
@@ -755,8 +814,13 @@ class TopKRouter(Router):
         selection_topk_indices: Optional[torch.Tensor] = None,
         selection_topk_plus_one_indices: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        scores_for_aux_loss: Optional[torch.Tensor] = None,
     ):
-        """Apply direct routed-load auxiliary losses for the given logits and routing map."""
+        """Apply direct routed-load auxiliary losses for the given logits and routing map.
+
+        `scores_for_aux_loss` (the normalized scores the aux loss uses) is where the STE gradient
+        enters with `moe_load_balance_ste_post_activation`.
+        """
         direct_loss_coeffs = []
         for load_balancing_type in DIRECT_LOAD_BALANCING_LOSS_TYPES:
             direct_aux_loss_coeff = self.get_aux_loss_coeff(load_balancing_type)
@@ -811,6 +875,33 @@ class TopKRouter(Router):
         quantile_correction_mean_local = getattr(
             self.config, "quantile_correction_mean_local", False
         )
+        quantile_correction_unnormalized = getattr(
+            self.config, "quantile_correction_unnormalized", False
+        )
+        quantile_correction_extended_window = getattr(
+            self.config, "quantile_correction_extended_window", False
+        )
+        quantile_correction_count_normalized = getattr(
+            self.config, "quantile_correction_count_normalized", False
+        )
+        # The post-activation path is defined for routers without a selection bias; with one,
+        # the margin input is already the biased selection score, and the flag has no effect.
+        load_balance_ste_post_scores = (
+            scores_for_aux_loss
+            if getattr(self.config, "moe_load_balance_ste_post_activation", False) and not biased
+            else None
+        )
+        new_ste_kwargs = dict(
+            quantile_correction_exact_margin=getattr(
+                self.config, "quantile_correction_exact_margin", False
+            ),
+            quantile_estimator=self.config.moe_quantile_estimator,
+            quantile_histogram_bins=self.config.moe_quantile_histogram_bins,
+            load_balance_ste_post_scores=load_balance_ste_post_scores,
+            load_balance_ste_mass_normalized=getattr(
+                self.config, "moe_load_balance_ste_mass_normalized", False
+            ),
+        )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             quantile_correction_delta_bias = (
                 self._quantile_correction_delta_bias_cache
@@ -839,6 +930,10 @@ class TopKRouter(Router):
                 quantile_correction_mean_local=quantile_correction_mean_local,
                 load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
                 load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
+                quantile_correction_unnormalized=quantile_correction_unnormalized,
+                quantile_correction_extended_window=quantile_correction_extended_window,
+                quantile_correction_count_normalized=quantile_correction_count_normalized,
+                **new_ste_kwargs,
             )
             metagrad_coeff_loss = None
             if self._metagrad_tracks("coeff"):
@@ -867,6 +962,10 @@ class TopKRouter(Router):
                         quantile_correction_mean_local=quantile_correction_mean_local,
                         load_balance_ste_boundary_fraction=load_balance_ste_boundary_fraction,
                         load_balance_ste_detach_threshold=load_balance_ste_detach_threshold,
+                        quantile_correction_unnormalized=quantile_correction_unnormalized,
+                        quantile_correction_extended_window=quantile_correction_extended_window,
+                        quantile_correction_count_normalized=quantile_correction_count_normalized,
+                        **new_ste_kwargs,
                     )
             metagrad_width_loss = None
             if (
@@ -1119,7 +1218,7 @@ class TopKRouter(Router):
         )
 
         def selection_scores():
-            if selection_score_function == "softmax":
+            if selection_score_function == "softmax" and not self.expert_bias_post_softmax:
                 return logits.float()
             return self._compute_selection_scores(logits)
 
@@ -1486,8 +1585,10 @@ class TopKRouter(Router):
             name: token_count.new_tensor(0.0) for name in ("half_r", "1r", "2r", "4r")
         }
         ste_window_expert_count = torch.zeros_like(tokens_per_expert)
+        ste_window_selected_expert_count = torch.zeros_like(tokens_per_expert)
         quantile_delta_bias = None
         quantile_affected_entry_count = token_count.new_tensor(0.0)
+        quantile_inv_window_width_max = token_count.new_tensor(0.0)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
         if (not self.training) and load_balance_ste_type == "full":
             # Preserve the existing STE-support metrics for comparisons: every
@@ -1531,13 +1632,21 @@ class TopKRouter(Router):
             ste_window_expert_count = (
                 boundary_entries & (abs_margin < support_radius)
             ).float().sum(dim=0)
+            # In-window pairs that are currently selected; the rest of the window is unselected.
+            ste_window_selected_expert_count = (
+                boundary_entries & (abs_margin < support_radius) & attempted_routing_map
+            ).float().sum(dim=0)
             ste_window_counts["1r"] = ste_window_expert_count.sum()
             ste_window_call_count = token_count.new_tensor(1.0)
 
         if self.has_aux_loss_type("quantile_correction_ste"):
             margin_input, _ = self._margin_input_for_ste(logits, detached=True)
             quantile_margin, quantile_valid_tokens = _load_balance_margin(
-                margin_input, attempted_routing_map, "topk_plus_one"
+                margin_input,
+                attempted_routing_map,
+                quantile_correction_margin_position(
+                    getattr(self.config, "quantile_correction_exact_margin", False)
+                ),
             )
             use_global_lb = getattr(self.config, "moe_use_global_lb", False)
             reduce_group = self.tp_dp_cp_group if use_global_lb else self.tp_cp_group
@@ -1548,6 +1657,8 @@ class TopKRouter(Router):
                 self.config.num_moe_experts,
                 reduce_group,
                 mean_local=getattr(self.config, "quantile_correction_mean_local", False),
+                estimator=self.config.moe_quantile_estimator,
+                num_bins=self.config.moe_quantile_histogram_bins,
             )
             self._quantile_correction_delta_bias_cache = quantile_delta_bias
             if not self.training:
@@ -1555,10 +1666,42 @@ class TopKRouter(Router):
                 corrected_assignment = (
                     quantile_margin + quantile_delta_bias.unsqueeze(0)
                 ) > 0.0
-                quantile_affected_entry_count = (
+                quantile_flips = (
                     (hard_assignment != corrected_assignment)
                     & quantile_valid_tokens.unsqueeze(-1)
-                ).float().sum()
+                ).float()
+                quantile_affected_entry_count = quantile_flips.sum()
+                # Largest per-token STE height 1/|delta_b_e| over experts with a non-empty window.
+                quantile_window_width = quantile_delta_bias.abs()
+                quantile_inv_window_width_max = torch.where(
+                    (quantile_flips.sum(dim=0) > 0) & (quantile_window_width > 0),
+                    1.0 / quantile_window_width.clamp(min=1e-12),
+                    torch.zeros_like(quantile_window_width),
+                ).max()
+
+        # Distance to balance in logit units: each expert's QB shift (regular validation only).
+        qb_shift = None
+        if (not self.training) and moe_router_regular_validation_diagnostics_enabled():
+            if quantile_delta_bias is not None:
+                qb_shift = quantile_delta_bias
+            else:
+                qb_margin_input, _ = self._margin_input_for_ste(logits, detached=True)
+                qb_margin, qb_valid_tokens = _load_balance_margin(
+                    qb_margin_input, attempted_routing_map, "topk_plus_one"
+                )
+                qb_group = (
+                    self.tp_dp_cp_group
+                    if getattr(self.config, "moe_use_global_lb", False)
+                    else self.tp_cp_group
+                )
+                qb_shift = _quantile_correction_delta_bias(
+                    qb_margin,
+                    qb_valid_tokens,
+                    self.topk,
+                    self.config.num_moe_experts,
+                    qb_group,
+                    mean_local=True,
+                )
 
         attempted_assignment_count = tokens_per_expert.sum()
         accepted_assignment_count = accepted_tokens_per_expert.sum()
@@ -1671,6 +1814,17 @@ class TopKRouter(Router):
         save_to_router_metrics_tracker(
             "ste_window_expert_count", ste_window_expert_count, layer_number, num_layers
         )
+        save_to_router_metrics_tracker(
+            "ste_window_selected_expert_count",
+            ste_window_selected_expert_count,
+            layer_number,
+            num_layers,
+        )
+        if qb_shift is not None:
+            save_to_router_metrics_tracker("qb_shift_sum", qb_shift, layer_number, num_layers)
+            save_to_router_metrics_tracker(
+                "qb_shift_count", qb_shift.new_tensor(1.0), layer_number, num_layers
+            )
         if quantile_delta_bias is not None:
             save_to_router_metrics_tracker(
                 "quantile_delta_bias_sum",
@@ -1687,6 +1841,12 @@ class TopKRouter(Router):
             save_to_router_metrics_tracker(
                 "quantile_affected_entry_count",
                 quantile_affected_entry_count,
+                layer_number,
+                num_layers,
+            )
+            save_to_router_metrics_tracker(
+                "quantile_inv_window_width_max",
+                quantile_inv_window_width_max,
                 layer_number,
                 num_layers,
             )
@@ -1736,6 +1896,10 @@ class TopKRouter(Router):
         if not self.training:
             self._save_pre_activation_value_metrics(
                 "router_logits", logits, valid_tokens, token_count, layer_number, num_layers
+            )
+            logit_rows = logits.detach().float().view(-1, self.config.num_moe_experts)[valid_tokens]
+            save_to_router_metrics_tracker(
+                "router_logit_std_sum", logit_rows.std(dim=-1).sum(), layer_number, num_layers
             )
             if collect_weighter_diagnostics:
                 self._save_pre_activation_value_metrics(
@@ -2087,6 +2251,46 @@ class TopKRouter(Router):
         else:
             return input
 
+    def save_bias_update_metrics(
+        self,
+        old_bias: torch.Tensor,
+        new_bias: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
+    ):
+        """Record one global-batch update of the balancing bias (expert_bias or qb_beta).
+
+        The change is measured with the common shift removed, since it does not affect routing.
+        `gate` is the ID Balancing derivative gate, if any.
+        """
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        if self.is_mtp_layer:
+            layer_number = self.layer_number + self.config.num_layers
+        else:
+            layer_number = self.layer_number
+        delta = new_bias - old_bias
+        delta = delta - delta.mean()
+        save_to_router_metrics_tracker(
+            "expert_bias_update_count", new_bias.new_tensor(1.0), layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "expert_bias_abs_delta_sum", delta.abs().mean(), layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "expert_bias_std_sum", new_bias.std(), layer_number, num_layers
+        )
+        save_to_router_metrics_tracker(
+            "expert_bias_range_sum", new_bias.max() - new_bias.min(), layer_number, num_layers
+        )
+        if gate is not None:
+            save_to_router_metrics_tracker(
+                "id_balancing_gate_open_count", gate.sum(), layer_number, num_layers
+            )
+            save_to_router_metrics_tracker(
+                "id_balancing_update_count", gate.new_tensor(1.0), layer_number, num_layers
+            )
+
     @jit_fuser
     def _apply_expert_bias(
         self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
@@ -2351,6 +2555,7 @@ class TopKRouter(Router):
                     should_return_selection_top_indices and should_return_topk_plus_one_indices
                 ),
                 random_tie_breaking=self.config.init_moe_router_zero,
+                expert_bias_post_softmax=self.expert_bias_post_softmax,
             )
             if (
                 should_return_selection_top_indices
@@ -2562,6 +2767,7 @@ class TopKRouter(Router):
                 selection_topk_indices=selection_topk_indices,
                 selection_topk_plus_one_indices=selection_topk_plus_one_indices,
                 padding_mask=padding_mask,
+                scores_for_aux_loss=scores_for_aux_loss,
             )
             probs = self._apply_qb_projection_distillation(
                 probs,
@@ -2765,7 +2971,8 @@ class InferenceTopKRouter(TopKRouter):
 
         precomputed_indices = None
         if self.qb_beta is not None:
-            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+            qb_scores = self._compute_selection_scores(logits) if self.qb_on_scores else logits
+            precomputed_indices = (qb_scores - self.qb_beta).topk(self.topk, dim=1).indices
 
         probs, top_indices = self._compiled_topk_routing(
             logits,
