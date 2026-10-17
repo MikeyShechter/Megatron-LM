@@ -1,0 +1,148 @@
+# Part 4d and 7b of paper_experiment_plan.md: smoke run (300 iterations) of 2048_experts_holes.yaml and of the first
+# symmetric QC run (2048_experts_symmetric_qc.yaml at λ=0.1, a new code path).
+# For the 1/w and 1/|δb| runs it is also the λ check: at step 300, MaxVio should be near that of the reference runs
+# (1.0-1.6); much above 5 means λ is too small, a jump in loss means it is too large.
+# Copy of 2048_experts_holes.yaml with the symmetric QC entry and exit_interval.
+# 7 runs that stop at iteration 300 (evals at 150 and 300); they end without a `done` marker by design.
+job_details:
+  name: experts2048_every2_holes_smoke
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+  num_experts: [2048]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]      # same per-expert shape as the 256-expert configuration
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  moe_learnable_bias_type: ["none"]
+
+  # ── Load balancing: shared keys (post, exact margin for QC and rect, EQB quantile, rect kernel shape) ──
+  moe_load_balance_ste_post_activation: [true]
+  quantile_correction_exact_margin: [true]           # QC
+  moe_quantile_estimator: ["exact"]                  # QC δb
+  load_balance_ste_type: ["rect"]
+
+  # ── One entry per hole; each spec differs from its reference run in one key (and λ where the height changes) ──
+  LIST_HOLE:
+    # Activation with post (Part 3): QC sigmoid, the fixed configuration. Softmax: vf44gjaf.
+    - moe_router_score_function: ["sigmoid"]
+      moe_router_load_balancing_type: ["quantile_correction_ste"]
+      moe_ste_rect_poistion: ["topk"]
+      load_balance_ste_width: [0.0]
+      moe_load_balance_ste_mass_normalized: [true]
+      moe_load_balance_ste_detach_threshold: [true]
+      quantile_correction_symmetric_window: [false]
+      moe_aux_loss_coeff: [0.1]
+    # Detach with rect (4c): rect w=1 attached. Detached: 7sxgd69b. Also the mass row of the rect height pair.
+    - moe_router_score_function: ["softmax"]
+      moe_router_load_balancing_type: ["centered_fsq"]
+      moe_ste_rect_poistion: ["exact_margin"]
+      load_balance_ste_width: [1.0]
+      moe_load_balance_ste_mass_normalized: [true]
+      moe_load_balance_ste_detach_threshold: [false]
+      quantile_correction_symmetric_window: [false]
+      moe_aux_loss_coeff: [0.1]
+    # Height, rect (4d): 1/w, attached, because detach requires mass normalization (4c). λ in 10x steps around
+    # 6.6, where the 1/w windows' mass (about 7,900 tokens per expert at w=1) matches T at λ=0.1.
+    - moe_router_score_function: ["softmax"]
+      moe_router_load_balancing_type: ["centered_fsq"]
+      moe_ste_rect_poistion: ["exact_margin"]
+      load_balance_ste_width: [1.0]
+      moe_load_balance_ste_mass_normalized: [false]
+      moe_load_balance_ste_detach_threshold: [false]
+      quantile_correction_symmetric_window: [false]
+      moe_aux_loss_coeff: [1.0, 10.0]
+    # Height, QC (4d): 1/|δb|, attached. Mass: 8cvnm4ny (λ=0.1). λ brackets 10-50, the scale where the
+    # flip windows' mass (|n_e - q| / |δb_e|, the boundary density) matches T at λ=0.1.
+    - moe_router_score_function: ["softmax"]
+      moe_router_load_balancing_type: ["quantile_correction_ste"]
+      moe_ste_rect_poistion: ["topk"]
+      load_balance_ste_width: [0.0]
+      moe_load_balance_ste_mass_normalized: [false]
+      moe_load_balance_ste_detach_threshold: [false]
+      quantile_correction_symmetric_window: [false]
+      moe_aux_loss_coeff: [10.0, 100.0]
+    # Symmetric QC at λ=0.1 (7b): the new window's first GPU run.
+    - moe_router_score_function: ["softmax"]
+      moe_router_load_balancing_type: ["quantile_correction_ste"]
+      moe_ste_rect_poistion: ["topk"]
+      load_balance_ste_width: [0.0]
+      moe_load_balance_ste_mass_normalized: [true]
+      moe_load_balance_ste_detach_threshold: [true]
+      quantile_correction_symmetric_window: [true]
+      moe_aux_loss_coeff: [0.1]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]
+  exit_interval: [300]            # stop after 300 iterations; the LR schedule stays that of a 6000-iter run
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]

@@ -1,0 +1,137 @@
+# Part 8b of paper_experiment_plan.md: smoke run of the three new code paths before
+# 2048_experts_split_router_activation.yaml (A's QC, B's QC, E's identity).
+# Copy of 2048_experts_split_router_activation.yaml with 3 of its entries and exit_interval.
+# 3 runs that stop at iteration 300 (evals at 150 and 300); they end without a `done` marker by design.
+job_details:
+  name: experts2048_every2_split_router_activation_smoke
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+  num_experts: [2048]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]      # same per-expert shape as the 256-expert configuration
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  moe_router_score_function: ["softmax"]
+  moe_learnable_bias_type: ["none"]
+
+  # ── Split router-weighter (as pj2yuna0) ───────────────────────────────────────
+  moe_router_use_separate_weighter: [true]
+  moe_weighter_activation: ["softmax"]
+  moe_router_enable_bias: [true]
+  moe_lm_loss_ste_normalized_relative: [true]
+  moe_lm_loss_ste_post_activation: [true]     # LM STE at the normalized scores (softmax, or s/Σs for sigmoid)
+  eval_split_router_with_weighter: [true]
+  eval_split_router_with_router_weights: [true]
+
+  # ── Load balancing: one LIST entry per (block, kernel); every entry sets every LB key ──
+  # Corrected QC = exact margin, EQB quantile, mass normalization, detached reference (as iwfdgrhg).
+  # Identity: aux where the LB gradient enters at normalized scores (A, B); centered_fsq + full where it enters at
+  # the raw logits (E), because aux on unnormalized scores keeps the uncentered λ/T push on every logit.
+  # Selection activation "none" = softmax for selection and every post target; it is D's (0nl5u4q1, iwfdgrhg) value.
+  LIST_BLOCK:
+    # A's QC at λ=0.1: LM post with LB post (softmax)
+    - moe_router_selection_activation: ["none"]
+      moe_router_load_balancing_type: ["quantile_correction_ste"]
+      load_balance_ste_type: ["rect"]
+      quantile_correction_exact_margin: [true]
+      moe_quantile_estimator: ["exact"]
+      moe_load_balance_ste_mass_normalized: [true]
+      moe_load_balance_ste_detach_threshold: [true]
+      moe_load_balance_ste_post_activation: [true]
+      moe_aux_loss_coeff: [0.1]
+    # B's QC: sigmoid selection, LM and LB post at s/Σs
+    - moe_router_selection_activation: ["sigmoid"]
+      moe_router_load_balancing_type: ["quantile_correction_ste"]
+      load_balance_ste_type: ["rect"]
+      quantile_correction_exact_margin: [true]
+      moe_quantile_estimator: ["exact"]
+      moe_load_balance_ste_mass_normalized: [true]
+      moe_load_balance_ste_detach_threshold: [true]
+      moe_load_balance_ste_post_activation: [true]
+      moe_aux_loss_coeff: [0.1]
+    # E's identity: LM post with the LB full STE at the logits
+    - moe_router_selection_activation: ["none"]
+      moe_router_load_balancing_type: ["centered_fsq"]
+      load_balance_ste_type: ["full"]
+      quantile_correction_exact_margin: [false]
+      moe_quantile_estimator: ["legacy"]
+      moe_load_balance_ste_mass_normalized: [false]
+      moe_load_balance_ste_detach_threshold: [false]
+      moe_load_balance_ste_post_activation: [false]
+      moe_aux_loss_coeff: [1.0e-3]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]
+  exit_interval: [300]            # stop after 300 iterations; the LR schedule stays that of a 6000-iter run
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]
