@@ -2869,6 +2869,8 @@ def training_log(
             moe_router_load_balancing_type=args.moe_router_load_balancing_type,
             pg_collection=pg_collection,
             return_current_max_vio_global=should_update_moe_balance_control,
+            # Step-to-step load dynamics, summarized once per eval interval (at the eval steps).
+            load_dynamics_window=args.eval_interval or 0,
         )
         current_vio = router_metrics_log.get(MOE_ROUTER_CURRENT_MAX_VIO_GLOBAL_KEY)
         if should_update_moe_balance_control and current_vio is not None:

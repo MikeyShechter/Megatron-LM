@@ -95,6 +95,7 @@ _MOE_ROUTER_METRIC_SPECS = {
     "quantile_delta_bias_sum": "expert",
     "quantile_delta_bias_count": "scalar",
     "quantile_affected_entry_count": "scalar",
+    "quantile_mirror_entry_count": "scalar",
     "quantile_inv_window_width_max": "scalar",
     "expert_bias_update_count": "scalar",
     "expert_bias_abs_delta_sum": "scalar",
@@ -128,6 +129,26 @@ _MOE_ROUTER_METRIC_SPECS = {
     "lm_ste_extras_better_count": "scalar",
     "lm_ste_extras_token_count": "scalar",
 }
+
+# Per-batch summary of the shift to balance (`qb_shift_batch_stats`): one tracker entry per
+# statistic, so that every rank pre-allocates the same names.
+QB_SHIFT_BATCH_STATS = (
+    "abs_mean",
+    "abs_p10",
+    "abs_p25",
+    "abs_p50",
+    "abs_p75",
+    "abs_p90",
+    "abs_p99",
+    "abs_max",
+    "under_abs_mean",
+    "over_abs_mean",
+    "over_frac",
+)
+_MOE_ROUTER_METRIC_SPECS.update(
+    {f"qb_shift_batch_{name}_sum": "scalar" for name in QB_SHIFT_BATCH_STATS}
+)
+_MOE_ROUTER_METRIC_SPECS["qb_shift_batch_count"] = "scalar"
 
 _MOE_ROUTER_MAX_METRICS = {
     "dispatch_max_vio_max",
@@ -1252,8 +1273,28 @@ def _fixed_boundary_load_surrogate(
     return ste_tokens_per_expert, margin, valid_tokens
 
 
+def _quantile_correction_mirror_band(
+    margin: torch.Tensor, delta_bias: torch.Tensor
+) -> torch.Tensor:
+    """The flip band's mirror image across the current boundary.
+
+    These are the tokens within |delta_b| on the other side of the boundary, whose assignment
+    already agrees with the correction: selected ones for underloaded experts (delta_b > 0),
+    unselected ones for overloaded experts (delta_b < 0).
+    """
+    current_assignment = margin > 0.0
+    return torch.where(
+        delta_bias > 0.0,
+        current_assignment & (margin < delta_bias),
+        ~current_assignment & (margin >= delta_bias) & (delta_bias < 0.0),
+    )
+
+
 def _quantile_correction_window(
-    margin: torch.Tensor, delta_bias: torch.Tensor, extended_window: bool
+    margin: torch.Tensor,
+    delta_bias: torch.Tensor,
+    extended_window: bool,
+    symmetric_window: bool = False,
 ) -> torch.Tensor:
     """The (token, expert) pairs in each expert's quantile-correction STE window."""
     corrected_assignment = margin + delta_bias > 0.0
@@ -1263,7 +1304,10 @@ def _quantile_correction_window(
         # for overloaded experts (delta_b < 0).
         return torch.where(delta_bias > 0.0, corrected_assignment, ~corrected_assignment)
     # Only the tokens whose assignment the QB correction flips.
-    return corrected_assignment != (margin > 0.0)
+    window = corrected_assignment != (margin > 0.0)
+    if symmetric_window:
+        window = window | _quantile_correction_mirror_band(margin, delta_bias)
+    return window
 
 
 class _QuantileCorrectionLoadSTE(torch.autograd.Function):
@@ -1282,29 +1326,31 @@ class _QuantileCorrectionLoadSTE(torch.autograd.Function):
         delta_bias: torch.Tensor,
         expert_height: torch.Tensor,
         extended_window: bool = False,
+        symmetric_window: bool = False,
         grad_target: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         ctx.save_for_backward(margin, valid_tokens, delta_bias, expert_height)
         ctx.extended_window = bool(extended_window)
+        ctx.symmetric_window = bool(symmetric_window)
         ctx.has_grad_target = grad_target is not None
         ctx.grad_dtype = grad_target.dtype if grad_target is not None else margin.dtype
         return forward_load
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[Optional[torch.Tensor], None, None, None, None, None, Optional[torch.Tensor]]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[
+        Optional[torch.Tensor], None, None, None, None, None, None, Optional[torch.Tensor]
+    ]:
         margin, valid_tokens, delta_bias, expert_height = ctx.saved_tensors
         delta_bias_float = delta_bias.float().unsqueeze(0)
         window = _quantile_correction_window(
-            margin.float(), delta_bias_float, ctx.extended_window
+            margin.float(), delta_bias_float, ctx.extended_window, ctx.symmetric_window
         )
         window = window & (delta_bias_float != 0.0) & valid_tokens.unsqueeze(-1).bool()
         ste_grad = window.to(dtype=torch.float32) * expert_height.float().unsqueeze(0)
         grad = (grad_output.unsqueeze(0).float() * ste_grad).to(dtype=ctx.grad_dtype)
         if ctx.has_grad_target:
-            return None, None, None, None, None, None, grad
-        return grad, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, grad
+        return grad, None, None, None, None, None, None, None
 
 
 def _quantile_correction_extended_width(
@@ -1355,12 +1401,15 @@ def _quantile_correction_expert_height(
     count_normalized: bool,
     mass_normalized: bool = False,
     mass_tokens: Optional[Union[int, torch.Tensor]] = None,
+    symmetric_window: bool = False,
 ) -> torch.Tensor:
     """Per-expert STE height inside each expert's quantile-correction window.
 
     With `mass_normalized` the height is T / (tokens in the window), with T = `mass_tokens`, so
     every expert's window carries the identity kernel's mass T; the other height options then
-    have no effect, because the height is constant inside a window.
+    have no effect, because the height is constant inside a window. With `symmetric_window`
+    the window spans both sides of the boundary: its width is 2|delta_b|, and the token counts
+    include both halves.
     """
     with torch.no_grad():
         if mass_normalized:
@@ -1368,6 +1417,7 @@ def _quantile_correction_expert_height(
                 margin.detach().float(),
                 delta_bias.detach().float().unsqueeze(0),
                 extended_window,
+                symmetric_window,
             )
             window = (
                 window
@@ -1381,7 +1431,10 @@ def _quantile_correction_expert_height(
             )
         else:
             # The flip window runs from the current boundary to the corrected one: |delta_b|.
+            # The symmetric window adds its mirror image on the other side: 2|delta_b|.
             width = delta_bias.detach().float().abs()
+            if symmetric_window:
+                width = 2.0 * width
         if unnormalized:
             height = torch.ones_like(width)
         else:
@@ -1394,6 +1447,7 @@ def _quantile_correction_expert_height(
                 margin.detach().float(),
                 delta_bias.detach().float().unsqueeze(0),
                 extended_window,
+                symmetric_window,
             )
             window_count = (window & valid_tokens.unsqueeze(-1).bool()).float().sum(dim=0)
             if reduce_group is not None and reduce_group.size() > 1:
@@ -1416,6 +1470,7 @@ def _quantile_correction_load_surrogate(
     mean_local: bool = False,
     unnormalized: bool = False,
     extended_window: bool = False,
+    symmetric_window: bool = False,
     count_normalized: bool = False,
     topk_indices: Optional[torch.Tensor] = None,
     exact_margin: bool = False,
@@ -1473,6 +1528,7 @@ def _quantile_correction_load_surrogate(
         count_normalized=count_normalized,
         mass_normalized=mass_normalized,
         mass_tokens=mass_tokens,
+        symmetric_window=symmetric_window,
     )
     ste_tokens_per_expert = _QuantileCorrectionLoadSTE.apply(
         margin if grad_target is None else margin.detach(),
@@ -1481,6 +1537,7 @@ def _quantile_correction_load_surrogate(
         delta_bias,
         expert_height,
         extended_window,
+        symmetric_window,
         grad_target,
     )
     return ste_tokens_per_expert, margin, valid_tokens, delta_bias
@@ -1489,6 +1546,35 @@ def _quantile_correction_load_surrogate(
 def quantile_correction_margin_position(exact_margin: bool) -> str:
     """Margin position used by quantile correction (`quantile_correction_exact_margin`)."""
     return "exact_margin" if exact_margin else "topk_plus_one"
+
+
+def qb_shift_batch_stats(shift: torch.Tensor) -> torch.Tensor:
+    """Summarize one batch's shift to balance for one layer, in the order of `QB_SHIFT_BATCH_STATS`.
+
+    `shift` is δb_e: the shift that would give each expert exactly its fair share (> 0 for an
+    underloaded expert, < 0 for an overloaded one). Returns the mean, quantiles and max of |δb_e|
+    over experts, the mean |δb_e| over underloaded and over overloaded experts, and the fraction of
+    overloaded experts.
+    """
+    with torch.no_grad():
+        shift = shift.detach().float().flatten()
+        magnitude = shift.abs()
+        levels = magnitude.new_tensor([0.1, 0.25, 0.5, 0.75, 0.9, 0.99])
+        quantiles = torch.quantile(magnitude, levels)
+        under = (shift > 0).float()
+        over = (shift < 0).float()
+        under_mean = (magnitude * under).sum() / under.sum().clamp(min=1.0)
+        over_mean = (magnitude * over).sum() / over.sum().clamp(min=1.0)
+        return torch.cat(
+            [
+                magnitude.mean().view(1),
+                quantiles,
+                magnitude.max().view(1),
+                under_mean.view(1),
+                over_mean.view(1),
+                over.mean().view(1),
+            ]
+        )
 
 
 def _qb_projection_target(
@@ -1809,6 +1895,7 @@ def direct_load_balancing_loss_func(
     load_balance_ste_detach_threshold: bool = False,
     quantile_correction_unnormalized: bool = False,
     quantile_correction_extended_window: bool = False,
+    quantile_correction_symmetric_window: bool = False,
     quantile_correction_count_normalized: bool = False,
     quantile_correction_exact_margin: bool = False,
     quantile_estimator: str = "legacy",
@@ -1890,6 +1977,7 @@ def direct_load_balancing_loss_func(
                     mean_local=quantile_correction_mean_local,
                     unnormalized=quantile_correction_unnormalized,
                     extended_window=quantile_correction_extended_window,
+                    symmetric_window=quantile_correction_symmetric_window,
                     count_normalized=quantile_correction_count_normalized,
                     topk_indices=load_balance_topk_indices,
                     exact_margin=quantile_correction_exact_margin,
@@ -3895,6 +3983,14 @@ def _build_moe_router_metrics_log(
                 / (token_count.sum().clamp(min=1.0) * num_experts)
             ).item()
         )
+        # The mirror band of the symmetric window, beside the flip band counted above.
+        mirror_entry_count = metrics["quantile_mirror_entry_count"].float().sum()
+        log["quantile_correction/mirror_token_expert_fraction"] = float(
+            (mirror_entry_count / (token_count.sum().clamp(min=1.0) * num_experts)).item()
+        )
+        log["quantile_correction/mirror_to_flip_ratio"] = float(
+            (mirror_entry_count / affected_entry_count.clamp(min=1.0)).item()
+        )
         inv_window_width_max = metrics.get("quantile_inv_window_width_max")
         if inv_window_width_max is not None:
             log["quantile_correction/ste_height_max"] = float(
@@ -3989,6 +4085,26 @@ def _build_moe_router_metrics_log(
                 log[f"{vio_prefix}/QBShiftAbsMaxGlobal"] = float(qb_max.mean().item())
                 for position, layer_idx in enumerate(qb_layer_indices):
                     log[f"{vio_prefix}/QBShiftAbsP50/Layer {layer_idx}"] = qb_p50_list[position]
+        # The same shift per eval batch, from exact margins and the exact global quantile: each
+        # batch is summarized (`qb_shift_batch_stats`) and the summaries are averaged over the eval
+        # batches. Sums and counts are both summed over ranks, so the ratio is the mean over ranks
+        # and batches.
+        batch_count = metrics.get("qb_shift_batch_count")
+        if batch_count is not None and (batch_count > 0).any():
+            batch_count = batch_count.float()
+            batch_layers = batch_count > 0
+            batch_layer_indices = torch.nonzero(batch_layers, as_tuple=False).flatten().tolist()
+            for name in QB_SHIFT_BATCH_STATS:
+                total = metrics[f"qb_shift_batch_{name}_sum"].float()
+                per_layer = total / batch_count.clamp(min=1.0)
+                layer_mean = float(per_layer[batch_layers].mean().item())
+                per_layer_list = per_layer.tolist()
+                for vio_prefix in vio_prefixes:
+                    log[f"{vio_prefix}/QBShiftBatch/all_layers/{name}"] = layer_mean
+                    for layer_idx in batch_layer_indices:
+                        log[f"{vio_prefix}/QBShiftBatch/Layer {layer_idx}/{name}"] = per_layer_list[
+                            layer_idx
+                        ]
 
     aux_loss_per_layer = tokens_per_expert.new_zeros(tokens_per_expert.size(0))
     load_balance_types = _as_load_balance_type_list(moe_router_load_balancing_type)
@@ -4125,6 +4241,141 @@ def _build_moe_router_metrics_log(
     return log
 
 
+# A load error |n_e - q| / sqrt(q) above this is one that sampling noise rarely reaches
+# (q = mean load).
+LOAD_DYNAMICS_SIGNIFICANCE = 3.0
+_MOE_LOAD_DYNAMICS_STATE: dict = {}
+# Columns of the per-layer window counters in `_update_load_dynamics`.
+_LD_PAIRS, _LD_FLIPS, _LD_SIG_FLIPS, _LD_WORSEN = 0, 1, 2, 3
+_LD_OVER, _LD_OVER_WORSE, _LD_UNDER, _LD_UNDER_WORSE = 4, 5, 6, 7
+_LD_CARRY_NUM, _LD_CARRY_DEN, _LD_Q_SUM = 8, 9, 10
+
+
+def _update_load_dynamics(
+    state: dict, tokens_per_expert: torch.Tensor, iteration: int, window: int
+) -> dict[str, float]:
+    """Track how each expert's load error moves from one training step to the next.
+
+    `tokens_per_expert` is one step's global load, [layers, experts], with zero rows for dense
+    layers. Per expert, r = n/q - 1 is the load error (> 0 overloaded, q the mean load) and
+    z = (n - q)/sqrt(q) the same error in units of sampling noise. Counters accumulate over the
+    steps of a window; at every iteration that is a multiple of `window` the window's summary is
+    returned (see `train/load_dynamics/*` in metrics.md), otherwise {}. `state` persists between
+    calls.
+    """
+    with torch.no_grad():
+        loads = tokens_per_expert.detach().float()
+        active = loads.sum(dim=-1) > 0
+        layer_ids = torch.nonzero(active, as_tuple=False).flatten().tolist()
+        if not layer_ids:
+            return {}
+        if state.get("layer_ids") != layer_ids:
+            state.clear()
+            state["layer_ids"] = layer_ids
+        n = loads[active]
+        num_experts = n.size(-1)
+        q = n.mean(dim=-1, keepdim=True)
+        r = n / q - 1.0
+        z = (n - q) / q.sqrt()
+        theta = LOAD_DYNAMICS_SIGNIFICANCE
+        if "window" not in state:
+            state["window"] = {
+                "steps": 0,
+                "counts": r.new_zeros(r.size(0), 11),
+                "sum": torch.zeros_like(r),
+                "sum_sq": torch.zeros_like(r),
+                "lag_prod": torch.zeros_like(r),
+                "first": r.clone(),
+            }
+        acc = state["window"]
+        counts = acc["counts"]
+        if "prev_r" in state:
+            prev_r, prev_z = state["prev_r"], state["prev_z"]
+            delta = r - prev_r
+            over, under = prev_z > theta, prev_z < -theta
+            imbalanced = (over | under).float()
+            counts[:, _LD_PAIRS] += num_experts
+            counts[:, _LD_FLIPS] += ((r > 0) != (prev_r > 0)).float().sum(dim=-1)
+            # ID Balancing's gate: the error grew in the same direction without crossing zero.
+            counts[:, _LD_WORSEN] += (prev_r * delta > 0).float().sum(dim=-1)
+            counts[:, _LD_OVER] += over.float().sum(dim=-1)
+            counts[:, _LD_OVER_WORSE] += (over & (delta > 0)).float().sum(dim=-1)
+            counts[:, _LD_UNDER] += under.float().sum(dim=-1)
+            counts[:, _LD_UNDER_WORSE] += (under & (delta < 0)).float().sum(dim=-1)
+            counts[:, _LD_CARRY_NUM] += (r * prev_r * imbalanced).sum(dim=-1)
+            counts[:, _LD_CARRY_DEN] += (prev_r * prev_r * imbalanced).sum(dim=-1)
+            if acc["steps"] > 0:
+                acc["lag_prod"] += r * prev_r
+        # Side with hysteresis: it changes only when the expert is clearly over- or underloaded.
+        side = state.get("side", torch.zeros_like(r))
+        new_side = torch.where(z > theta, 1.0, torch.where(z < -theta, -1.0, side))
+        counts[:, _LD_SIG_FLIPS] += ((side != 0) & (new_side != side)).float().sum(dim=-1)
+        state["side"] = new_side
+        acc["sum"] += r
+        acc["sum_sq"] += r * r
+        counts[:, _LD_Q_SUM] += q.squeeze(-1)
+        acc["steps"] += 1
+        if acc["steps"] == window // 2:  # first half of the window, for the window-scale drift
+            acc["half_sum"], acc["half_steps"] = acc["sum"].clone(), acc["steps"]
+        state["prev_r"], state["prev_z"] = r, z
+
+        steps = acc["steps"]
+        if window <= 0 or iteration % window != 0 or steps < 2:
+            return {}
+        del state["window"]
+        mean = acc["sum"] / steps
+        var = acc["sum_sq"] - steps * mean * mean  # sum over steps of (r - mean)^2
+        # sum over consecutive pairs of (r_t - mean)(r_{t-1} - mean)
+        cov = (
+            acc["lag_prod"]
+            - mean * (acc["sum"] - acc["first"])
+            - mean * (acc["sum"] - r)
+            + (steps - 1) * mean * mean
+        )
+        var_sum = var.sum(dim=-1)
+        pairs = counts[:, _LD_PAIRS]
+        q_mean = counts[:, _LD_Q_SUM] / steps
+        threshold = (theta / torch.sqrt(q_mean)).unsqueeze(-1)  # a clear imbalance, in units of r
+        stats = {
+            "flip_frac": counts[:, _LD_FLIPS] / pairs,
+            "dwell_steps": steps * num_experts / (counts[:, _LD_FLIPS] + num_experts),
+            "sig_flip_frac": counts[:, _LD_SIG_FLIPS] / (steps * num_experts),
+            "worsen_frac": counts[:, _LD_WORSEN] / pairs,
+            "worsen_over_frac": counts[:, _LD_OVER_WORSE] / counts[:, _LD_OVER],
+            "worsen_under_frac": counts[:, _LD_UNDER_WORSE] / counts[:, _LD_UNDER],
+            "carry_over": counts[:, _LD_CARRY_NUM] / counts[:, _LD_CARRY_DEN],
+            "persist_corr": (cov.sum(dim=-1) / (steps - 1)) / (var_sum / steps),
+            "persistent_share": (steps * mean * mean).sum(dim=-1) / acc["sum_sq"].sum(dim=-1),
+            "fluct_noise_ratio": torch.sqrt(var_sum / (num_experts * (steps - 1)) * q_mean),
+            "imbalanced_frac": (mean.abs() > threshold).float().mean(dim=-1),
+        }
+        if "half_sum" in acc and steps > acc["half_steps"]:
+            # Window scale: mean error over the first and the second half of the window, for the
+            # experts that were clearly imbalanced in the first half. Averaging over the half
+            # windows removes the step-to-step sampling noise.
+            first_half = acc["half_sum"] / acc["half_steps"]
+            second_half = (acc["sum"] - acc["half_sum"]) / (steps - acc["half_steps"])
+            over, under = first_half > threshold, first_half < -threshold
+            imbalanced = (over | under).float()
+            over_worse = (over & (second_half > first_half)).float().sum(dim=-1)
+            under_worse = (under & (second_half < first_half)).float().sum(dim=-1)
+            stats["drift_worsen_over_frac"] = over_worse / over.float().sum(dim=-1)
+            stats["drift_worsen_under_frac"] = under_worse / under.float().sum(dim=-1)
+            stats["drift_ratio"] = (first_half * second_half * imbalanced).sum(dim=-1) / (
+                first_half * first_half * imbalanced
+            ).sum(dim=-1)
+        log = {}
+        for name, per_layer in stats.items():
+            values = per_layer.tolist()
+            finite = [value for value in values if math.isfinite(value)]
+            if finite:
+                log[f"train/load_dynamics/all_layers/{name}"] = sum(finite) / len(finite)
+            for layer_idx, value in zip(layer_ids, values):
+                if math.isfinite(value):
+                    log[f"train/load_dynamics/Layer {layer_idx}/{name}"] = value
+        return log
+
+
 def track_moe_router_metrics(
     loss_scale: float,
     iteration: int,
@@ -4138,8 +4389,13 @@ def track_moe_router_metrics(
     pg_collection: Optional[ProcessGroupCollection] = None,
     return_current_max_vio_global: bool = False,
     include_weighter_diagnostics: bool = False,
+    load_dynamics_window: int = 0,
 ) -> dict[str, float]:
-    """Reduce and log accumulated MoE router diagnostics."""
+    """Reduce and log accumulated MoE router diagnostics.
+
+    With prefix "train" and `load_dynamics_window` > 0, it also tracks the step-to-step load
+    dynamics and logs their summary once per window (`_update_load_dynamics`).
+    """
     tracker = get_moe_router_metrics_tracker()
     if force_initialize:
         assert num_layers is not None
@@ -4166,6 +4422,15 @@ def track_moe_router_metrics(
         loss_scale=loss_scale,
         moe_router_load_balancing_type=moe_router_load_balancing_type,
     )
+    if prefix == "train" and load_dynamics_window > 0 and "tokens_per_expert" in tracker:
+        log.update(
+            _update_load_dynamics(
+                _MOE_LOAD_DYNAMICS_STATE,
+                tracker["tokens_per_expert"],
+                iteration,
+                load_dynamics_window,
+            )
+        )
 
     if writer:
         for key, value in log.items():

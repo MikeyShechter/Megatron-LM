@@ -751,6 +751,17 @@ class TransformerConfig(ModelParallelConfig):
     """Use a rect-independent normalized-relative LM assignment STE for split routing.
     Every selected expert receives the local signal `p_e * grad_y dot (h_e - y)`."""
 
+    moe_lm_loss_ste_post_activation: bool = False
+    """Send the normalized-relative LM STE gradient (`moe_lm_loss_ste_normalized_relative`) into
+    the split router's normalized scores, the ones the aux loss uses (softmax of the logits for
+    selection activation none or softmax, s / sum(s) for sigmoid and sqrtsoftplus), instead of
+    the selection scores (the logits, or the activated scores s). The per-expert signal
+    `p_e * grad_y dot (h_e - y)` is unchanged; through the normalization it also reaches the
+    unselected experts. The LM-side counterpart of `moe_load_balance_ste_post_activation`, with
+    the same bias handling: with a selection bias added to the logits, the gradient enters at the
+    softmax of the biased logits; with a bias added to scores the flag has no effect. Other LM
+    STEs ignore it."""
+
     moe_router_lm_loss_extra_experts: int = 0
     """Number of extra split-router experts to execute for the counterfactual LM routing STE.
     The regular top-k experts determine the forward output. Extra experts are used only to
@@ -929,6 +940,16 @@ class TransformerConfig(ModelParallelConfig):
     1/width, where the width spans from the corrected boundary to the farthest token in the
     window over the load-balancing batch."""
 
+    quantile_correction_symmetric_window: bool = False
+    """Center each expert's quantile-correction STE window on the current boundary: besides the
+    tokens the QB shift flips (margins between 0 and -delta_b_e), it takes their mirror image, the
+    tokens within |delta_b_e| on the other side of the boundary, whose assignment already agrees
+    with the correction. The window is then the rect |margin| <= |delta_b_e|, and the gradient
+    options apply as for the flip window (margins, post-activation, detached threshold). The
+    heights follow the wider window: 1/width uses the width 2|delta_b_e|, and mass and count
+    normalization divide by the tokens in both halves. No effect with
+    quantile_correction_extended_window."""
+
     quantile_correction_count_normalized: bool = False
     """Scale each expert's quantile-correction STE height by q / (tokens in its window), with q
     its fair share of the load-balancing batch, so every expert's window carries a total weight
@@ -951,8 +972,10 @@ class TransformerConfig(ModelParallelConfig):
     same threshold expert (detached with `moe_load_balance_ste_detach_threshold`). With the full
     STE and `centered_fsq` this is exactly the aux loss (at top-k 2; 2/k times it otherwise).
     Applies to `centered_fsq` (rect, triangle, tanh, higher_order_rect, full),
-    `quantile_correction_ste` and `fixed_number_boundary_ste`. Has no effect when a selection
-    bias (DeepSeek or a selection-only learnable bias) is active."""
+    `quantile_correction_ste` and `fixed_number_boundary_ste`. With a selection bias (DeepSeek or
+    a selection-only learnable bias) added to the logits under softmax selection, the gradient
+    enters at the softmax of the biased logits instead, so it also reaches the bias. With a bias
+    added to scores (sigmoid, sqrtsoftplus, post-softmax expert bias) the flag has no effect."""
 
     moe_load_balance_ste_mass_normalized: bool = False
     """Scale each expert's STE kernel to a total mass of T, the number of tokens in the

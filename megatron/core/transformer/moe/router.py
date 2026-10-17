@@ -13,8 +13,10 @@ from megatron.core.transformer.moe.moe_utils import (
     LMSTESignalTracker,
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    QB_SHIFT_BATCH_STATS,
     _load_balance_margin,
     _quantile_correction_delta_bias,
+    _quantile_correction_mirror_band,
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
@@ -32,6 +34,7 @@ from megatron.core.transformer.moe.moe_utils import (
     moe_metagrad_enabled,
     qb_dual_update,
     qb_projection_distillation_loss_func,
+    qb_shift_batch_stats,
     quantile_correction_margin_position,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -884,13 +887,15 @@ class TopKRouter(Router):
         quantile_correction_count_normalized = getattr(
             self.config, "quantile_correction_count_normalized", False
         )
-        # The post-activation path is defined for routers without a selection bias; with one,
-        # the margin input is already the biased selection score, and the flag has no effect.
-        load_balance_ste_post_scores = (
-            scores_for_aux_loss
-            if getattr(self.config, "moe_load_balance_ste_post_activation", False) and not biased
-            else None
-        )
+        # Post-activation path: the gradient enters at the normalized scores. With a selection
+        # bias the load is decided by the biased selection scores, so it enters at their softmax.
+        load_balance_ste_post_scores = None
+        if getattr(self.config, "moe_load_balance_ste_post_activation", False):
+            load_balance_ste_post_scores = (
+                self._biased_selection_probs(margin_input, padding_mask)
+                if biased
+                else scores_for_aux_loss
+            )
         new_ste_kwargs = dict(
             quantile_correction_exact_margin=getattr(
                 self.config, "quantile_correction_exact_margin", False
@@ -900,6 +905,9 @@ class TopKRouter(Router):
             load_balance_ste_post_scores=load_balance_ste_post_scores,
             load_balance_ste_mass_normalized=getattr(
                 self.config, "moe_load_balance_ste_mass_normalized", False
+            ),
+            quantile_correction_symmetric_window=getattr(
+                self.config, "quantile_correction_symmetric_window", False
             ),
         )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
@@ -1199,6 +1207,31 @@ class TopKRouter(Router):
             return self.expert_bias.float()
         return None
 
+    def _biased_selection_probs(
+        self, margin_input: torch.Tensor, padding_mask: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Softmax of the biased selection logits: where the post-activation STE gradient enters
+        when a selection bias is active.
+
+        The gradient reaches the bias, and the router logits unless `_margin_input_for_ste`
+        detached them. Only a bias added to logits under softmax selection gives such a
+        distribution; for a bias added to scores (sigmoid, sqrtsoftplus, post-softmax expert bias,
+        split QB) this returns None, and the gradient enters at the biased scores as before.
+        """
+        if self.use_separate_weighter:
+            logit_space = self.qb_beta is None and self.router_selection_activation in (
+                "softmax",
+                "none",
+            )
+        else:
+            logit_space = self.score_function == "softmax" and not self.expert_bias_post_softmax
+        if not logit_space:
+            return None
+        probs = torch.softmax(margin_input.float(), dim=-1)
+        if padding_mask is not None:
+            probs = probs * (~padding_mask).unsqueeze(-1)
+        return probs
+
     def _margin_input_for_ste(self, logits: torch.Tensor, detached: bool):
         """Return the tensor the STE margin is computed on, and whether it is biased.
 
@@ -1295,8 +1328,18 @@ class TopKRouter(Router):
         The normalized surrogate has derivative `p_e * grad_y dot (h_e - y)` with
         respect to each selected expert's activated router score. Its contribution is
         zero in forward, and all weighter probabilities are detached on this branch.
+        With `moe_lm_loss_ste_post_activation` the derivative is taken with respect to the
+        normalized scores instead, as the LB STE's post path does.
         """
-        selection_scores, _ = self._margin_input_for_ste(logits, detached=False)
+        selection_scores, biased = self._margin_input_for_ste(logits, detached=False)
+        if getattr(self.config, "moe_lm_loss_ste_post_activation", False):
+            post_scores = (
+                self._biased_selection_probs(selection_scores, padding_mask)
+                if biased
+                else self._compute_split_scores_for_aux_loss(logits)
+            )
+            if post_scores is not None:
+                selection_scores = post_scores
         if padding_mask is not None:
             routing_map = routing_map & ~padding_mask.unsqueeze(-1)
 
@@ -1588,6 +1631,7 @@ class TopKRouter(Router):
         ste_window_selected_expert_count = torch.zeros_like(tokens_per_expert)
         quantile_delta_bias = None
         quantile_affected_entry_count = token_count.new_tensor(0.0)
+        quantile_mirror_entry_count = token_count.new_tensor(0.0)
         quantile_inv_window_width_max = token_count.new_tensor(0.0)
         load_balance_ste_type, load_balance_ste_width, _ = get_load_balance_ste_params(self.config)
         if (not self.training) and load_balance_ste_type == "full":
@@ -1671,6 +1715,14 @@ class TopKRouter(Router):
                     & quantile_valid_tokens.unsqueeze(-1)
                 ).float()
                 quantile_affected_entry_count = quantile_flips.sum()
+                # Tokens within |delta_b_e| on the other side of the boundary: the band the
+                # symmetric window adds (it gets gradient only with that window).
+                quantile_mirror_entry_count = (
+                    _quantile_correction_mirror_band(
+                        quantile_margin, quantile_delta_bias.unsqueeze(0)
+                    )
+                    & quantile_valid_tokens.unsqueeze(-1)
+                ).float().sum()
                 # Largest per-token STE height 1/|delta_b_e| over experts with a non-empty window.
                 quantile_window_width = quantile_delta_bias.abs()
                 quantile_inv_window_width_max = torch.where(
@@ -1702,6 +1754,36 @@ class TopKRouter(Router):
                     qb_group,
                     mean_local=True,
                 )
+
+        # The same shift for this batch alone, from exact margins and the exact global quantile
+        # (EQB) for every load-balancing method, summarized per batch (regular validation only).
+        # Quantile-correction runs that already use both reuse their own delta_b.
+        qb_batch_stats = None
+        if (not self.training) and moe_router_regular_validation_diagnostics_enabled():
+            if (
+                quantile_delta_bias is not None
+                and getattr(self.config, "quantile_correction_exact_margin", False)
+                and self.config.moe_quantile_estimator == "exact"
+            ):
+                batch_shift = quantile_delta_bias
+            else:
+                batch_margin_input, _ = self._margin_input_for_ste(logits, detached=True)
+                batch_margin, batch_valid_tokens = _load_balance_margin(
+                    batch_margin_input, attempted_routing_map, "exact_margin"
+                )
+                batch_shift = _quantile_correction_delta_bias(
+                    batch_margin,
+                    batch_valid_tokens,
+                    self.topk,
+                    self.config.num_moe_experts,
+                    (
+                        self.tp_dp_cp_group
+                        if getattr(self.config, "moe_use_global_lb", False)
+                        else self.tp_cp_group
+                    ),
+                    estimator="exact",
+                )
+            qb_batch_stats = qb_shift_batch_stats(batch_shift)
 
         attempted_assignment_count = tokens_per_expert.sum()
         accepted_assignment_count = accepted_tokens_per_expert.sum()
@@ -1825,6 +1907,14 @@ class TopKRouter(Router):
             save_to_router_metrics_tracker(
                 "qb_shift_count", qb_shift.new_tensor(1.0), layer_number, num_layers
             )
+        if qb_batch_stats is not None:
+            for name, value in zip(QB_SHIFT_BATCH_STATS, qb_batch_stats.unbind()):
+                save_to_router_metrics_tracker(
+                    f"qb_shift_batch_{name}_sum", value, layer_number, num_layers
+                )
+            save_to_router_metrics_tracker(
+                "qb_shift_batch_count", qb_batch_stats.new_tensor(1.0), layer_number, num_layers
+            )
         if quantile_delta_bias is not None:
             save_to_router_metrics_tracker(
                 "quantile_delta_bias_sum",
@@ -1841,6 +1931,12 @@ class TopKRouter(Router):
             save_to_router_metrics_tracker(
                 "quantile_affected_entry_count",
                 quantile_affected_entry_count,
+                layer_number,
+                num_layers,
+            )
+            save_to_router_metrics_tracker(
+                "quantile_mirror_entry_count",
+                quantile_mirror_entry_count,
                 layer_number,
                 num_layers,
             )
