@@ -164,6 +164,20 @@ twice. A run killed by the 8 h limit resumes the same way. Only rerun when the u
   - `moe_learnable_bias_lr_mult`: can't be combined with the tie.
 - `moe_router_score_function`: softmax | sigmoid | sqrtsoftplus.
 - `moe_router_use_separate_weighter`: split router-weighter.
+- Where the gradients enter (pre = the selection scores, post = the normalized scores π, which the aux loss uses):
+  - `moe_load_balance_ste_post_activation`: the LB STE enters post.
+  - `moe_lm_loss_ste_post_activation` (split only, added 2026-10-14): the normalized-relative LM STE
+    (`moe_lm_loss_ste_normalized_relative`) enters post. Other LM STEs ignore it.
+  - Split router: `moe_router_selection_activation`. `none` (every split run so far) selects on the raw logits, and π
+    is softmax(z). With `sigmoid`, the selection and pre scores are s = σ(z) and π is s/Σs.
+  - For the softmax post target, keep `none`. `softmax` gives the same selection and the same π, but differs from
+    the existing runs in the config.
+- Identity kernel: `aux_loss` equals `centered_fsq` + `load_balance_ste_type: full` +
+  `moe_load_balance_ste_post_activation` (at top-k 2), so aux is the identity only post.
+  - When the LB enters pre at unnormalized scores (raw logits, or s), use `centered_fsq` + `full` (no post flag).
+    Never use aux there: it adds an uncentered λ/T push on every logit (user, 2026-10-14).
+  - Worked example: `AGENT_plans/paper_experiment_plan.md` Part 8b and
+    `configs/2048_experts_split_router_activation*.yaml`.
 
-The experiment plan and its decision rules are in `plan.md`. Metric definitions are in
-`skills/runsdb/references/metrics.md`.
+The experiment plan for the LB paper and its decision rules are in `AGENT_plans/paper_experiment_plan.md`. Metric
+definitions are in `skills/runsdb/references/metrics.md`.

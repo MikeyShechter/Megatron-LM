@@ -117,8 +117,69 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
     layers.
   - `train/vio/Top10PctShare`: share of assignments that go to the busiest ⌈0.1·E⌉ experts (205 for E=2048); mean
     over layers. ≈ 0.10 when balanced (paper Fig. 4c).
+  - The paper's other summaries (worst MaxVio over steps, mean over the last 1k steps, cumulative excess of MaxVio
+    above 1) come from `train/vio/MaxVioBatch` in `raw()`, which has every step.
 
   (U:3304-3316)
+- `train/load_dynamics/*` (added 2026-10-14): how each expert's load moves from one training step to the next,
+  from the same per-step global loads as `train/vio/*`. Per step and expert: the load error r_e = n_e/q − 1 (> 0
+  overloaded; q = the mean load, T·K/E = 512 here) and z_e = (n_e − q)/√q, the same error in units of sampling
+  noise. A fresh batch moves n_e by about √q ≈ 23 tokens (4.4%) even at perfect balance, so step-to-step counts
+  must be read against their noise level. "Clearly" over- or underloaded means |z_e| > 3, a load error above 13%
+  at q = 512.
+  - Accumulated over each eval interval (150 steps) and logged at the eval steps, per layer
+    (`train/load_dynamics/Layer N/<stat>`, N as in `vio/MaxVio/Layer N`) and as the mean over layers
+    (`train/load_dynamics/all_layers/<stat>`). A ratio whose denominator is empty in a window (e.g. no clearly
+    overloaded expert) is not logged for that window.
+  - `flip_frac`: fraction of experts whose side (over or under) changed since the previous step. ≈ 0.5 under
+    noise, because experts near balance flip about every other step; on its own it mostly counts the experts
+    inside the noise band.
+  - `dwell_steps`: mean number of consecutive steps an expert stays on one side, within the window. ≈ 2 under
+    noise, ≈ 1 for strict alternation (overshoot), long (up to 150) when experts stay on one side.
+  - `sig_flip_frac`: fraction of expert-steps that swing from clearly overloaded to clearly underloaded or back.
+    The side has hysteresis at |z| = 3: it changes only when the expert crosses the opposite threshold. ≈ 0
+    under noise, so any clear value is overshoot that noise can't explain. Swings smaller than ±13% are missed.
+  - `worsen_frac`: fraction of experts whose error grew in the same direction without crossing zero: ID
+    Balancing's derivative gate g_e = 1[e_e(t−1)·Δe_e(t) > 0] (arXiv 2609.39137, Eq. 11). ≈ 0.24 under noise.
+  - `worsen_over_frac` / `worsen_under_frac`: the same, among the experts that were clearly overloaded /
+    underloaded at the previous step: the share that got even more overloaded / underloaded at the next step.
+    ≈ 0 under noise or with a strong restoring push; ≈ 0.45 when the same experts stay imbalanced and nothing
+    pushes them back; above that, the imbalance feeds itself. Only changes faster than the sampling noise
+    show up here; slow runaways are in `drift_*`.
+  - `carry_over`: Σ r_e(t)·r_e(t−1) / Σ r_e(t−1)² over the clearly imbalanced experts: the share of their load
+    error still there one step later. 1 − carry_over is corrected per step; ≈ 1 no correction, > 1 growing, < 0
+    the expert lands on the other side (overshoot). ≈ 0 under noise.
+  - `persist_corr`: lag-1 autocorrelation of each expert's r around its own window mean, pooled over experts.
+    < 0 oscillation, ≈ 0 noise or static imbalance, > 0 the error drifts slowly within the window (a runaway, a
+    slow oscillation or a slow correction; `drift_*` tells them apart).
+  - `persistent_share`: Σ_e T·m_e² / Σ_e Σ_t r_e², with m_e the expert's mean r over the window's T steps: the
+    share of the squared load error that is a fixed per-expert offset. ≈ 1 the same experts stay over- or
+    underloaded; 1/T ≈ 0.007 under noise.
+  - `fluct_noise_ratio`: RMS of r around each expert's window mean, times √q. ≈ 1 the step-to-step movement is
+    sampling noise; well above 1, real dynamics (oscillation, drift or spikes).
+  - `imbalanced_frac`: fraction of experts whose mean r over the window is clearly imbalanced (|m_e| > 3/√q).
+    ≈ 0 under noise.
+  - `drift_worsen_over_frac` / `drift_worsen_under_frac`: among the experts that were clearly overloaded /
+    underloaded on average over the first half of the window, the share whose average imbalance is larger, in
+    the same direction, over the second half. Averaging over 75 steps removes the sampling noise, so these catch
+    slow runaways that the per-step `worsen_*` miss: ≈ 0.5 static imbalance, → 1 a runaway (an overload feeding
+    itself, or an expert dying), → 0 the method is correcting. Not logged when no expert qualifies (e.g. under
+    noise or fast oscillation).
+  - `drift_ratio`: Σ m1·m2 / Σ m1² over the same experts (m1, m2: the mean r over the first and the second half
+    of the window): the share of the first half's imbalance still there in the second half. ≈ 1 static, < 1
+    correcting, > 1 growing, < 0 reversed.
+  - Values on synthetic multinomial loads (E=2048, q=512, one 150-step window, all_layers; – = not logged):
+
+    | regime | flip_frac | dwell_steps | sig_flip_frac | worsen_frac | worsen_over_frac | carry_over | persist_corr | persistent_share | fluct_noise_ratio | imbalanced_frac | drift_worsen_over_frac | drift_ratio |
+    |---|---|---|---|---|---|---|---|---|---|---|---|---|
+    | noise only (balanced) | 0.50 | 2.0 | 0.000 | 0.24 | 0.00 | −0.01 | −0.01 | 0.007 | 1.0 | 0.00 | – | – |
+    | static imbalance | 0.06 | 14 | 0.000 | 0.46 | 0.45 | 0.98 | −0.01 | 0.98 | 1.0 | 0.65 | 0.48 | 1.00 |
+    | overshoot (half the experts ±10% every step) | 0.97 | 1.0 | 0.13 | 0.01 | 0.00 | −0.61 | −0.84 | 0.009 | 2.5 | 0.00 | – | – |
+    | slow runaway | 0.11 | 8.6 | 0.000 | 0.46 | 0.47 | 1.00 | 0.95 | 0.71 | 4.9 | 0.65 | 1.00 | 3.20 |
+    | slow oscillation (period 60 steps) | 0.15 | 6.6 | 0.020 | 0.42 | 0.42 | 0.96 | 0.96 | 0.06 | 5.0 | 0.03 | 0.06 | 0.94 |
+    | correcting (imbalance decays over 50 steps) | 0.26 | 3.7 | 0.000 | 0.35 | 0.34 | 0.92 | 0.75 | 0.53 | 2.1 | 0.16 | 0.00 | 0.22 |
+
+  (U:4199-4329, U:4378-4386, T:2873)
 - `train/token_dropping/*`: logged only with a capacity factor. `train/metagrad_*`: logged only with `--metagrad-params`.
 - `train/quantile_correction/*`: present in a few old runs only; the definition is not in the current code.
 
@@ -146,6 +207,22 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
     r = w/2: when most experts need to move by more than r, a fixed window cannot reach the tokens that must flip.
   - Computed from each rank's local micro-batch and averaged over the load-balancing group
     (`quantile_correction_mean_local` style); quantile-correction runs reuse their own δb_e.
+- Per-batch distance to balance (added 2026-10-14, every run, regular validation only):
+  `vio/QBShiftBatch/Layer N/<stat>` and `vio/QBShiftBatch/all_layers/<stat>` (mean over layers), with <stat> one of
+  `abs_mean`, `abs_p10`, `abs_p25`, `abs_p50`, `abs_p75`, `abs_p90`, `abs_p99`, `abs_max`, `under_abs_mean`,
+  `over_abs_mean`, `over_frac`.
+  - The same δb_e as `vio/QBShift*`, but for each eval batch on its own, from exact margins and the exact global
+    quantile (EQB) for every method. Quantile-correction runs with `quantile_correction_exact_margin` and
+    `moe_quantile_estimator: exact` reuse their own δb_e, the shift their STE window uses.
+  - Each batch is summarized over the experts of a layer, then the summaries are averaged over the eval batches
+    (20). `vio/QBShift*` instead averages each expert's δb_e over the batches first, which cancels the
+    batch-to-batch noise; the ratio of the two shows how much of the shift persists across batches.
+  - `abs_*`: mean, quantiles and max of |δb_e| over experts. `under_abs_mean` / `over_abs_mean`: mean |δb_e| over
+    the underloaded (δb_e > 0) / overloaded (δb_e < 0) experts. `over_frac`: fraction of overloaded experts.
+  - Units are those of the selection scores (logits without selection biases); compare with
+    `router_logits/std_pre_activation/Layer N`.
+
+  (U:1514-1540, U:4041-4060, R:1735-1763)
 - The train-time MaxVio is logged per step as `train/vio/MaxVioBatch` since 2026-10-04 (see train/*); before
   that it only drove the coefficient controller.
 
@@ -257,6 +334,21 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
 - `quantile_correction/ste_height_max` (added 2026-10-05): the largest per-token STE height 1/|δb_e| over experts
   with a non-empty window, i.e. 1 / (the narrowest window). With `quantile_correction_unnormalized` the height is
   1 everywhere, and this key is still 1 / (the narrowest window).
+- `quantile_correction/mirror_token_expert_fraction` (added 2026-10-14): the fraction of (token, expert) pairs in the
+  mirror bands, the flip bands' mirror images across the current boundary.
+  - The mirror band holds the tokens within |δb_e| on the other side of the boundary: an underloaded expert's
+    selected tokens with margin below δb_e, an overloaded expert's unselected tokens with margin above −|δb_e|.
+  - It has the same normalization as `affected_token_expert_fraction` (the flip bands), so the symmetric window's
+    in-window fraction is the sum of the two.
+  - Logged for every QC run. The band gets gradient only with `quantile_correction_symmetric_window`; otherwise it
+    shows how many tokens that window would add.
+  - Like the other `quantile_correction/*` keys, it is eval only and pooled over layers.
+- `quantile_correction/mirror_to_flip_ratio` (added 2026-10-14): Σ mirror-band pairs / Σ flip-band pairs, over all
+  layers and experts of the eval batches.
+  - With the symmetric window and mass normalization, the flip band's share of an expert's push is
+    |flip_e| / (|flip_e| + |mirror_e|), so about 1 / (1 + ratio) when experts are alike.
+  - A ratio near 1 means the margin density is about the same on both sides of the boundary.
+  - Logged for every QC run, like the fraction above.
 - Config `quantile_correction_unnormalized` (added 2026-10-05): the quantile-correction STE uses height 1 inside each
   expert's window instead of 1/|δb_e|, so the window width does not set the gradient scale. Each expert's total STE
   weight is then |n_e − q| (the number of flips needed) instead of about the token density at its boundary.
@@ -267,6 +359,17 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   normalized height is 1/width, where the width runs from the corrected boundary to the farthest token in the window
   over the load-balancing batch, so it is much smaller than 1/|δb_e|. `quantile_correction/ste_height_max` and
   `affected_token_expert_fraction` still describe the flip window, not the extended one.
+- Config `quantile_correction_symmetric_window` (added 2026-10-14): each expert's quantile-correction STE window is
+  centered on the current boundary, i.e. the rect |m| ≤ |δb_e|.
+  - It holds the flip band (the tokens between margin 0 and −δb_e) and its mirror band: the tokens within |δb_e| on
+    the other side, whose assignment already agrees with the correction (an underloaded expert's selected tokens, an
+    overloaded expert's unselected ones).
+  - Every token in the window is pushed the same way.
+  - The heights follow the window: 1/width uses 2|δb_e|; mass normalization gives T, and count normalization q,
+    spread over the tokens of both bands.
+  - Margins, post and detach work as for the flip window. No effect with `quantile_correction_extended_window`.
+  - `quantile_correction/ste_height_max` and `affected_token_expert_fraction` still describe the flip window. The
+    mirror band's size is `quantile_correction/mirror_token_expert_fraction` and `mirror_to_flip_ratio`.
 - Config `quantile_correction_count_normalized` (added 2026-10-06): scales each expert's STE height by
   q / (tokens in its window), q = its fair share of the load-balancing batch, so every expert's window carries
   a total weight of q. With height 1, each expert's total push is then 2λ(f_e − 1/E): it depends only on the load
@@ -305,8 +408,19 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   kernel, the gradient goes to π_te − π_ref against the same threshold expert (π_te alone with
   `moe_load_balance_ste_detach_threshold`). With the full STE and `centered_fsq`, the gradient is exactly the aux
   loss's at top-k 2. Applies to `centered_fsq` (rect, triangle, tanh, higher_order_rect, full),
-  `quantile_correction_ste` and `fixed_number_boundary_ste`. It has no effect with a selection bias (DeepSeek or a
-  selection-only learnable bias).
+  `quantile_correction_ste` and `fixed_number_boundary_ste`. With a selection bias (DeepSeek or a selection-only
+  learnable bias) added to the logits under softmax selection, the gradient enters at the softmax of the biased
+  logits, so it also reaches the bias (changed 2026-10-10; before, the flag had no effect with any selection bias).
+  With a bias added to scores (sigmoid, sqrtsoftplus, post-softmax expert bias) it still has no effect.
+- Config `moe_lm_loss_ste_post_activation` (added 2026-10-14; split router): the normalized-relative LM STE
+  (`moe_lm_loss_ste_normalized_relative`) enters at the normalized router scores π, the aux-loss scores, instead of
+  the selection scores. π is softmax(z) for selection activation `none`/`softmax` and s/Σs for sigmoid/sqrtsoftplus;
+  the selection scores are the logits, or s. The per-expert signal p_e·∇y·(h_e − y) is unchanged. Through the
+  normalization it also reaches the unselected experts' logits.
+  - Bias handling is that of `moe_load_balance_ste_post_activation`: a logit-space selection bias gives softmax(z + b);
+    a score-space bias makes the flag a no-op.
+  - Other LM STEs ignore it.
+  - The runs before 2026-10-14 all had it off (LM pre at the raw logits).
 - Config `moe_load_balance_ste_mass_normalized` (added 2026-10-07): every expert's STE kernel is scaled to a total
   mass of T, the tokens in the load-balancing batch (the full STE's mass). Each expert's total push is then the same
   for the same load error, whatever the kernel; the kernel only spreads it over tokens. Windowed kernels get height
