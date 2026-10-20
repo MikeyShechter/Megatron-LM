@@ -964,6 +964,20 @@ class TransformerConfig(ModelParallelConfig):
     underloaded expert short by fewer tokens than it is runner-up for gets delta_b = 0 and no
     window."""
 
+    quantile_correction_post_margin: bool = False
+    """Run quantile correction fully post: take its margins, the shift delta_b and the windows on
+    the normalized scores that `moe_load_balance_ste_post_activation` sends the gradient into
+    (softmax probabilities), instead of on the logits. delta_b is then a shift of the
+    probabilities, so the 1/|delta_b| height is in probability units; mass normalization does not
+    depend on units. Needs `moe_load_balance_ste_post_activation`."""
+
+    quantile_correction_coordinate_coefficient: bool = False
+    """Weight each pair (t, e) in a quantile-correction window by the coordinate estimator's
+    coefficient n_e^{-t} - n_m^{-t} instead of n_e - 1/a: the loads without token t of expert e and
+    of the expert m it would swap with (its threshold expert at the exact margin). The windows,
+    heights and entry point are unchanged, and the scale matches the default coefficient's. Needs
+    `quantile_correction_exact_margin`, which defines the threshold expert."""
+
     moe_load_balance_ste_post_activation: bool = False
     """Send the STE load-balancing gradient into the normalized router scores (the aux-loss
     scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by their sum over

@@ -370,6 +370,17 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   - Margins, post and detach work as for the flip window. No effect with `quantile_correction_extended_window`.
   - `quantile_correction/ste_height_max` and `affected_token_expert_fraction` still describe the flip window. The
     mirror band's size is `quantile_correction/mirror_token_expert_fraction` and `mirror_to_flip_ratio`.
+- Config `quantile_correction_post_margin` (added 2026-10-18): quantile correction fully post. The margins, δb_e and
+  the windows are taken on the softmax probabilities (π_e − m(π_{−e}) with the exact margin), where
+  `moe_load_balance_ste_post_activation` already sends the gradient, instead of on the logits.
+  - `quantile_correction/delta_b_e/*` and `quantile_correction/ste_height_max` are then in probability units:
+    δb_e is about π at the threshold (≈3e-3 at E=2048) times the logit shift, so 1/|δb_e| is ~300× larger.
+  - `vio/QBShift*` and `vio/QBShiftBatch/*` stay in logit units: these runs compute them like non-QC runs instead of
+    reusing their own δb_e.
+- Config `quantile_correction_coordinate_coefficient` (added 2026-10-18): competitor-aware QC. Each window pair
+  (t, e) is weighted by the coordinate estimator's coefficient n_e^{-t} − n_m^{-t} instead of n_e − 1/a, where m is
+  the expert the pair would swap with (its threshold expert at the exact margin). Windows, heights and entry point
+  are unchanged, and the scale matches the default coefficient's. Needs `quantile_correction_exact_margin`.
 - Config `quantile_correction_count_normalized` (added 2026-10-06): scales each expert's STE height by
   q / (tokens in its window), q = its fair share of the load-balancing batch, so every expert's window carries
   a total weight of q. With height 1, each expert's total push is then 2λ(f_e − 1/E): it depends only on the load
