@@ -187,7 +187,7 @@ def _surrogate_grad(kind, logits, scores, routing_map, top, top_plus_one, topk, 
             logits, routing_map, load, 0.05, num_experts, None, "exact_margin", **common
         )
     else:
-        surrogate, _, _, _ = _quantile_correction_load_surrogate(
+        surrogate, _, _, _, _ = _quantile_correction_load_surrogate(
             logits, routing_map, load, topk, num_experts, None, exact_margin=True, **common
         )
     return surrogate

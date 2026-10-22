@@ -8,9 +8,9 @@
 
 An experiment set is a directory in CHECKPOINT_ROOT.
 - An offline run (<run>/wandb/wandb/offline-run-*/) is synced if it has a .synced marker or its run id is in
-  runsdb.
-- A set is synced when all its offline runs are, or when runsdb holds at least as many runs of that sweep as
-  there are offline runs. Some older sets were uploaded under new run ids.
+  runsdb as a wandb run. Runs that ingest_local.py read from their run dirs don't count.
+- A set is synced when all its offline runs are, or when runsdb holds at least as many wandb runs of that sweep
+  as there are offline runs. Some older sets were uploaded under new run ids.
 - Runs whose SLURM job is still queued or running are left alone.
 
 Sets are ordered by last activity (newest .wandb write). An unsynced set that is older than the newest synced
@@ -56,8 +56,10 @@ def active_runs():
 
 def scan(include=()):
     active = active_runs()
-    db_ids = {p.stem for p in C.META.glob("*.json")}
-    db_counts = pd.read_parquet(C.ROOT / "runs.parquet", columns=["sweep"])["sweep"].value_counts().to_dict()
+    db = pd.read_parquet(C.ROOT / "runs.parquet", columns=["run_id", "sweep", "source"])
+    db = db[db["source"] != "local"]  # read from run dirs by ingest_local.py, not uploaded yet
+    db_ids = set(db["run_id"])
+    db_counts = db["sweep"].value_counts().to_dict()
     sets = []
     for d in sorted(p for p in C.CHECKPOINT_ROOT.iterdir() if p.is_dir()):
         files = sorted(d.glob("*/wandb/wandb/*run-*/run-*.wandb"))  # <set>/<run>/wandb/wandb/<offline-run>/run-<id>.wandb

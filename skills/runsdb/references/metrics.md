@@ -381,6 +381,9 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   (t, e) is weighted by the coordinate estimator's coefficient n_e^{-t} − n_m^{-t} instead of n_e − 1/a, where m is
   the expert the pair would swap with (its threshold expert at the exact margin). Windows, heights and entry point
   are unchanged, and the scale matches the default coefficient's. Needs `quantile_correction_exact_margin`.
+- Config `quantile_correction_midpoint_coefficient` (added 2026-10-20): each window pair's coefficient n_e − 1/a
+  gets + (½ − A_e^t), making it n_e^{-t} + ½ − 1/a, the exact jump of the squared load. In the one-sided flip window
+  this shrinks |n_e − 1/a| by half a token for every token of expert e. No effect with the coordinate coefficient.
 - Config `quantile_correction_count_normalized` (added 2026-10-06): scales each expert's STE height by
   q / (tokens in its window), q = its fair share of the load-balancing batch, so every expert's window carries
   a total weight of q. With height 1, each expert's total push is then 2λ(f_e − 1/E): it depends only on the load

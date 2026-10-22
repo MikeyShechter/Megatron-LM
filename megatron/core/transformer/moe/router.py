@@ -912,6 +912,9 @@ class TopKRouter(Router):
             quantile_correction_coordinate_coefficient=getattr(
                 self.config, "quantile_correction_coordinate_coefficient", False
             ),
+            quantile_correction_midpoint_coefficient=getattr(
+                self.config, "quantile_correction_midpoint_coefficient", False
+            ),
         )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             quantile_correction_delta_bias = (

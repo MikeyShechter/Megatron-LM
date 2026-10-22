@@ -1480,7 +1480,8 @@ def _quantile_correction_load_surrogate(
     mass_normalized: bool = False,
     mass_tokens: Optional[Union[int, torch.Tensor]] = None,
     post_margin: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    midpoint_coefficient: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Build the hard-load surrogate and its per-expert QB correction.
 
     Margins are taken against the token's runner-up (`topk_plus_one`), or with `exact_margin`
@@ -1488,6 +1489,11 @@ def _quantile_correction_load_surrogate(
     the token's weakest selected expert for unselected ones. Only the exact margin makes each
     window the set of tokens that a bias on that one expert would flip. With `post_margin` the
     margins (and so delta_b and the windows) are taken on `post_scores` instead of the logits.
+
+    With `midpoint_coefficient` the last return value is the sum over window pairs (t, e) of
+    (1/2 - A_e^t) * height_e * entry_te, A_e^t = routing_map; only its gradient is used. At the
+    loss's scale it turns each pair's coefficient n_e - 1/a into n_e^{-t} + 1/2 - 1/a. Otherwise
+    it is None.
     """
     margin_position = quantile_correction_margin_position(exact_margin)
     margin, valid_tokens = _load_balance_margin(
@@ -1542,7 +1548,22 @@ def _quantile_correction_load_surrogate(
         symmetric_window,
         grad_target,
     )
-    return ste_tokens_per_expert, margin, valid_tokens, delta_bias
+    midpoint_surrogate = None
+    if midpoint_coefficient:
+        with torch.no_grad():
+            delta_bias_float = delta_bias.detach().float().unsqueeze(0)
+            window = _quantile_correction_window(
+                margin.detach().float(), delta_bias_float, extended_window, symmetric_window
+            )
+            window = window & (delta_bias_float != 0.0) & valid_tokens.unsqueeze(-1).bool()
+            weight = (
+                (0.5 - routing_map.float())
+                * window.float()
+                * expert_height.float().unsqueeze(0)
+            )
+        entry = margin if grad_target is None else grad_target
+        midpoint_surrogate = (weight * entry.float()).sum()
+    return ste_tokens_per_expert, margin, valid_tokens, delta_bias, midpoint_surrogate
 
 
 def _quantile_correction_coordinate_surrogate(
@@ -1999,6 +2020,7 @@ def direct_load_balancing_loss_func(
     load_balance_ste_mass_normalized: bool = False,
     quantile_correction_post_margin: bool = False,
     quantile_correction_coordinate_coefficient: bool = False,
+    quantile_correction_midpoint_coefficient: bool = False,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE.
 
@@ -2013,6 +2035,9 @@ def direct_load_balancing_loss_func(
     - `quantile_correction_coordinate_coefficient` (quantile correction only): weight each window
       pair by the coordinate estimator's coefficient n_e^{-t} - n_m^{-t} (m: the expert the pair
       would swap with) instead of n_e - 1/a, at the same scale.
+    - `quantile_correction_midpoint_coefficient` (quantile correction with the default
+      coefficient only): add 1/2 - A_e^t to each window pair's coefficient n_e - 1/a, making it
+      n_e^{-t} + 1/2 - 1/a.
     """
     total_num_tokens_tensor = torch.as_tensor(
         total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
@@ -2060,6 +2085,7 @@ def direct_load_balancing_loss_func(
         )
     else:
         coordinate_surrogate = None
+        midpoint_surrogate = None
         if load_balancing_type == "quantile_correction_ste" and (
             quantile_correction_coordinate_coefficient
         ):
@@ -2093,7 +2119,7 @@ def direct_load_balancing_loss_func(
             ste_forward_load = (
                 tokens_per_expert if reduce_group is not None else routing_map.sum(dim=0)
             )
-            ste_tokens_per_expert, ste_margin, ste_valid_tokens, _ = (
+            ste_tokens_per_expert, ste_margin, ste_valid_tokens, _, midpoint_surrogate = (
                 _quantile_correction_load_surrogate(
                     logits,
                     routing_map,
@@ -2117,6 +2143,7 @@ def direct_load_balancing_loss_func(
                     mass_normalized=load_balance_ste_mass_normalized,
                     mass_tokens=total_num_tokens_tensor,
                     post_margin=quantile_correction_post_margin,
+                    midpoint_coefficient=quantile_correction_midpoint_coefficient,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
@@ -2184,6 +2211,14 @@ def direct_load_balancing_loss_func(
                 * coordinate_surrogate
             )
             loss = loss + coordinate_surrogate - coordinate_surrogate.detach()
+        if midpoint_surrogate is not None:
+            # 1/2 - A_e^t at the same scale as the centered loss's coefficient n_e - 1/a.
+            midpoint_surrogate = (
+                hard_load_frac.new_tensor(2.0 * float(num_experts))
+                / torch.square(denom)
+                * midpoint_surrogate
+            )
+            loss = loss + midpoint_surrogate - midpoint_surrogate.detach()
         if load_balancing_type == "centered_fsq_and_var":
             reusable_margin = (
                 ste_margin if ste_rect_poistion == load_balance_ste_rect_poistion else None

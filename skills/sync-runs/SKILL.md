@@ -46,7 +46,8 @@ total offline runs, how many run dirs have `done`, and the last activity. Then a
 
 ## How the check decides
 
-- **Synced offline run:** it has a `run-<id>.wandb.synced` marker (written by `wandb sync`), or its id is in runsdb.
+- **Synced offline run:** it has a `run-<id>.wandb.synced` marker (written by `wandb sync`), or its id is in runsdb
+  as a wandb run. Runs read from their run dirs with `ingest_local.py` (`source = local`) don't count.
 - **Synced set:** all its offline runs are synced, or runsdb has at least as many runs of that sweep as the set
   has offline runs. The second case covers some older sets that were uploaded under new run ids, so their markers
   and ids don't match. It also prevents duplicate uploads.

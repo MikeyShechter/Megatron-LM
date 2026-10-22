@@ -978,6 +978,15 @@ class TransformerConfig(ModelParallelConfig):
     heights and entry point are unchanged, and the scale matches the default coefficient's. Needs
     `quantile_correction_exact_margin`, which defines the threshold expert."""
 
+    quantile_correction_midpoint_coefficient: bool = False
+    """Add 1/2 - A_e^t (A_e^t = 1 if token t selects expert e) to the coefficient n_e - 1/a of each
+    pair (t, e) in a quantile-correction window, making it n_e^{-t} + 1/2 - 1/a: the jump of the
+    squared load when token t flips (its slope midway through the flip) instead of the slope at
+    the current load. In the one-sided flip window A_e^t is the same for all of expert e's tokens,
+    so this shrinks |n_e - 1/a| by half a token. Windows, heights and entry point are unchanged.
+    No effect with `quantile_correction_coordinate_coefficient`, whose coefficient has no
+    self-term."""
+
     moe_load_balance_ste_post_activation: bool = False
     """Send the STE load-balancing gradient into the normalized router scores (the aux-loss
     scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by their sum over
