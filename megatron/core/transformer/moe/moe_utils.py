@@ -332,6 +332,76 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
+def switch_load_balancing_load_ste_term(
+    probs: torch.Tensor,
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    total_num_tokens: Union[int, torch.Tensor],
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    load_balance_ste_type: str,
+    load_balance_ste_width: float,
+    load_balance_tanh_ste_slope: float,
+    load_balance_ste_rect_poistion: str = "topk",
+    detach_threshold: bool = False,
+    post_scores: Optional[torch.Tensor] = None,
+    mass_normalized: bool = False,
+) -> torch.Tensor:
+    """Zero-valued term that differentiates the Switch aux loss through its load f_i.
+
+    `switch_load_balancing_loss_func` treats the hard load f_i in E * Σ_i f_i * P_i as a
+    constant, so its gradient goes only through P_i. Adding this term keeps the loss value and
+    adds the gradient E * Σ_i P_i * ∂f_i, where ∂f_i is the routed-load STE of the direct
+    load-balancing losses (`_load_balance_ste_load_surrogate`) on the `logits` margins. P_i is
+    summed over `reduce_group`, the same level as `tokens_per_expert`, so each rank's tokens get
+    the gradient of the group's loss, as they do through P_i.
+
+    Args:
+        probs (torch.Tensor): The aux-loss scores of the local tokens. Shape [num_tokens, num_experts].
+        logits (torch.Tensor): The logits `probs` and `routing_map` come from; the STE margins.
+        routing_map (torch.Tensor): The aux-loss routing map of the local tokens.
+        tokens_per_expert (torch.Tensor): Token counts per expert over `reduce_group`.
+        total_num_tokens (int or torch.Tensor): Tokens over `reduce_group`.
+        topk, num_experts, moe_aux_loss_coeff: As in `switch_load_balancing_loss_func`.
+        reduce_group: The load-balancing group of `tokens_per_expert`.
+        load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope,
+        load_balance_ste_rect_poistion, detach_threshold, post_scores, mass_normalized: The STE
+            options of `direct_load_balancing_loss_func`.
+    """
+    ste_rect_poistion = (
+        load_balance_ste_rect_poistion
+        if load_balance_ste_type in ("rect", "higher_order_rect", "triangle")
+        else "topk"
+    )
+    total_num_tokens_tensor = torch.as_tensor(
+        total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
+    )
+    ste_tokens_per_expert, _, _ = _load_balance_ste_load_surrogate(
+        logits,
+        routing_map,
+        tokens_per_expert,
+        load_balance_ste_type,
+        load_balance_ste_width,
+        load_balance_tanh_ste_slope,
+        ste_rect_poistion,
+        detach_threshold=detach_threshold,
+        post_scores=post_scores,
+        mass_normalized=mass_normalized,
+        mass_tokens=total_num_tokens_tensor,
+        reduce_group=reduce_group,
+    )
+    aggregated_probs_per_expert = reduce_from_tensor_model_parallel_region(
+        probs.detach().float().sum(dim=0), reduce_group
+    )
+    load_ste = ste_tokens_per_expert - ste_tokens_per_expert.detach()
+    return torch.sum(aggregated_probs_per_expert * load_ste) * (
+        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+    )
+
+
 class _RectangularIndicatorSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, margin: torch.Tensor, bandwidth: float) -> torch.Tensor:
@@ -1659,6 +1729,72 @@ def _quantile_correction_coordinate_surrogate(
     return (weight * entry.float()).sum()
 
 
+def _quantile_correction_logistic_surrogate(
+    logits: torch.Tensor,
+    routing_map: torch.Tensor,
+    topk: int,
+    num_experts: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    tau: float,
+    delta_bias: Optional[torch.Tensor] = None,
+    topk_plus_one_indices: Optional[torch.Tensor] = None,
+    detach_threshold: bool = False,
+    mean_local: bool = False,
+    topk_indices: Optional[torch.Tensor] = None,
+    exact_margin: bool = False,
+    estimator: str = "legacy",
+    num_bins: int = 1000,
+    post_scores: Optional[torch.Tensor] = None,
+    post_margin: bool = False,
+) -> torch.Tensor:
+    """Logistic margin loss around each expert's QB-corrected boundary z = -delta_b.
+
+    Every valid pair (t, e) is pushed away from that boundary: up when z_e^t + delta_b_e > 0 (the
+    N*K/E tokens QB would give expert e), down otherwise, with weight
+    2 * sigmoid(-|z_e^t + delta_b_e| / tau), the push of 2 * tau * log(1 + exp(-|z + delta_b| / tau)).
+    The weight is 1 at the boundary. Returns sum over pairs of the signed weight times entry_te,
+    where the entry is the post-activation target with `post_scores`, otherwise the margin; only
+    its gradient is used.
+    """
+    margin_position = quantile_correction_margin_position(exact_margin)
+    margin, valid_tokens = _load_balance_margin(
+        post_scores if post_margin else logits,
+        routing_map,
+        margin_position,
+        topk_indices=topk_indices,
+        topk_plus_one_indices=topk_plus_one_indices,
+        detach_threshold=detach_threshold,
+    )
+    if delta_bias is None:
+        delta_bias = _quantile_correction_delta_bias(
+            margin,
+            valid_tokens,
+            topk,
+            num_experts,
+            reduce_group,
+            mean_local=mean_local,
+            estimator=estimator,
+            num_bins=num_bins,
+        )
+    entry = _load_balance_ste_post_target(
+        post_scores,
+        routing_map,
+        margin_position,
+        topk_indices,
+        topk_plus_one_indices,
+        detach_threshold,
+    )
+    if entry is None:
+        entry = margin
+    with torch.no_grad():
+        shifted = margin.detach().float() + delta_bias.detach().float().unsqueeze(0)
+        # Minus the push, so that gradient descent moves pairs above the boundary up.
+        weight = torch.sigmoid(shifted.abs().div_(-tau)).mul_(-2.0)
+        weight = torch.where(shifted > 0.0, weight, -weight)
+        weight.mul_(valid_tokens.unsqueeze(-1).to(weight.dtype))
+    return (weight * entry.float()).sum()
+
+
 def quantile_correction_margin_position(exact_margin: bool) -> str:
     """Margin position used by quantile correction (`quantile_correction_exact_margin`)."""
     return "exact_margin" if exact_margin else "topk_plus_one"
@@ -2021,6 +2157,7 @@ def direct_load_balancing_loss_func(
     quantile_correction_post_margin: bool = False,
     quantile_correction_coordinate_coefficient: bool = False,
     quantile_correction_midpoint_coefficient: bool = False,
+    quantile_correction_logistic_tau: float = 0.0,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE.
 
@@ -2038,6 +2175,10 @@ def direct_load_balancing_loss_func(
     - `quantile_correction_midpoint_coefficient` (quantile correction with the default
       coefficient only): add 1/2 - A_e^t to each window pair's coefficient n_e - 1/a, making it
       n_e^{-t} + 1/2 - 1/a.
+    - `quantile_correction_logistic_tau` > 0 (quantile correction only): replace the window push
+      by a logistic margin loss around each expert's QB-corrected boundary
+      (`_quantile_correction_logistic_surrogate`). A pair at the boundary gets 2E*T/denom^2, the
+      push of a mass-normalized quantile-correction window pair, so lambda keeps its scale.
     """
     total_num_tokens_tensor = torch.as_tensor(
         total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
@@ -2086,7 +2227,27 @@ def direct_load_balancing_loss_func(
     else:
         coordinate_surrogate = None
         midpoint_surrogate = None
-        if load_balancing_type == "quantile_correction_ste" and (
+        logistic_surrogate = None
+        if load_balancing_type == "quantile_correction_ste" and quantile_correction_logistic_tau > 0.0:
+            logistic_surrogate = _quantile_correction_logistic_surrogate(
+                logits,
+                routing_map,
+                topk,
+                num_experts,
+                reduce_group,
+                quantile_correction_logistic_tau,
+                delta_bias=quantile_correction_delta_bias,
+                topk_plus_one_indices=load_balance_topk_plus_one_indices,
+                detach_threshold=load_balance_ste_detach_threshold,
+                mean_local=quantile_correction_mean_local,
+                topk_indices=load_balance_topk_indices,
+                exact_margin=quantile_correction_exact_margin,
+                estimator=quantile_estimator,
+                num_bins=quantile_histogram_bins,
+                post_scores=load_balance_ste_post_scores,
+                post_margin=quantile_correction_post_margin,
+            )
+        elif load_balancing_type == "quantile_correction_ste" and (
             quantile_correction_coordinate_coefficient
         ):
             ste_forward_load = (
@@ -2219,6 +2380,15 @@ def direct_load_balancing_loss_func(
                 * midpoint_surrogate
             )
             loss = loss + midpoint_surrogate - midpoint_surrogate.detach()
+        if logistic_surrogate is not None:
+            # 2E*T/denom^2 per unit weight: a mass-normalized window pair's push.
+            logistic_surrogate = (
+                hard_load_frac.new_tensor(2.0 * float(num_experts))
+                * total_num_tokens_tensor
+                / torch.square(denom)
+                * logistic_surrogate
+            )
+            loss = loss + logistic_surrogate - logistic_surrogate.detach()
         if load_balancing_type == "centered_fsq_and_var":
             reusable_margin = (
                 ste_margin if ste_rect_poistion == load_balance_ste_rect_poistion else None
@@ -2420,6 +2590,95 @@ def qb_global_beta(
         num_bins=num_bins,
         value_range=value_range,
     )
+
+
+class _QBSelectionLMSTE(torch.autograd.Function):
+    """Identity on the routing probs; the backward adds the LM-loss gradient through QB's selection.
+
+    The routing push of a selected pair is c = -dL/dA = -g (dL/dg - sum_j g_j dL/dg_j). Window pairs
+    get -height * (c - c_bar) on their margin with `edge` None (grad b = -mean grad z over the
+    window), or -height * c plus +height * (window sum of c) on each expert's edge token (grad b =
+    -grad z of the edge token). A margin is the selected score minus the token's (k+1)-th biased
+    score, so its gradient goes to the score with + and to that competitor's score with -.
+    """
+
+    @staticmethod
+    def forward(ctx, probs, scores, window, competitor, edge, height, group):
+        ctx.save_for_backward(probs, window, competitor, edge if edge is not None else window)
+        ctx.has_edge = edge is not None
+        ctx.height = height
+        ctx.group = group
+        ctx.scores_dtype = scores.dtype
+        return probs.view_as(probs)
+
+    @staticmethod
+    def backward(ctx, grad_probs):
+        probs, window, competitor, edge = ctx.saved_tensors
+        g = probs.float()
+        grad_g = grad_probs.float()
+        push = -g * (grad_g - (g * grad_g).sum(dim=-1, keepdim=True))
+        window = window.float()
+        push = push * window
+        totals = torch.stack([push.sum(dim=0), window.sum(dim=0)])
+        if ctx.group is not None and ctx.group.size() > 1:
+            torch.distributed.all_reduce(totals, group=ctx.group)
+        if ctx.has_edge:
+            push = push - edge.float() * totals[0].unsqueeze(0)
+        else:
+            push = push - window * (totals[0] / totals[1].clamp(min=1.0)).unsqueeze(0)
+        grad_margin = -ctx.height * push
+        grad_scores = grad_margin.scatter_add(
+            1, competitor.unsqueeze(1), -grad_margin.sum(dim=1, keepdim=True)
+        )
+        return grad_probs, grad_scores.to(ctx.scores_dtype), None, None, None, None, None
+
+
+def qb_selection_lm_ste(
+    probs: torch.Tensor,
+    scores: torch.Tensor,
+    beta: torch.Tensor,
+    k: int,
+    width: float,
+    bias_grad: str,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Pass the LM-loss gradient through QB's hard top-k on `scores - beta` (see `_QBSelectionLMSTE`).
+
+    The STE is a one-sided rect of height 1/width over the selected pairs whose margin is below
+    `width`. `bias_grad` "window_mean" differentiates the bias by the implicit function theorem,
+    "edge_token" through the expert's edge token: its selected pair with the smallest margin over
+    `group`.
+    """
+    with torch.no_grad():
+        biased = scores.detach().float() - beta.float()
+        values, indices = biased.topk(k + 1, dim=-1)
+        selected_indices = indices[:, :k]
+        margin = torch.zeros_like(biased).scatter_(
+            1, selected_indices, values[:, :k] - values[:, k:]
+        )
+        selected = torch.zeros_like(biased, dtype=torch.bool).scatter_(1, selected_indices, True)
+        window = selected & (margin < width)
+        competitor = indices[:, k]
+        edge = None
+        if bias_grad == "edge_token":
+            local_min, local_index = margin.masked_fill(~selected, float("inf")).min(dim=0)
+            global_min = local_min.clone()
+            owner = torch.isfinite(local_min)
+            if group is not None and group.size() > 1:
+                torch.distributed.all_reduce(
+                    global_min, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                rank = torch.distributed.get_rank(group=group)
+                owner_rank = torch.full_like(local_index, group.size())
+                owner_rank = owner_rank.masked_fill(owner & (local_min == global_min), rank)
+                torch.distributed.all_reduce(
+                    owner_rank, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                owner = owner_rank == rank
+            experts = torch.nonzero(owner).squeeze(-1)
+            edge = torch.zeros_like(selected)
+            edge[local_index[experts], experts] = True
+    return _QBSelectionLMSTE.apply(probs, scores, window, competitor, edge, 1.0 / width, group)
 
 
 def get_capacity(

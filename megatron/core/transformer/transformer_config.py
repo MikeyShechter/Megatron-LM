@@ -838,6 +838,22 @@ class TransformerConfig(ModelParallelConfig):
     the unbiased scores either way. Plain router only; the split router always uses its
     selection scores."""
 
+    moe_router_qb_lm_ste_width: float = 0.0
+    """With quantile balancing, pass the LM-loss gradient through QB's hard top-k with a one-sided
+    rect STE of this width and height 1/width over the selected pairs whose margin to the token's
+    (k+1)-th biased score is below it (in QB's units: probabilities with
+    `moe_router_quantile_balancing_on_scores`). Each pair's routing push is c = -dL/dA, and the
+    bias is differentiated as set by `moe_router_qb_lm_ste_bias_grad`, so the push trades an
+    expert's slots between tokens without changing its load. The forward is unchanged; 0 turns it
+    off. Plain router only."""
+
+    moe_router_qb_lm_ste_bias_grad: Literal['window_mean', 'edge_token'] = 'window_mean'
+    """How the STE of `moe_router_qb_lm_ste_width` differentiates the QB bias b_e. "window_mean"
+    (implicit function theorem): grad b_e = -mean grad z over the window, so every window pair
+    gets c - mean(c). "edge_token" (order statistic): grad b_e = -grad z of the expert's edge
+    token, its selected pair with the smallest margin, which then takes minus the window's total
+    push."""
+
     moe_quantile_estimator: Literal['legacy', 'histogram', 'exact'] = 'legacy'
     """How per-expert quantiles of the global batch are computed for quantile balancing
     (`qb_beta`), quantile correction (delta_b) and the fixed-number boundary radius.
@@ -987,6 +1003,15 @@ class TransformerConfig(ModelParallelConfig):
     No effect with `quantile_correction_coordinate_coefficient`, whose coefficient has no
     self-term."""
 
+    quantile_correction_logistic_tau: float = 0.0
+    """If > 0, replace quantile correction's window push by a logistic margin loss around each
+    expert's QB-corrected boundary z = -delta_b_e: every pair (t, e) is pushed up if
+    z_e^t + delta_b_e > 0 (the N*K/E tokens QB would give expert e) and down otherwise, with weight
+    2 * sigmoid(-|z_e^t + delta_b_e| / tau), the push of 2 * tau * log(1 + exp(-|z + delta_b| / tau)).
+    tau is in margin units: logits, or probabilities with `quantile_correction_post_margin`. A pair
+    at the boundary gets the push of a mass-normalized quantile-correction window pair at the same
+    lambda. Window, height, coordinate and midpoint options have no effect. 0 turns it off."""
+
     moe_load_balance_ste_post_activation: bool = False
     """Send the STE load-balancing gradient into the normalized router scores (the aux-loss
     scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by their sum over
@@ -1007,6 +1032,14 @@ class TransformerConfig(ModelParallelConfig):
     For windowed kernels the height becomes T / (tokens in the window). Applies to the same
     load-balancing types as `moe_load_balance_ste_post_activation`. For quantile correction it
     replaces the height options (unnormalized, count-normalized, 1/|delta_b|)."""
+
+    moe_aux_loss_load_ste: bool = False
+    """Differentiate the `aux_loss` E * sum_i f_i * P_i through the load f_i as well, instead of
+    treating f_i as a constant: f_i gets the routed-load STE of the direct load-balancing losses
+    (`moe_load_balance_ste_type`, `moe_load_balance_ste_width`, `moe_ste_rect_poistion`,
+    `moe_load_balance_ste_detach_threshold`, `moe_load_balance_ste_post_activation`,
+    `moe_load_balance_ste_mass_normalized`). The loss value is unchanged; the extra gradient is
+    E * sum_i P_i * df_i, with P_i over the load-balancing group."""
 
     metagrad_params: str = "none"
     """Meta-gradient-controlled load-balance parameters: none, width, coeff, or width_and_coeff."""

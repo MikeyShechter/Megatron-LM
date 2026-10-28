@@ -384,6 +384,11 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
 - Config `quantile_correction_midpoint_coefficient` (added 2026-10-20): each window pair's coefficient n_e − 1/a
   gets + (½ − A_e^t), making it n_e^{-t} + ½ − 1/a, the exact jump of the squared load. In the one-sided flip window
   this shrinks |n_e − 1/a| by half a token for every token of expert e. No effect with the coordinate coefficient.
+- Config `quantile_correction_logistic_tau` (added 2026-10-23; 0 = off): replaces QC's window push by a logistic
+  margin loss around each expert's QB-corrected boundary. Every pair is pushed up if z + δb_e > 0 and down otherwise,
+  with weight 2σ(−|z + δb_e|/τ) (1 at the boundary, where a pair gets a mass-normalized window pair's push at the
+  same λ). τ is in margin units. Window, height, coordinate and midpoint options have no effect. The
+  `quantile_correction/*` window metrics still describe QC's flip window.
 - Config `quantile_correction_count_normalized` (added 2026-10-06): scales each expert's STE height by
   q / (tokens in its window), q = its fair share of the load-balancing batch, so every expert's window carries
   a total weight of q. With height 1, each expert's total push is then 2λ(f_e − 1/E): it depends only on the load
@@ -416,6 +421,11 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   instead of the logits. Top-k is taken on `score_function(logits) − qb_beta`, so `qb_beta` and
   `train/expert_bias/*` are in score units. With sigmoid this is Kimi K3's recipe. The combine weights stay the
   unbiased scores. Plain router only.
+- Configs `moe_router_qb_lm_ste_width` and `moe_router_qb_lm_ste_bias_grad` (added 2026-10-26): with quantile
+  balancing, an LM-loss STE through the hard top-k. A one-sided rect of width h (QB units) covers the selected pairs
+  whose margin to the token's (k+1)-th biased score is below h. Each pair's push is c = −dL/dA, and the bias gradient
+  is either `window_mean` (every window pair gets c − mean(c)) or `edge_token` (the expert's smallest selected margin
+  takes minus the window's total). The pushes cancel per expert, so loads don't change; the forward is unchanged.
 - Config `moe_load_balance_ste_post_activation` (added 2026-10-07): the STE load-balancing gradient enters at the
   normalized router scores π (the aux-loss scores: softmax probabilities, or sigmoid/sqrtsoftplus scores divided by
   their sum) instead of the logits. Which tokens get gradient still comes from the logit margins. With a margin

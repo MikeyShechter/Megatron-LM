@@ -34,6 +34,7 @@ from megatron.core.transformer.moe.moe_utils import (
     moe_metagrad_enabled,
     qb_dual_update,
     qb_projection_distillation_loss_func,
+    qb_selection_lm_ste,
     qb_shift_batch_stats,
     quantile_correction_margin_position,
     router_gating_linear,
@@ -41,6 +42,7 @@ from megatron.core.transformer.moe.moe_utils import (
     save_to_metagrad_losses_tracker,
     save_to_router_metrics_tracker,
     sinkhorn,
+    switch_load_balancing_load_ste_term,
     switch_load_balancing_loss_func,
     topk_selection_with_score_function,
     topk_routing_with_score_function,
@@ -768,8 +770,12 @@ class TopKRouter(Router):
         scores_for_aux_loss: torch.Tensor,
         routing_map: torch.Tensor,
         with_padding_mask: bool = False,
+        logits: Optional[torch.Tensor] = None,
     ):
-        """Apply the auxiliary loss for the given scores and routing map."""
+        """Apply the auxiliary loss for the given scores and routing map.
+
+        With `moe_aux_loss_load_ste`, `logits` (the logits the scores and routing map come from)
+        carry the STE margins of the load term."""
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
@@ -795,6 +801,38 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+        if getattr(self.config, "moe_aux_loss_load_ste", False):
+            load_balance_ste_type, load_balance_ste_width, load_balance_tanh_ste_slope = (
+                get_load_balance_ste_params(self.config)
+            )
+            aux_loss = aux_loss + switch_load_balancing_load_ste_term(
+                probs=scores_for_aux_loss,
+                logits=logits,
+                routing_map=routing_map,
+                tokens_per_expert=global_tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=aux_loss_coeff,
+                reduce_group=reduce_group,
+                load_balance_ste_type=load_balance_ste_type,
+                load_balance_ste_width=load_balance_ste_width,
+                load_balance_tanh_ste_slope=load_balance_tanh_ste_slope,
+                load_balance_ste_rect_poistion=getattr(
+                    self.config, "moe_ste_rect_poistion", "topk"
+                ),
+                detach_threshold=getattr(
+                    self.config, "moe_load_balance_ste_detach_threshold", False
+                ),
+                post_scores=(
+                    scores_for_aux_loss
+                    if getattr(self.config, "moe_load_balance_ste_post_activation", False)
+                    else None
+                ),
+                mass_normalized=getattr(
+                    self.config, "moe_load_balance_ste_mass_normalized", False
+                ),
+            )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             aux_loss_coeff,
@@ -914,6 +952,9 @@ class TopKRouter(Router):
             ),
             quantile_correction_midpoint_coefficient=getattr(
                 self.config, "quantile_correction_midpoint_coefficient", False
+            ),
+            quantile_correction_logistic_tau=getattr(
+                self.config, "quantile_correction_logistic_tau", 0.0
             ),
         )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
@@ -2662,6 +2703,21 @@ class TopKRouter(Router):
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
             probs, routing_map = self.quantile_balancing(logits)
+            qb_lm_ste_width = getattr(self.config, "moe_router_qb_lm_ste_width", 0.0)
+            if qb_lm_ste_width > 0.0 and self.training and torch.is_grad_enabled():
+                probs = qb_selection_lm_ste(
+                    probs,
+                    (
+                        self._compute_selection_scores(logits)
+                        if self.qb_on_scores
+                        else logits.float()
+                    ),
+                    self.qb_beta,
+                    self.topk,
+                    qb_lm_ste_width,
+                    self.config.moe_router_qb_lm_ste_bias_grad,
+                    self.tp_dp_cp_group,
+                )
         else:
             routing_output = topk_routing_with_score_function(
                 logits,
@@ -2880,6 +2936,7 @@ class TopKRouter(Router):
                 scores_for_aux_loss,
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
+                logits=logits_for_load_balance,
             )
             probs = self._apply_direct_load_balancing_aux_losses(
                 probs,

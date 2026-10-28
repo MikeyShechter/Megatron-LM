@@ -219,6 +219,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_metagrad_raw_sensitivities,
     get_moe_metagrad_raw_state,
     get_moe_metagrad_scalar_state,
+    get_moe_router_metrics_tracker,
     moe_metagrad_enabled,
     set_moe_metagrad_prev_sensitivities,
     set_moe_router_regular_validation_diagnostics_enabled,
@@ -4063,6 +4064,29 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _save_eval_expert_counts(snapshots, path):
+    """Save each expert's running selection count after every eval batch, summed over ranks."""
+    counts = torch.stack(snapshots).round().to(torch.int64)  # (eval batches, layers, experts)
+    torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
+    torch.distributed.all_reduce(
+        counts, group=mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+    )
+    if torch.distributed.get_rank() == 0:
+        args = get_args()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(
+            {
+                "cumulative_tokens_per_expert": counts.cpu(),
+                "load": args.load,
+                "iteration": args.iteration,
+                "eval_global_batch_size": args.eval_global_batch_size,
+                "seq_length": args.seq_length,
+            },
+            path,
+        )
+        print_rank_0(f'Saved per-expert eval selection counts to {path}')
+
+
 def evaluate(
     forward_step_func,
     data_iterator,
@@ -4072,8 +4096,13 @@ def evaluate(
     verbose=False,
     non_loss_data_func=None,
     eval_iters=None,
+    expert_counts_path=None,
 ):
-    """Evaluation."""
+    """Evaluation.
+
+    With `expert_counts_path`, also saves every expert's running selection count after each eval
+    batch (see --eval-expert-counts-dir).
+    """
     args = get_args()
     timers = get_timers()
 
@@ -4114,6 +4143,8 @@ def evaluate(
     if eval_iters is None:
         eval_iters = args.eval_iters
 
+    expert_count_snapshots = [] if expert_counts_path is not None else None
+
     with torch.no_grad():
         iteration = 0
         if verbose:
@@ -4139,6 +4170,12 @@ def evaluate(
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
+
+            if expert_count_snapshots is not None:
+                # The tracker was cleared at the start of this eval pass, so this is the running count.
+                expert_count_snapshots.append(
+                    get_moe_router_metrics_tracker()["tokens_per_expert"].clone()
+                )
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -4193,6 +4230,9 @@ def evaluate(
                     rerun_state_machine.set_mode(rerun_mode)
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
+
+        if expert_count_snapshots:
+            _save_eval_expert_counts(expert_count_snapshots, expert_counts_path)
 
         collected_non_loss_data = None
         if non_loss_data_func is not None:
@@ -4363,6 +4403,14 @@ def evaluate_and_print_results(
             if record_alternate_routing_batches
             else iterator
         )
+        expert_counts_path = None
+        if (
+            getattr(args, "eval_expert_counts_dir", None)
+            and collect_regular_validation_router_diagnostics
+        ):
+            expert_counts_path = os.path.join(
+                args.eval_expert_counts_dir, f"expert_counts_iter{iteration:07d}{suffix}.pt"
+            )
         set_moe_router_regular_validation_diagnostics_enabled(
             collect_regular_validation_router_diagnostics
         )
@@ -4376,6 +4424,7 @@ def evaluate_and_print_results(
                 verbose,
                 non_loss_data_func,
                 eval_iters=iterations,
+                expert_counts_path=expert_counts_path,
             )
         finally:
             set_moe_router_regular_validation_diagnostics_enabled(False)

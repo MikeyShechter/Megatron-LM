@@ -151,6 +151,11 @@ class ValidationConfig:
     val/router_ranks_<ranks>/lm_loss. Rank sets are separated by spaces and ranks by commas, for
     example "1,3 3,4"; each set lists moe_router_topk ranks."""
 
+    eval_expert_counts_dir: Optional[str] = None
+    """If set, regular validation saves every expert's running selection count after each eval
+    batch, summed over ranks, to <dir>/expert_counts_iter<iteration>.pt. Off by default; meant for
+    eval-only runs (--skip-train --load <run dir> --ckpt-step <iteration>)."""
+
     test_mode: bool = False
     """Run all real-time test alongside the experiment."""
 
