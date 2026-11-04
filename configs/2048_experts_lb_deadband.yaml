@@ -1,0 +1,134 @@
+# Per-expert deadband on the load-balancing signal (user, 2026-11-01), the "Deadband" item of the Part 9 controllers
+# page: an expert whose load error is within the batch's noise gets no LB push of its own, because it can't be
+# balanced better and pushing it only adds noise to the router. Vio_e = (n_e - q)/q per training step's global batch,
+# q = T*K/E = 512; one sampling-noise sd of Vio_e is 1/sqrt(q) = 0.044, and the measured overdispersion
+# (var/mean median 2.5, p90 8) makes it about 0.07 for the median expert and 0.125 at p90.
+# - Fixed deadband, moe_lb_deadband_vio (added 2026-11-01): no push while |Vio_e| < X.
+#     X = 0.044: 1 sampling-noise sd.
+#     X = 0.133: 3 sampling-noise sd (the "clearly off" line of train/load_dynamics), about 2 sd of the median expert.
+#     X = 0.25:  about 2 sd of a p90-overdispersed expert.
+#     X = 0.5:   about the largest |Vio_e| noise alone gives among 2048 experts in a step (0.48 simulated).
+# - Noise deadband, moe_lb_deadband_noise_z (added 2026-11-01): no push while |n_e - q| < z * sigma_e, sigma_e^2 an
+#   EMA (decay 0.99) of the expert's load variance around its own EMA load. z in {0.5, 1, 2, 3}: pure noise would
+#   still get a push on about 62%, 32%, 5% and 0.3% of steps. The measured step-to-step wobble of the QC baseline is
+#   about 4.2x sampling noise mid-run (train/load_dynamics fluct_noise_ratio), so the band is about |Vio_e| < 0.19z
+#   there: 0.09, 0.19, 0.37, 0.56 (user, 2026-11-01: z=0.5 added).
+# Each on both kernels of the standard router at their baseline lambda:
+# - QC, the fixed configuration: post, exact margin, EQB, mass norm., detach, lambda=0.1
+#   (26-10-08 qc_detach, vf44gjaf: 3.2129).
+# - Identity kernel = aux loss, lambda=1 (26-09-15 aux/003, 5w5e2lak: 3.2206).
+# Copy of 2048_experts_qc_squared_loss.yaml. Changed: name; LB block (LIST_KERNEL x LIST_DEADBAND).
+# 16 runs: 2 kernels x (4 fixed + 4 noise).
+job_details:
+  name: experts2048_every2_lb_deadband
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  moe_layer_freq: [2]
+  ffn_hidden_size: [768]
+  num_experts: [2048]
+  moe_router_topk: [2]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]      # same per-expert shape as the 256-expert configuration
+  moe_latent_size: [192]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  moe_router_score_function: ["softmax"]
+  moe_learnable_bias_type: ["none"]
+
+  # ── Load balancing: kernel x deadband ────────────────────────────────────────
+  LIST_KERNEL:
+    # QC, the fixed configuration (vf44gjaf: 3.2129)
+    - moe_router_load_balancing_type: ["quantile_correction_ste"]
+      quantile_correction_exact_margin: [true]
+      moe_quantile_estimator: ["exact"]               # EQB
+      moe_load_balance_ste_post_activation: [true]    # post: the gradient enters at the softmax probabilities
+      moe_load_balance_ste_detach_threshold: [true]
+      moe_load_balance_ste_mass_normalized: [true]    # height T/|W_e|
+      moe_aux_loss_coeff: [0.1]
+    # identity kernel = aux loss (5w5e2lak: 3.2206)
+    - moe_router_load_balancing_type: ["aux_loss"]
+      quantile_correction_exact_margin: [false]
+      moe_quantile_estimator: ["legacy"]
+      moe_load_balance_ste_post_activation: [false]
+      moe_load_balance_ste_detach_threshold: [false]
+      moe_load_balance_ste_mass_normalized: [false]
+      moe_aux_loss_coeff: [1.0]
+  LIST_DEADBAND:
+    # fixed: no LB push while |Vio_e| < X
+    - moe_lb_deadband_vio: [0.044, 0.133, 0.25, 0.5]
+      moe_lb_deadband_noise_z: [0.0]
+    # per-expert noise: no LB push while |n_e - q| < z * sigma_e
+    - moe_lb_deadband_vio: [0.0]
+      moe_lb_deadband_noise_z: [0.5, 1.0, 2.0, 3.0]
+  moe_lb_deadband_noise_ema_decay: [0.99]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 2 / 2048 = 512 assignments/expert on average.
+  train_iters: [6000]
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [16] # One EP group across all GPUs; 128 local experts/GPU.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]
