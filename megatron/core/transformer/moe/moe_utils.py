@@ -1472,8 +1472,13 @@ def _quantile_correction_expert_height(
     mass_normalized: bool = False,
     mass_tokens: Optional[Union[int, torch.Tensor]] = None,
     symmetric_window: bool = False,
+    squared_loss: bool = False,
 ) -> torch.Tensor:
     """Per-expert STE height inside each expert's quantile-correction window.
+
+    With `squared_loss` the height is T / q in every window (T = `mass_tokens`, q the fair share
+    sum(forward_load) / num_experts), so each window pair's push is proportional to its expert's
+    load error n_e - q; it replaces all other height options, mass normalization included.
 
     With `mass_normalized` the height is T / (tokens in the window), with T = `mass_tokens`, so
     every expert's window carries the identity kernel's mass T; the other height options then
@@ -1482,6 +1487,12 @@ def _quantile_correction_expert_height(
     include both halves.
     """
     with torch.no_grad():
+        if squared_loss:
+            fair_share = forward_load.detach().float().sum() / num_experts
+            tokens = torch.as_tensor(mass_tokens, device=fair_share.device, dtype=torch.float32)
+            return torch.ones_like(delta_bias, dtype=torch.float32) * (
+                tokens / fair_share.clamp(min=1e-12)
+            )
         if mass_normalized:
             window = _quantile_correction_window(
                 margin.detach().float(),
@@ -1551,6 +1562,7 @@ def _quantile_correction_load_surrogate(
     mass_tokens: Optional[Union[int, torch.Tensor]] = None,
     post_margin: bool = False,
     midpoint_coefficient: bool = False,
+    squared_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Build the hard-load surrogate and its per-expert QB correction.
 
@@ -1607,6 +1619,7 @@ def _quantile_correction_load_surrogate(
         mass_normalized=mass_normalized,
         mass_tokens=mass_tokens,
         symmetric_window=symmetric_window,
+        squared_loss=squared_loss,
     )
     ste_tokens_per_expert = _QuantileCorrectionLoadSTE.apply(
         margin if grad_target is None else margin.detach(),
@@ -2158,6 +2171,8 @@ def direct_load_balancing_loss_func(
     quantile_correction_coordinate_coefficient: bool = False,
     quantile_correction_midpoint_coefficient: bool = False,
     quantile_correction_logistic_tau: float = 0.0,
+    quantile_correction_squared_loss: bool = False,
+    load_balance_expert_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Calculate direct routed-load balance loss with optional STE.
 
@@ -2179,6 +2194,15 @@ def direct_load_balancing_loss_func(
       by a logistic margin loss around each expert's QB-corrected boundary
       (`_quantile_correction_logistic_surrogate`). A pair at the boundary gets 2E*T/denom^2, the
       push of a mass-normalized quantile-correction window pair, so lambda keeps its scale.
+    - `quantile_correction_squared_loss` (quantile correction with the default coefficient only):
+      height T/q in every window instead of T/|W_e|, so each window pair's push is proportional
+      to its expert's load error: the selected STE of the squared load error instead of the L1
+      error. Equal to the mass-normalized push at |n_e - q| = q.
+    - `load_balance_expert_weights` ([num_experts], the load-balancing deadband): scales each
+      expert's own push through the gradient of its load; 0 silences the expert. The loss value
+      is unchanged.
+      Not applied to the coordinate, midpoint or logistic quantile-correction terms, nor to the
+      exact_jump, coordinate_perturbation and noisy losses.
     """
     total_num_tokens_tensor = torch.as_tensor(
         total_num_tokens, device=tokens_per_expert.device, dtype=torch.float32
@@ -2305,6 +2329,7 @@ def direct_load_balancing_loss_func(
                     mass_tokens=total_num_tokens_tensor,
                     post_margin=quantile_correction_post_margin,
                     midpoint_coefficient=quantile_correction_midpoint_coefficient,
+                    squared_loss=quantile_correction_squared_loss,
                 )
             )
             ste_load_frac = ste_tokens_per_expert.float() / denom
@@ -2362,6 +2387,10 @@ def direct_load_balancing_loss_func(
             ste_load_frac = ste_tokens_per_expert.float() / denom
             load_frac = hard_load_frac + ste_load_frac - ste_load_frac.detach()
 
+        if load_balance_expert_weights is not None:
+            load_frac = load_frac.detach() + load_balance_expert_weights * (
+                load_frac - load_frac.detach()
+            )
         loss = _direct_load_balance_from_load(load_frac, num_experts, load_balancing_type)
         if coordinate_surrogate is not None:
             # The centered loss's derivative in the loads is 2E/denom^2 * (n_e - 1/a); the

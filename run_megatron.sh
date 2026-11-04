@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=reformo
+#SBATCH --account=laionize
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1        # one task per node; torchrun spawns one process per GPU
 #SBATCH --gpus-per-node=4

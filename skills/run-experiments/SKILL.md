@@ -81,7 +81,7 @@ numbers don't follow the file order, so identify runs by their label.
   - Afterwards, sync or delete the smoke set. An unsynced set older than the newest synced one blocks sync-runs.
 - **The job uses the code as it is when the job starts, not when it was submitted.** `run_megatron.sh` mounts the repo
   at `/workspace`. Editing code, or switching branches, while jobs are queued changes what they run.
-- **Cost:** each run uses 4 nodes × 4 GPUs (account reformo, partition booster) for ~6 h in every2 (5.6–6.1 h). The
+- **Cost:** each run uses 4 nodes × 4 GPUs (account laionize since 2026-11-01, when reformo's budget ran out; partition booster) for ~6 h in every2 (5.6–6.1 h). The
   limit is 8 h (`#SBATCH --time=480`). The dry run prints the number of runs.
 - **Duplicates:** check whether runsdb already has the run:
   `tools/runsdb/q.py runs --where "num_experts=2048 AND moe_router_load_balancing_type='...'"`.

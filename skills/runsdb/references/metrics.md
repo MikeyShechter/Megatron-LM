@@ -450,6 +450,20 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
   for the same load error, whatever the kernel; the kernel only spreads it over tokens. Windowed kernels get height
   T / (tokens in the window). For quantile correction this replaces the height options (1/|δb_e|, unnormalized,
   count-normalized). Same load-balancing types as the post-activation option.
+- Configs `moe_lb_deadband_vio`, `moe_lb_deadband_noise_z` and `moe_lb_deadband_noise_ema_decay` (added
+  2026-11-01): a per-expert deadband on the load-balancing signal, from the step's global loads n_e (mean q = T·K/E).
+  - Fixed: no push of its own for an expert with |Vio_e| = |n_e − q|/q below `moe_lb_deadband_vio`.
+  - Noise: no push while |n_e − q| < z·σ_e, where σ_e² is an EMA of the expert's load variance around its own EMA
+    load. The decay is `moe_lb_deadband_noise_ema_decay` (default 0.99), and both averages start at q.
+  - A silenced expert's load is set to q in `aux_loss`. In the direct losses built on the per-expert load (quantile
+    correction, the centered_fsq family, fixed-N) it carries no gradient. Through the softmax it still moves with
+    the other experts' pushes.
+  - One sampling-noise sd of Vio_e is 1/√q (0.044 at q = 512).
+  - 0 turns each off. The logged `load_balancing_loss` of `aux_loss` runs is computed with the substituted loads
+    (`TopKRouter._lb_deadband_weights`).
+  - `moe_lb_deadband_rescale` (added 2026-11-01): the push of every expert outside the deadband is multiplied by
+    Σ_e |n_e − q| / Σ_{e outside} |n_e − q|, so the total push equals the one without the deadband. Without it, the
+    silenced experts' push is simply removed.
 
 ## Downstream tasks (validation sets added after "regular"; run at every eval; `--skip-task-eval` turns them off)
 - `--task-eval-tasks dclm-core-22` means 20 lm-eval-harness tasks:

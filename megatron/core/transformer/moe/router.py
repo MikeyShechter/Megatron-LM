@@ -438,6 +438,30 @@ class TopKRouter(Router):
             and not self.use_separate_weighter
         )
 
+        # Per-expert noise deadband (`moe_lb_deadband_noise_z`): moving averages of each expert's
+        # load and of its variance. A negative variance marks averages that haven't started.
+        if getattr(self.config, "moe_lb_deadband_noise_z", 0.0) > 0:
+            self.register_buffer(
+                'lb_deadband_load_mean',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+            self.register_buffer(
+                'lb_deadband_load_var',
+                torch.full(
+                    (self.config.num_moe_experts,),
+                    -1.0,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        else:
+            self.lb_deadband_load_mean = None
+            self.lb_deadband_load_var = None
+
         # Learnable routing biases (selection-only or routing-weight variants).
         self.learnable_bias_type = getattr(self.config, "moe_learnable_bias_type", "none")
         self.lm_loss_ste = getattr(self.config, "moe_lm_loss_ste", False)
@@ -542,6 +566,10 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        for name in ('lb_deadband_load_mean', 'lb_deadband_load_var'):
+            buf = getattr(self, name, None)
+            if buf is not None and buf.dtype != torch.float32:
+                buf.data = buf.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -764,6 +792,44 @@ class TopKRouter(Router):
                 return True
         return False
 
+    def _lb_deadband_weights(self, tokens_per_expert: torch.Tensor) -> Optional[torch.Tensor]:
+        """Per-expert weights of the load-balancing push from the deadband: 0 inside it, else 1.
+
+        `tokens_per_expert` are the load-balancing batch's loads n_e, with mean q. The fixed
+        deadband (`moe_lb_deadband_vio`) silences |n_e - q| < vio * q; the noise deadband
+        (`moe_lb_deadband_noise_z`) silences |n_e - q| < z * sigma_e and then adds the batch to
+        each expert's moving averages. With `moe_lb_deadband_rescale` the weight outside the
+        deadband is sum_e |n_e - q| / sum_{e outside} |n_e - q| instead of 1, so the total push is
+        the one without the deadband. None when no deadband is set.
+        """
+        vio = getattr(self.config, "moe_lb_deadband_vio", 0.0)
+        noise_z = getattr(self.config, "moe_lb_deadband_noise_z", 0.0)
+        if vio <= 0.0 and noise_z <= 0.0:
+            return None
+        with torch.no_grad():
+            load = tokens_per_expert.float()
+            fair = load.mean()
+            error = (load - fair).abs()
+            if vio > 0.0:
+                active = error >= vio * fair
+            else:
+                mean, var = self.lb_deadband_load_mean, self.lb_deadband_load_var
+                # First batch: start from a balanced expert with sampling noise only (mean q, var q).
+                start = var < 0
+                mean.copy_(torch.where(start, fair, mean))
+                var.copy_(torch.where(start, fair, var))
+                active = error >= noise_z * var.sqrt()
+                # Exponentially weighted mean and variance (Finch 2009, incremental form).
+                alpha = 1.0 - self.config.moe_lb_deadband_noise_ema_decay
+                diff = load - mean
+                mean.add_(alpha * diff)
+                var.copy_((1.0 - alpha) * (var + alpha * diff * diff))
+            weights = active.float()
+            if getattr(self.config, "moe_lb_deadband_rescale", False):
+                kept = (error * weights).sum().clamp(min=1e-12)
+                weights = torch.where(active, error.sum() / kept, torch.zeros_like(weights))
+            return weights
+
     def _apply_aux_loss(
         self,
         probs: torch.Tensor,
@@ -791,6 +857,13 @@ class TopKRouter(Router):
                 with_padding_mask=with_padding_mask,
             )
         )
+        lb_weights = self._lb_deadband_weights(global_tokens_per_expert)
+        if lb_weights is not None:
+            # Scale each expert's deviation from the mean load; a silenced expert gets the mean
+            # load, the coefficient of a balanced expert.
+            loads = global_tokens_per_expert.float()
+            fair = loads.mean()
+            global_tokens_per_expert = fair + lb_weights * (loads - fair)
 
         aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
@@ -956,6 +1029,10 @@ class TopKRouter(Router):
             quantile_correction_logistic_tau=getattr(
                 self.config, "quantile_correction_logistic_tau", 0.0
             ),
+            quantile_correction_squared_loss=getattr(
+                self.config, "quantile_correction_squared_loss", False
+            ),
+            load_balance_expert_weights=self._lb_deadband_weights(global_tokens_per_expert),
         )
         for load_balancing_type, direct_aux_loss_coeff in direct_loss_coeffs:
             quantile_correction_delta_bias = (

@@ -1003,6 +1003,44 @@ class TransformerConfig(ModelParallelConfig):
     No effect with `quantile_correction_coordinate_coefficient`, whose coefficient has no
     self-term."""
 
+    quantile_correction_squared_loss: bool = False
+    """Give every quantile-correction window the fixed height T / q (T tokens in the load-balancing
+    batch, q = T*K/E an expert's fair share, so T / q = E/K). Each window pair's push is then
+    proportional to its expert's load error n_e - q: the selected STE of the squared load error.
+    Mass normalization (height T / |W_e|, with |W_e| = |n_e - q| at the exact margin and quantile)
+    gives every window pair the same push instead: the selected STE of the L1 error. The two
+    heights agree at |n_e - q| = q. Replaces the other height options, mass normalization
+    included. No effect with `quantile_correction_coordinate_coefficient` or
+    `quantile_correction_logistic_tau`."""
+
+    moe_lb_deadband_vio: float = 0.0
+    """Fixed per-expert deadband on the load-balancing signal: an expert whose load error in the
+    load-balancing batch, |Vio_e| = |n_e - q| / q (q = T*K/E, the mean load), is below this value
+    gets no load-balancing push of its own. One sampling-noise standard deviation of Vio_e is
+    1/sqrt(q) (0.044 at q = 512). In `aux_loss` the expert's load is replaced by q; in the direct
+    losses built on the per-expert load (quantile correction, the `centered_fsq` family,
+    `fixed_number_boundary_ste`) its load carries no gradient. Through a softmax it still moves
+    with the other experts' pushes. Not applied to the coordinate, midpoint or logistic
+    quantile-correction terms. 0 turns it off; it is used instead of `moe_lb_deadband_noise_z` when
+    both are set."""
+
+    moe_lb_deadband_noise_z: float = 0.0
+    """Per-expert noise deadband on the load-balancing signal: no load-balancing push of its own for
+    an expert while |n_e - q| < z * sigma_e. sigma_e^2 is an exponential moving average of the
+    variance of the expert's load n_e around its own moving-average load (decay
+    `moe_lb_deadband_noise_ema_decay`, one update per training forward, after the expert's
+    deadband test). Both averages start from a balanced expert with sampling noise only: mean q,
+    variance q. The push is removed as with `moe_lb_deadband_vio`. 0 turns it off."""
+
+    moe_lb_deadband_noise_ema_decay: float = 0.99
+    """Decay of the moving averages behind `moe_lb_deadband_noise_z` (0.99: about 100 steps)."""
+
+    moe_lb_deadband_rescale: bool = False
+    """With a load-balancing deadband, multiply the push of every expert outside it by
+    sum_e |n_e - q| / sum_{e outside} |n_e - q|, so the total push (each expert's push grows with
+    its load error) is the one without the deadband: the silenced experts' push moves to the rest
+    instead of disappearing. In `aux_loss` this scales the expert's load deviation n_e - q."""
+
     quantile_correction_logistic_tau: float = 0.0
     """If > 0, replace quantile correction's window push by a logistic margin loss around each
     expert's QB-corrected boundary z = -delta_b_e: every pair (t, e) is pushed up if
