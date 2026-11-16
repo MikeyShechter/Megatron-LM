@@ -19,19 +19,33 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 import common as C
 
 KINDS = {}
 
 
-def key_kinds(metas):
+def raw_key_counts(run_id):
+    """(#rows, {key: #values}) of raw/<run_id>.parquet, read from the parquet metadata (row and null counts).
+    wandb's own per-key counts (historyKeys) are wrong since 2026-11-04: about 2 values per key."""
+    md = pq.read_metadata(C.RAW / f"{run_id}.parquet")
+    counts = defaultdict(int)
+    for g in range(md.num_row_groups):
+        rg = md.row_group(g)
+        for i in range(rg.num_columns):
+            col = rg.column(i)
+            counts[col.path_in_schema] += rg.num_rows - col.statistics.null_count
+    return md.num_rows, {k: n for k, n in counts.items() if n}
+
+
+def key_kinds(counts):
     """'train' for keys logged on most steps (median over runs of #values/#rows > 5%), else 'eval'."""
     shares = defaultdict(list)
-    for m in metas:
-        if m["history_rows"]:
-            for k, n in m["history_keys"].items():
-                shares[k].append(n / m["history_rows"])
+    for rows, keys in counts.values():
+        if rows:
+            for k, n in keys.items():
+                shares[k].append(n / rows)
     return {k: "train" if statistics.median(v) > 0.05 else "eval" for k, v in shares.items()}
 
 
@@ -177,11 +191,11 @@ def sweeps_table(runs):
     return pd.DataFrame(rows).sort_values("date", ascending=False).reset_index(drop=True)
 
 
-def keys_table(metas, kinds, run_dates):
+def keys_table(key_counts, kinds, run_dates):
     counts, dates = defaultdict(list), defaultdict(list)
-    for m in metas.values():
-        d = run_dates.get(m["run_id"])
-        for k, n in m["history_keys"].items():
+    for rid, (_, keys) in key_counts.items():
+        d = run_dates.get(rid)
+        for k, n in keys.items():
             if k not in ("_step", "_timestamp"):
                 counts[k].append(n)
                 if isinstance(d, str):
@@ -221,8 +235,9 @@ def main():
     for path in C.META.glob("*.json"):
         m = C.read_json(path)
         metas[m["run_id"]] = m
-    kinds = key_kinds(metas.values())
-    jobs = [(r, C.decay_start(m["config"])) for r, m in metas.items() if (C.RAW / f"{r}.parquet").exists()]
+    key_counts = {r: raw_key_counts(r) for r in metas if (C.RAW / f"{r}.parquet").exists()}
+    kinds = key_kinds(key_counts)
+    jobs = [(r, C.decay_start(metas[r]["config"])) for r in key_counts]
     with ProcessPoolExecutor(min(16, os.cpu_count() or 4), initializer=_init_worker, initargs=(kinds,)) as ex:
         results = list(ex.map(process_run, jobs, chunksize=16))
     write_long("eval", [r[1] for r in results])
@@ -231,7 +246,7 @@ def main():
     write_parquet(runs, "runs")
     sweeps = sweeps_table(runs)
     write_parquet(sweeps, "sweeps")
-    keys = keys_table(metas, kinds, dict(zip(runs["run_id"], runs["started"].dt.strftime("%Y-%m-%d"))))
+    keys = keys_table(key_counts, kinds, dict(zip(runs["run_id"], runs["started"].dt.strftime("%Y-%m-%d"))))
     write_parquet(keys, "keys")
     write_markdown(sweeps, keys)
     print(f"built tables for {len(metas)} runs ({len(jobs)} with history) in {time.time() - t0:.0f}s")

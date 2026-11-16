@@ -30,7 +30,6 @@ def as_dict(x):
 
 def run_meta(run):
     a = run._attrs
-    keys = as_dict(a.get("historyKeys")).get("keys") or {}
     return {
         "run_id": run.id,
         "name": a.get("displayName"),
@@ -40,11 +39,6 @@ def run_meta(run):
         "tags": a.get("tags") or [],
         "notes": a.get("notes") or "",
         "history_rows": a.get("historyLineCount") or 0,
-        "history_keys": {
-            k: sum(t.get("count", 0) for t in v.get("typeCounts", []))
-            for k, v in keys.items()
-            if not k.startswith("system/")
-        },
         "config": C.clean_config(as_dict(a.get("config"))),
         "summary": as_dict(a.get("summaryMetrics")),
         "source": "wandb",

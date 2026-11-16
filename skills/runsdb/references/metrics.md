@@ -93,8 +93,10 @@ all-reduced over ranks (SUM; MAX for `*_worst`). "Mean over layers" means over M
   zero. Mean over layers. 0 at the first step. The paper (arXiv 2609.39137, Fig. 4a) sees about 0.38 early and 0.25
   later (U:3333-3343, U:3677-3713, R:2105).
 - `train/expert_bias/{abs_delta,std,range}` (added 2026-10-04): the balancing bias of the loss-free methods, i.e.
-  `expert_bias` with `--moe-router-enable-expert-bias` (`sign` or `id` update) or `qb_beta` with
-  `quantile_balancing`. Per layer, at this step's global-batch update, then mean over layers:
+  `expert_bias` with `--moe-router-enable-expert-bias` (`sign` or `id` update), `qb_beta` with
+  `quantile_balancing`, or QC's routing bias with `quantile_correction_qb_routing` (in QC's margin units:
+  probabilities with `quantile_correction_post_margin`). Per layer, at this step's global-batch update, then mean
+  over layers:
   - `abs_delta`: mean over experts of |Δb_e − mean_e Δb_e|. The common shift is removed because it does not change
     routing (ID and QB biases are zero-mean anyway; DeepSeek `sign` is not). With `sign` this is ≈ the update rate by
     construction. The paper's bias-drift plot (Fig. 5a) is |Δb| between checkpoints 1k steps apart instead.
@@ -377,6 +379,15 @@ keys above log 0. Margins of exactly 0 are left out, because they belong to the 
     δb_e is about π at the threshold (≈3e-3 at E=2048) times the logit shift, so 1/|δb_e| is ~300× larger.
   - `vio/QBShift*` and `vio/QBShiftBatch/*` stay in logit units: these runs compute them like non-QC runs instead of
     reusing their own δb_e.
+- Config `quantile_correction_qb_routing` (added 2026-11-10; plain router): QC + QB. QC is unchanged, but the
+  dispatch is each token's top-k of (QC's margin scores + the previous training step's δb_e), with unbiased combine
+  weights. The margin scores are the logits, or π with `quantile_correction_post_margin`. At finalize the bias
+  becomes the step's δb_e, taken like EQB over the pooled global batch (with one microbatch per step, the forward's
+  own δb_e); eval routes with the last one.
+  - The dispatch metrics (`vio/*`, `train/vio/*`, `train/load_dynamics/*`, dispatch MaxVio) measure the biased
+    dispatch.
+  - `quantile_correction/*` and `vio/QBShift*` measure the router's own unbiased top-k, as in plain QC runs.
+  - `train/expert_bias/*` tracks the routing bias.
 - Config `quantile_correction_coordinate_coefficient` (added 2026-10-18): competitor-aware QC. Each window pair
   (t, e) is weighted by the coordinate estimator's coefficient n_e^{-t} − n_m^{-t} instead of n_e − 1/a, where m is
   the expert the pair would swap with (its threshold expert at the exact margin). Windows, heights and entry point

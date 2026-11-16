@@ -63,7 +63,7 @@ have. Ask the user before installing it.
 - `raw('<run_id>')`: the full history of one run, one column per key. Quote keys:
   `SELECT _step, "vio/MaxVioGlobal" FROM raw('7h9qk7e1') WHERE "vio/MaxVioGlobal" IS NOT NULL`.
 - `sweeps`, `keys`: what `q.py sweeps` and `q.py keys` print.
-- `meta/<run_id>.json`: the full config (~800 keys), summary, and per-key value counts.
+- `meta/<run_id>.json`: the full config (~800 keys) and summary.
 
 ## Conventions and pitfalls
 
