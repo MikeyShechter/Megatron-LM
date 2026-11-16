@@ -80,7 +80,6 @@ def ingest_run(run_id, files):
         "tags": info.get("tags", []),
         "notes": "",
         "history_rows": n,
-        "history_keys": {c: int(df[c].notna().sum()) for c in df.columns},
         "config": C.clean_config(config),
         "summary": summary,
         "source": "local",
