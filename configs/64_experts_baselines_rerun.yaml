@@ -1,0 +1,156 @@
+# E=64, K=8 baseline reruns (user, 2026-11-07), after the fixes found in the E=2048 work. Each LIST entry sets every
+# LB key, so no setting leaks between baselines.
+# - aux loss, λ ∈ {0.1, 1}: λ=0.1 reruns the old table's aux row (lpz3rnmh: 3.1766, MaxVio 0.16 / 0.24) for the newer
+#   logs (local MaxVio, dead experts); λ=1 extends the grid past its top, for a comparison with QC at matched balance.
+# - DeepSeek loss-free (sign update, bias on the scores), rate ∈ {0.1, 1}: rate 0.1 reruns 14joife5 (3.1765,
+#   0.45 / 0.60) with exact int64 token counts (bf16 counts bug, fixed 2026-11-07); 0.1 was the top of its old grid
+#   (1e-4 ... 0.1), so rate 1 extends it.
+# - QB with EQB's exact global quantile, bias on the logits, sigmoid (the EQB paper's setup) and sqrtsoftplus: the old
+#   runs averaged each rank's quantile (ho1femok, sqrtsoftplus: 3.1772, 0.15 / 0.22; o1q9o1tp, sigmoid: 3.1784,
+#   0.11 / 0.19).
+# - ID balancing (K_i = K_d = rate, as at E=2048), never run at E=64: rate ∈ {6e-3, 6e-2, 0.6}. E=2048's best was 6e-3
+#   with sigmoid and 0.06 with softmax; here the relative load errors are about 10x smaller, so the grid reaches higher.
+# Copy of 64_experts_qc_full_post.yaml. Changed: name; LB block (LIST_BASELINE; the score function moved into it).
+# 9 runs.
+job_details:
+  name: experts64_baselines_rerun
+  output_dir: /e/data1/mmlaion/shechter1/checkpoints/megatron/
+
+parameters:
+  # ── Data ─────────────────────────────────────────────────────────────────────
+  data_args_path: ["configs/dclm_baseline_gpt_neox_paths.txt"]
+  data_cache_path: ["/e/data1/mmlaion/shechter1/megatron_data_cache/dclm_gpt_neox"]
+
+  split: ["98,1,1"]
+  tokenizer_type: ["NullTokenizer"]
+  vocab_size: [50277]             # GPT-NeoX tokenizer vocab size; data is already tokenized.
+  padded_vocab_size: [50304]
+  null_tokenizer_eod_id: [0]      # GPT-NeoX <|endoftext|>
+  null_tokenizer_pad_id: [-1]     # no pad token in the pretokenized stream
+  save_only_latest: [true]
+  save_pre_decay: [true]
+
+  task-eval-tasks: ['dclm-core-22']   # as in the E=64 baselines
+  task-eval-data-dir: ['/e/project1/laionize/shechter1/core_megatron_datasets']
+
+  # ── Model ─────────────────────────────────────────────────────────────────────
+  num_layers: [12]
+  hidden_size: [768]
+  num_attention_heads: [6]
+  disable_bias_linear: [true]
+  seq_length: [1024]
+  max_position_embeddings: [1024]
+  squared_relu: [true]
+
+  # ── MoE: E=64, K=8, MoE in every layer ───────────────────────────────────────
+  moe_layer_freq: [1]
+  ffn_hidden_size: [3072]
+  num_experts: [64]
+  moe_router_topk: [8]
+  moe_grouped_gemm: [true]
+  moe_token_dispatcher_type: ["alltoall"]
+  moe_ffn_hidden_size: [384]
+  moe_router_dtype: ["fp32"]
+  moe_use_global_lb: [true]
+  moe_learnable_bias_type: ["none"]
+
+  # ── Load balancing: the E=64 baselines, one LIST entry per method ─────────────
+  LIST_BASELINE:
+    # aux loss
+    - moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_load_balancing_type: ["aux_loss"]
+      moe_aux_loss_coeff: [0.1, 1.0]
+      moe_router_enable_expert_bias: [false]
+      moe_router_bias_update_type: ["sign"]
+      moe_router_bias_update_rate: [0.001]
+      moe_router_bias_derivative_rate: [0.0]
+      moe_quantile_estimator: ["legacy"]
+    # DeepSeek loss-free: sign update, bias on the scores
+    - moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_load_balancing_type: ["none"]
+      moe_aux_loss_coeff: [0.0]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_type: ["sign"]
+      moe_router_bias_update_rate: [0.1, 1.0]
+      moe_router_bias_derivative_rate: [0.0]
+      moe_quantile_estimator: ["legacy"]
+    # QB, EQB's exact global quantile, bias on the logits
+    - moe_router_score_function: ["sigmoid", "sqrtsoftplus"]
+      moe_router_load_balancing_type: ["quantile_balancing"]
+      moe_aux_loss_coeff: [0.0]
+      moe_router_enable_expert_bias: [false]
+      moe_router_bias_update_type: ["sign"]
+      moe_router_bias_update_rate: [0.001]
+      moe_router_bias_derivative_rate: [0.0]
+      moe_quantile_estimator: ["exact"]
+    # ID balancing, K_i = K_d
+    - moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_load_balancing_type: ["none"]
+      moe_aux_loss_coeff: [0.0]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_type: ["id"]
+      moe_router_bias_update_rate: [0.006]
+      moe_router_bias_derivative_rate: [0.006]
+      moe_quantile_estimator: ["legacy"]
+    - moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_load_balancing_type: ["none"]
+      moe_aux_loss_coeff: [0.0]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_type: ["id"]
+      moe_router_bias_update_rate: [0.06]
+      moe_router_bias_derivative_rate: [0.06]
+      moe_quantile_estimator: ["legacy"]
+    - moe_router_score_function: ["sqrtsoftplus"]
+      moe_router_load_balancing_type: ["none"]
+      moe_aux_loss_coeff: [0.0]
+      moe_router_enable_expert_bias: [true]
+      moe_router_bias_update_type: ["id"]
+      moe_router_bias_update_rate: [0.6]
+      moe_router_bias_derivative_rate: [0.6]
+      moe_quantile_estimator: ["legacy"]
+
+  # ── MaxVio controller: off (rate 0). Sweeps that use it set mode, rate and target. ──
+  moe_balance_update_rate: [0.0]
+  moe_balance_update_start_iter: [300]
+
+  # ── Optimizer ────────────────────────────────────────────────────────────────
+  optimizer: ["muon"]
+  muon_scale_mode: ["shape_scaling"]
+  muon_nesterov: [true]
+  muon_momentum: [0.95]
+  lr: [0.02]
+  decoupled_lr: [0.002]           # LR of the embedding and output layers
+  min_lr: [1.0e-6]
+  weight_decay: [0.0]
+  clip_grad: [1.0]
+  adam_beta1: [0.9]
+  adam_beta2: [0.95]
+
+  # ── LR schedule ──────────────────────────────────────────────────────────────
+  lr_decay_style: ["WSD"]
+  lr_warmup_iters: [0]
+  lr_wsd_decay_iters: [1714]      # decay starts at iteration 4286
+  lr_wsd_decay_style: ["linear"]
+
+  # ── Batch & iters ─────────────────────────────────────────────────────────────
+  micro_batch_size: [32]          # 32 sequences/GPU; one microbatch per optimizer step.
+  global_batch_size: [512]        # 512 * 1024 * 8 / 64 = 65,536 assignments/expert on average.
+  train_iters: [6000]
+  bf16: [true]
+  seed: [1000]
+  deterministic_mode: [true]
+  attention_backend: ["unfused"]
+  cross_entropy_loss_fusion: [false]
+
+  # ── Parallelism ───────────────────────────────────────────────────────────────
+  tensor_model_parallel_size: [1]
+  pipeline_model_parallel_size: [1]
+  expert_model_parallel_size: [8]  # 8 local experts/GPU, as in the E=64 baselines.
+
+  # ── Eval & logging ────────────────────────────────────────────────────────────
+  eval_interval: [150]
+  eval_iters: [20]
+  save_interval: [150]
+  log_interval: [10]
+  wandb_project: ["megatron-moe"]
+  log_timers_to_tensorboard: [true]
