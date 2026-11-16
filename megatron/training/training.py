@@ -1491,6 +1491,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
 
+    # Single-batch experiments: only the routers learn (before DDP, which buffers trainable params).
+    if getattr(args, "train_router_only", False):
+        for model_module in model:
+            for name, param in model_module.named_parameters():
+                if '.router.' not in name:
+                    param.requires_grad_(False)
+
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
@@ -3346,6 +3353,58 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _setup_single_batch_experiment(args, model, train_data_iterator):
+    """--single-batch-experiment (repeat the first batch) and --routing-dump-dir."""
+    if getattr(args, "single_batch_experiment", False):
+        import itertools
+
+        # RerunDataIterator reads `iterable`; get_batch copies to the GPU without changing it.
+        first_batch = next(train_data_iterator.iterable)
+        train_data_iterator.iterable = itertools.repeat(first_batch)
+
+    if getattr(args, "routing_dump_dir", None):
+        from megatron.core.transformer.moe import moe_utils
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        os.makedirs(args.routing_dump_dir, exist_ok=True)
+        # The QC surrogate then leaves this rank's window size; each dump adds it to its layer.
+        moe_utils._RECORD_QC_WINDOW = True
+        routers = [
+            m for chunk in model for m in unwrap_model(chunk).modules() if isinstance(m, TopKRouter)
+        ]
+        pending = {}
+
+        def dump_hook(module, inputs, output):
+            if not (module.training and torch.is_grad_enabled()):
+                return
+            window_pairs = moe_utils._LAST_QC_WINDOW_PAIRS
+            moe_utils._LAST_QC_WINDOW_PAIRS = None
+            step = args.curr_iteration + 1
+            interval = args.routing_dump_interval
+            if step != 1 and not (interval > 0 and step % interval == 0):
+                return
+            probs, routing_map = output
+            experts = routing_map.nonzero(as_tuple=True)[1].view(routing_map.shape[0], module.topk)
+            pending[module.layer_number] = {
+                'experts': experts.to(torch.int16).cpu(),
+                'weights': probs.detach().gather(1, experts).to(torch.float16).cpu(),
+            }
+            if window_pairs is not None:
+                pairs, tokens = window_pairs.tolist()
+                pending[module.layer_number]['qc_window_pairs'] = int(pairs)
+                pending[module.layer_number]['qc_window_tokens'] = int(tokens)
+            if len(pending) == len(routers):
+                path = os.path.join(
+                    args.routing_dump_dir,
+                    f"step{step:05d}_rank{torch.distributed.get_rank():03d}.pt",
+                )
+                torch.save(dict(pending), path)
+                pending.clear()
+
+        for router in routers:
+            router.register_forward_hook(dump_hook)
+
+
 def train(
     forward_step_func,
     model,
@@ -3362,6 +3421,7 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    _setup_single_batch_experiment(args, model, train_data_iterator)
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -4064,8 +4124,9 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
-def _save_eval_expert_counts(snapshots, path):
-    """Save each expert's running selection count after every eval batch, summed over ranks."""
+def _save_eval_expert_counts(snapshots, path, model):
+    """Save each expert's running selection count after every eval batch, summed over ranks,
+    and each layer's quantile-balancing bias (the bias this eval routed with)."""
     counts = torch.stack(snapshots).round().to(torch.int64)  # (eval batches, layers, experts)
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     torch.distributed.all_reduce(
@@ -4073,6 +4134,12 @@ def _save_eval_expert_counts(snapshots, path):
     )
     if torch.distributed.get_rank() == 0:
         args = get_args()
+        qb_beta, qb_beta_layer_numbers = [], []
+        for model_chunk in unwrap_model(model):
+            for module in model_chunk.modules():
+                if getattr(module, "qb_beta", None) is not None and module.layer_number is not None:
+                    qb_beta.append(module.qb_beta.detach().float().cpu())
+                    qb_beta_layer_numbers.append(module.layer_number)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(
             {
@@ -4081,6 +4148,8 @@ def _save_eval_expert_counts(snapshots, path):
                 "iteration": args.iteration,
                 "eval_global_batch_size": args.eval_global_batch_size,
                 "seq_length": args.seq_length,
+                "qb_beta": torch.stack(qb_beta) if qb_beta else None,
+                "qb_beta_layer_numbers": qb_beta_layer_numbers,
             },
             path,
         )
@@ -4232,7 +4301,7 @@ def evaluate(
                     return None, None, True
 
         if expert_count_snapshots:
-            _save_eval_expert_counts(expert_count_snapshots, expert_counts_path)
+            _save_eval_expert_counts(expert_count_snapshots, expert_counts_path, model)
 
         collected_non_loss_data = None
         if non_loss_data_func is not None:

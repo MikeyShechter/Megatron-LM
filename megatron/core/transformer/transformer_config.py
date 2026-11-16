@@ -825,6 +825,16 @@ class TransformerConfig(ModelParallelConfig):
     The bias then has probability units. Sigmoid and sqrtsoftplus always add it to the scores.
     Plain router only; the split router keeps its own selection rule."""
 
+    moe_router_init_bias_path: Optional[str] = None
+    """A .pt file with one constant selection bias b per MoE layer and expert (keys `qb_beta`,
+    [layers, experts], and `qb_beta_layer_numbers`, as saved with `eval_expert_counts_dir`), e.g.
+    the quantile-balancing bias fitted on a few batches at init. Each router centers its layer's b
+    and picks its top-k on logits - b; b is never updated and does not enter the combine weights.
+    The load balancing then works on logits - b: the expert bias of
+    `moe_router_enable_expert_bias` adds to it, quantile balancing fits its bias there, quantile
+    correction takes its margins and window there, and the aux loss counts the load and takes its
+    probabilities there. b is in logit units: plain router with softmax, bias on the logits."""
+
     moe_router_quantile_balancing_ema: float = 0.0
     """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
@@ -870,6 +880,15 @@ class TransformerConfig(ModelParallelConfig):
     """Number of uniform bins for `moe_quantile_estimator` "histogram". Kimi K3 uses 1000. With
     sigmoid-score quantile balancing the bins span [min(qb_beta) - 1, max(qb_beta) + 1], as in
     Kimi K3; otherwise they span each expert's global min/max (one extra small all-reduce)."""
+
+    moe_quantile_bias_iterations: int = 1
+    """Number of dual steps that compute the balancing bias of a batch: quantile balancing's
+    `qb_beta` update ("histogram" or "exact" `moe_quantile_estimator`) and quantile correction's
+    delta_b. Step 1 is the usual one, from the batch's routing. Each further step re-routes the
+    batch's tokens to their top-k under the bias found so far and takes the per-expert quantile
+    of the new margins: quantile balancing sets the bias to it, quantile correction adds it to
+    delta_b. The diagnostics that compare the shift to balance across methods (qb_shift) keep
+    step 1. 1 keeps the single step."""
 
     moe_qb_projection_temperature: float = 1.0
     """Temperature used only by the QB projection distillation probability transform."""
@@ -1013,6 +1032,26 @@ class TransformerConfig(ModelParallelConfig):
     included. No effect with `quantile_correction_coordinate_coefficient` or
     `quantile_correction_logistic_tau`."""
 
+    quantile_correction_window_scale: float = 1.0
+    """Footprint dial of `quantile_correction_ste` (single-batch experiments, with
+    `moe_load_balance_ste_mass_normalized`). Every expert's window becomes the
+    round(scale * |W_e|) (token, expert) pairs whose margin is nearest the middle of its flip band,
+    -delta_b / 2 (|W_e| = its usual window, the pairs the QB correction flips), counted over the
+    load-balancing batch. Below 1 it keeps the middle of the usual window, above 1 it widens it to
+    both sides until it holds every token, the identity kernel's support. Mass normalization keeps
+    each window's total push at T. 1 keeps the usual window and code path."""
+
+    quantile_correction_qb_routing: bool = False
+    """QC + QB: `quantile_correction_ste` that routes with the previous training step's delta_b,
+    as quantile balancing does with its bias. Each token goes to its top-k of (margin scores +
+    delta_b), where the margin scores are what QC takes its margins on: the logits, or the
+    normalized scores with `quantile_correction_post_margin`. The combine weights stay unbiased.
+    QC itself is unchanged: its margins, delta_b, windows and gradient come from the router's own
+    unbiased top-k, as without this flag. At finalize the bias becomes the step's delta_b, taken
+    like EQB over the whole global batch (the step's microbatches pooled; with one microbatch per
+    step that is the forward's own delta_b), so a batch is never routed with its own quantile.
+    Eval routes with the last training step's bias. Plain router only (not the split router)."""
+
     moe_lb_deadband_vio: float = 0.0
     """Fixed per-expert deadband on the load-balancing signal: an expert whose load error in the
     load-balancing batch, |Vio_e| = |n_e - q| / q (q = T*K/E, the mean load), is below this value
@@ -1062,6 +1101,16 @@ class TransformerConfig(ModelParallelConfig):
     a selection-only learnable bias) added to the logits under softmax selection, the gradient
     enters at the softmax of the biased logits instead, so it also reaches the bias. With a bias
     added to scores (sigmoid, sqrtsoftplus, post-softmax expert bias) the flag has no effect."""
+
+    moe_load_balance_ste_full_attach_threshold: bool = False
+    """Make the full STE differentiate the margin u_e - m(u_{-e}) instead of u_e alone, with the
+    gradient through the threshold m(u_{-e}), the K-th largest of the token's other scores: its
+    runner-up for a selected expert, its K-th expert for an unselected one (the `exact_margin`
+    position). u is the normalized scores with `moe_load_balance_ste_post_activation`, otherwise
+    the logits. The kernel stays 1 on every token. Off, the full STE drops m(u_{-e}), as the aux
+    loss does. Applies to the direct losses (`centered_fsq`); with the centered load error the
+    threshold term adds no push that is independent of the balance. Not used by
+    `moe_aux_loss_load_ste`."""
 
     moe_load_balance_ste_mass_normalized: bool = False
     """Scale each expert's STE kernel to a total mass of T, the number of tokens in the

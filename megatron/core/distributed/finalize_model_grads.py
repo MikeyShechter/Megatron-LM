@@ -335,6 +335,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_margin_buffer', None):
                 module.qb_margin_buffer.clear()
+            if getattr(module, 'qc_routing_buffer', None):
+                module.qc_routing_buffer.clear()
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
@@ -427,12 +429,22 @@ def _update_router_qb_beta(
     else:
         # Quantile of the pooled global batch: every rank's margins from this step's
         # microbatches, combined through all-reduced histograms (Kimi K3 or EQB).
+        # With moe_quantile_bias_iterations > 1 the buffer holds the scores, and each step
+        # takes the margins under the previous step's bias (step 1: qb_beta, the bias the
+        # batch was routed with, which gives the forward's margins).
+        iterations = config.moe_quantile_bias_iterations
         global_beta_list = []
         for router in router_list:
-            margins = torch.cat(router.qb_margin_buffer, dim=0)
+            buffered = torch.cat(router.qb_margin_buffer, dim=0)
             router.qb_margin_buffer.clear()
-            global_beta_list.append(
-                qb_global_beta(
+            beta = router.qb_beta
+            for _ in range(iterations):
+                if iterations > 1:
+                    alpha = (buffered - beta).topk(router.topk + 1, dim=1).values[:, -1:]
+                    margins = buffered - alpha
+                else:
+                    margins = buffered
+                beta = qb_global_beta(
                     margins,
                     router.topk,
                     config.num_moe_experts,
@@ -440,10 +452,12 @@ def _update_router_qb_beta(
                     estimator,
                     num_bins=config.moe_quantile_histogram_bins,
                     value_range=(
-                        router.qb_histogram_value_range() if estimator == "histogram" else None
+                        router.qb_histogram_value_range(beta)
+                        if estimator == "histogram"
+                        else None
                     ),
                 )
-            )
+            global_beta_list.append(beta)
         stacked_local_avg = torch.stack(global_beta_list, dim=0)
 
     ema = config.moe_router_quantile_balancing_ema
@@ -453,6 +467,26 @@ def _update_router_qb_beta(
     for router, qb_beta, new_beta in zip(router_list, qb_beta_list, stacked_new_beta):
         router.save_bias_update_metrics(qb_beta, new_beta)
         qb_beta.copy_(new_beta)
+
+
+def _update_router_qc_routing_bias(model: List[torch.nn.Module]):
+    """QC + QB (`quantile_correction_qb_routing`): the next step routes with this step's
+    quantile-correction delta_b, taken like EQB over the whole global batch: the step's
+    microbatches pooled, over QC's load-balancing group (every rank with `moe_use_global_lb`).
+    With one microbatch per step that is exactly the forward's own delta_b, so it is reused."""
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            buffer = getattr(module, 'qc_routing_buffer', None)
+            if not buffer or not module.training:
+                continue
+            if len(buffer) == 1:
+                new_bias = buffer[0][2]
+            else:
+                scores = torch.cat([entry[0] for entry in buffer], dim=0)
+                routing_map = torch.cat([entry[1] for entry in buffer], dim=0)
+                new_bias = module.quantile_correction_delta_b(scores, routing_map)[-1]
+            module.save_bias_update_metrics(module.qc_routing_bias, new_bias)
+            module.qc_routing_bias.copy_(new_bias)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -621,6 +655,9 @@ def finalize_model_grads(
 
     if config.moe_router_load_balancing_type == "quantile_balancing":
         _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+
+    if getattr(config, "quantile_correction_qb_routing", False):
+        _update_router_qc_routing_bias(model)
 
     reset_model_temporary_tensors(config, model)
 

@@ -103,6 +103,22 @@ class TrainingConfig:
     iterations_to_skip: list[int] = field(default_factory=list)
     """List of 1-indexed iterations to skip during training, empty by default."""
 
+    single_batch_experiment: bool = False
+    """Every training step reuses the first training batch. With --finetune (or from init) the
+    data order starts at sample 0, so runs from different checkpoints train on the same batch."""
+
+    train_router_only: bool = False
+    """Freeze every parameter except the MoE routers' (parameter names containing '.router.')."""
+
+    routing_dump_dir: Optional[str] = None
+    """If set, every training step 1 and every step divisible by routing_dump_interval saves each
+    MoE router's selected experts and gate weights for this rank's tokens, to
+    <dir>/step<NNNNN>_rank<RRR>.pt as {layer_number: {'experts': int16 [tokens, topk],
+    'weights': float16 [tokens, topk]}}."""
+
+    routing_dump_interval: int = 0
+    """See routing_dump_dir. 0 saves step 1 only."""
+
 
 @dataclass(kw_only=True)
 class ValidationConfig:

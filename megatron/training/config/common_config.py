@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 import os
 
 @dataclass(kw_only=True)
@@ -9,6 +9,10 @@ class RNGConfig:
 
     seed: int = 1234
     """Random seed used for python, numpy, pytorch, and cuda."""
+
+    data_seed: Optional[int] = None
+    """Seed for the datasets' sample order only. None uses `seed`. Lets a job draw other batches
+    while keeping the model init of `seed`."""
 
     te_rng_tracker: bool = False
     """Use the Transformer Engine version of the random number generator.
