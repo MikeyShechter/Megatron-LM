@@ -379,6 +379,17 @@ class TopKRouter(Router):
                         device=torch.cuda.current_device(),
                     ),
                 )
+            if self.config.moe_router_bias_update_type == "zaya1":
+                # ZAYA1's bias AdamW state: first and second moments, and the step count.
+                for name, size in (
+                    ('expert_bias_exp_avg', self.config.num_moe_experts),
+                    ('expert_bias_exp_avg_sq', self.config.num_moe_experts),
+                    ('expert_bias_adam_step', 1),
+                ):
+                    self.register_buffer(
+                        name,
+                        torch.zeros(size, dtype=torch.float32, device=torch.cuda.current_device()),
+                    )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -602,7 +613,14 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
-        for name in ('qc_routing_bias', 'lb_deadband_load_mean', 'lb_deadband_load_var'):
+        for name in (
+            'qc_routing_bias',
+            'lb_deadband_load_mean',
+            'lb_deadband_load_var',
+            'expert_bias_exp_avg',
+            'expert_bias_exp_avg_sq',
+            'expert_bias_adam_step',
+        ):
             buf = getattr(self, name, None)
             if buf is not None and buf.dtype != torch.float32:
                 buf.data = buf.data.to(torch.float32)

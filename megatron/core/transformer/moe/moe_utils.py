@@ -5296,6 +5296,62 @@ def get_id_balancing_updated_expert_bias(
         return updated_expert_bias, error, gate
 
 
+def get_zaya1_updated_expert_bias(
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    step: torch.Tensor,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ZAYA1-8B expert-bias update. See https://arxiv.org/abs/2605.05365 (Eq. 5).
+
+    One AdamW step on the bias, with torch.optim.AdamW's arithmetic, where the gradient is
+    load_share - 1/num_experts and load_share is each expert's share of the global batch's
+    assigned tokens. Overloaded experts get a positive gradient, so their bias goes down.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Local tokens per expert, [..., num_experts].
+        expert_bias (torch.Tensor): The bias for each expert.
+        exp_avg (torch.Tensor): AdamW first moment of the bias.
+        exp_avg_sq (torch.Tensor): AdamW second moment of the bias.
+        step (torch.Tensor): Number of AdamW steps taken so far, [..., 1].
+        lr (float): Learning rate.
+        beta1 (float): First-moment decay.
+        beta2 (float): Second-moment decay.
+        eps (float): Added to the denominator.
+        weight_decay (float): Decoupled weight decay.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The updated expert bias,
+        first moment, second moment and step count.
+    """
+    with torch.no_grad():
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(
+            tokens_per_expert,
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        )
+        # The counts are reduced as exact int64; fp32 holds them exactly below 2**24.
+        tokens_per_expert = tokens_per_expert.to(dtype=expert_bias.dtype)
+        load_share = tokens_per_expert / tokens_per_expert.sum(dim=-1, keepdim=True)
+        grad = load_share - 1.0 / tokens_per_expert.shape[-1]
+        step = step + 1
+        exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+        exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
+        bias_correction1 = 1 - beta1**step
+        bias_correction2 = 1 - beta2**step
+        denom = exp_avg_sq.sqrt() / bias_correction2.sqrt() + eps
+        updated_expert_bias = expert_bias * (1 - lr * weight_decay) - (
+            lr / bias_correction1
+        ) * exp_avg / denom
+        return updated_expert_bias, exp_avg, exp_avg_sq, step
+
+
 def maybe_move_tensor_to_cpu(
     tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
 ) -> torch.Tensor:

@@ -28,7 +28,13 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS,
+        NSCoeffT,
+        get_coefficient_iterator,
+        newton_schulz_tp,
+    )
+    from emerging_optimizers.utils import fp32_matmul_precision
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -153,8 +159,63 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 # ===========================================================================
 
 
+def _batched_newton_schulz_step(X: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
+    """One Newton-Schulz step on a batched (B, M, N) input.
+
+    Copied from emerging-optimizers 0.3.0 (``batched_newton_schulz_step``, PR #170), without
+    its TP all-reduce: the installed 0.2.0 only has the 2D ``torch.addmm`` step. It applies the
+    iteration to each batch element via :func:`torch.baddbmm`, which may not select the same
+    kernel as :func:`torch.addmm` does for one matrix, so results differ from the per-matrix
+    step by kernel-level rounding.
+    """
+    A = X @ X.mT
+    B = torch.baddbmm(A, A, A, alpha=c, beta=b)
+    X = torch.baddbmm(X, B, X, alpha=1.0, beta=a)
+    return X
+
+
+def _batched_newton_schulz(
+    x: torch.Tensor, steps: int, coefficient_type: str, eps: float = 1e-7
+) -> torch.Tensor:
+    """emerging-optimizers 0.3.0's ``newton_schulz`` for a batched (B, M, N) input.
+
+    The same normalization, transpose, coefficient iterator and BF16 compute (under the
+    "medium" fp32 matmul precision) as the installed per-matrix ``newton_schulz``, with the
+    batched step. No TP and no SYRK, as upstream Megatron-LM's single-rank batched path.
+    """
+    if x.ndim != 3:
+        raise TypeError(f"Input tensor x must be 3d (batched 2d), got {x.ndim}d")
+    if x.dtype != torch.float32:
+        raise TypeError(f"Input tensor x must be in float32, got {x.dtype}")
+    # transpose tensor to perform whitening on the smaller dimension
+    transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+    # Ensure spectral norm is at most 1
+    X = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)
+    # The installed version's coefficients and iteration mode, as the per-matrix path uses.
+    iter_mode = "cycle" if coefficient_type != "polar_express" else "repeat_last"
+    coeff_iter = get_coefficient_iterator(steps, _COEFFICIENT_SETS[coefficient_type], mode=iter_mode)
+    if torch.get_float32_matmul_precision() == "medium":
+        X = X.to(torch.bfloat16)
+    for a, b, c in coeff_iter:
+        X = _batched_newton_schulz_step(X, a, b, c)
+    # Convert back to FP32. This is a noop if X is already in FP32.
+    X = X.to(torch.float32)
+    # undo transpose if necessary
+    if transpose:
+        X = X.mT
+    return X
+
+
 class TensorParallelMuon(OrthogonalizedOptimizer):
-    """Tensor Parallel Muon optimizer."""
+    """Tensor Parallel Muon optimizer.
+
+    With ``ns_batch_size > 1``, the Newton-Schulz of same-shape matrices runs batched, as in
+    upstream Megatron-LM's ``LayerShardedMuon`` on a single-rank domain: under MoE a rank holds
+    hundreds of identically shaped expert weights, and the per-matrix loop is bound by kernel
+    launches. ``ns_batch_size=1`` (the default) keeps the per-matrix path bit for bit.
+    """
 
     def __init__(
         self,
@@ -174,6 +235,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        ns_batch_size: int = 1,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -209,6 +271,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        # The batched path (step with ns_batch_size > 1) reads these off self, as upstream's
+        # LayerShardedMuon does; the per-matrix path keeps them in its closure above.
+        self.ns_batch_size = ns_batch_size
+        self.num_ns_steps = num_ns_steps
+        self.coefficient_type = coefficient_type
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -277,6 +346,92 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
 
+    def _batchable(self, p: torch.Tensor) -> bool:
+        """True when orthogonalize(p) is one plain Newton-Schulz on the local matrix, which the
+        batched path reproduces: not a split QKV weight, and no TP partition (as orthogonalize
+        resolves it)."""
+        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+            return False
+        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
+        return partition_dim is None or partition_dim == -1
+
+    def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
+        """The base step's weight update with its pre/post hooks (upstream LayerShardedMuon's
+        _apply_update)."""
+        self.pre_weight_update_fn_inplace(p, update)
+        p.add_(update, alpha=-lr)
+        self.post_weight_update_fn_inplace(p)
+
+    def _iter_ns(self, params: List[torch.Tensor], load: Callable, group_kwargs: Dict[str, Any]):
+        """Newton-Schulz per matrix, batched by shape (upstream LayerShardedMuon._iter_ns).
+
+        Same-shape matrices are stacked into chunks of at most ``ns_batch_size``; yields
+        ``(p, update)`` one chunk at a time. ``load`` maps a param to its NS input. A chunk of
+        one goes through orthogonalize(), so it stays bit-exact with the per-matrix path.
+        """
+        by_shape: Dict[tuple, List[torch.Tensor]] = {}
+        for p in params:
+            by_shape.setdefault(tuple(p.shape), []).append(p)
+
+        for ps in by_shape.values():
+            for start in range(0, len(ps), self.ns_batch_size):
+                chunk = ps[start : start + self.ns_batch_size]
+                if len(chunk) == 1:
+                    yield chunk[0], self.orthogonalize(chunk[0], load(chunk[0]), **group_kwargs)
+                    continue
+                orth = _batched_newton_schulz(
+                    torch.stack([load(p).float() for p in chunk]),
+                    steps=self.num_ns_steps,
+                    coefficient_type=self.coefficient_type,
+                )
+                scale = get_muon_scale_factor(orth.size(-2), orth.size(-1), mode=self.scale_mode)
+                # Two sequential multiplies, as the per-matrix path's orth * scale * extra.
+                orth.mul_(scale).mul_(self.extra_scale_factor)
+                yield from zip(chunk, orth.unbind(0))
+                del orth
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """One optimizer step.
+
+        ``ns_batch_size <= 1``: the per-matrix base step. Otherwise upstream LayerShardedMuon's
+        single-rank path: the momentum update of every param, then Newton-Schulz batched by
+        shape and the weight updates. Split QKV and TP-partitioned weights keep the per-matrix
+        orthogonalize.
+        """
+        if self.ns_batch_size <= 1:
+            return OrthogonalizedOptimizer.step(self, closure)
+
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            self._init_group(group)
+            lr = group["lr"]
+            beta = group["momentum"]
+            params = [p for p in group["params"] if p.grad is not None]
+
+            # 1. Momentum update, as in the base step.
+            for p in params:
+                grad = p.grad
+                self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
+                self.state[p]["momentum_buffer"].lerp_(grad, 1 - beta)
+
+            def ns_input(p):
+                buf = self.state[p]["momentum_buffer"]
+                return p.grad.lerp(buf, beta) if self.nesterov else buf
+
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            with fp32_matmul_precision(self.fp32_matmul_prec):
+                # 2. Split QKV and TP-partitioned weights: the per-matrix path.
+                for p in params:
+                    if not self._batchable(p):
+                        self._apply_update(p, self.orthogonalize(p, ns_input(p), **group_kwargs), lr)
+                # 3. Everything else: Newton-Schulz batched by shape.
+                batched = [p for p in params if self._batchable(p)]
+                for p, update in self._iter_ns(batched, ns_input, group_kwargs):
+                    self._apply_update(p, update, lr)
+                    del update
+        return loss
+
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
     """Tensor Parallel Adaptive Muon optimizer.
@@ -330,7 +485,10 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
+        ns_batch_size: int = 1,
     ) -> None:
+        # ns_batch_size is accepted because the Muon kwargs carry it; this class steps with
+        # AdaptiveMuon.step, which orthogonalizes per matrix.
         TensorParallelMuon.__init__(
             self,
             params,

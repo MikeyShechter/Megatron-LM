@@ -289,6 +289,15 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_ns_batch_size: int = 1
+    """Max number of same-shape matrices fused into one batched Newton-Schulz (as upstream
+    Megatron-LM's muon_ns_batch_size on a single-rank domain). MoE gives a rank hundreds of
+    identically shaped expert weights, where the per-matrix loop is kernel-launch bound;
+    batching trades transient memory for fewer launches. The value is an upper bound per
+    same-shape bucket. Batches of more than one use baddbmm instead of addmm and differ from the
+    per-matrix path by kernel-level rounding; the default of 1 keeps the bit-exact path. Split QKV
+    and TP-partitioned weights always take the per-matrix path. Plain Muon only."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""

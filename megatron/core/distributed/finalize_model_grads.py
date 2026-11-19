@@ -24,6 +24,7 @@ from .. import parallel_state
 from ..transformer.moe.moe_utils import (
     get_id_balancing_updated_expert_bias,
     get_updated_expert_bias,
+    get_zaya1_updated_expert_bias,
     qb_global_beta,
 )
 from ..transformer.transformer_config import TransformerConfig
@@ -377,6 +378,28 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         )
         for router, error in zip(router_list, stacked_error):
             router.expert_bias_prev_error.copy_(error)
+    elif config.moe_router_bias_update_type == "zaya1":
+        stacked_updated_expert_bias, stacked_exp_avg, stacked_exp_avg_sq, stacked_step = (
+            get_zaya1_updated_expert_bias(
+                stacked_tokens_per_expert,
+                stacked_expert_bias,
+                torch.stack([router.expert_bias_exp_avg for router in router_list], dim=0),
+                torch.stack([router.expert_bias_exp_avg_sq for router in router_list], dim=0),
+                torch.stack([router.expert_bias_adam_step for router in router_list], dim=0),
+                config.moe_router_bias_update_rate,
+                config.moe_router_bias_adam_beta1,
+                config.moe_router_bias_adam_beta2,
+                config.moe_router_bias_adam_eps,
+                config.moe_router_bias_adam_weight_decay,
+            )
+        )
+        for router, exp_avg, exp_avg_sq, step in zip(
+            router_list, stacked_exp_avg, stacked_exp_avg_sq, stacked_step
+        ):
+            router.expert_bias_exp_avg.copy_(exp_avg)
+            router.expert_bias_exp_avg_sq.copy_(exp_avg_sq)
+            router.expert_bias_adam_step.copy_(step)
+        stacked_gate = [None] * len(router_list)
     else:
         stacked_updated_expert_bias = get_updated_expert_bias(
             stacked_tokens_per_expert,

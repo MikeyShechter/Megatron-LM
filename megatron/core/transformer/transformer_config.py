@@ -804,19 +804,38 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
-    moe_router_bias_update_type: Literal['sign', 'id', 'proportional'] = 'sign'
+    moe_router_bias_update_type: Literal['sign', 'id', 'proportional', 'zaya1'] = 'sign'
     """Expert-bias update rule used with `moe_router_enable_expert_bias`, once per global batch.
     "sign" is DeepSeek's b += rate * sign(e). "proportional" is the b += rate * e variant of
     Loss-Free Balancing (https://arxiv.org/abs/2408.15664, Sec. 4.3 and App. C), with e =
     mean_load - load in assigned-token counts of the global batch, as in their Algorithm 1.
+    It is also LongCat-Flash's rule (https://arxiv.org/abs/2509.01322, Eq. 2, without
+    zero-computation experts), whose mu = rate * topk * tokens in the global batch.
     "id" is ID Balancing (https://arxiv.org/abs/2609.39137):
     b += rate * e + derivative_rate * g * (e - e_prev),
     then b -= mean(b), where e = (mean_load - load) / mean_load is the normalized load error and
-    g = 1[e_prev * (e - e_prev) > 0] opens only while the imbalance is growing."""
+    g = 1[e_prev * (e - e_prev) > 0] opens only while the imbalance is growing.
+    "zaya1" is ZAYA1-8B's rule (https://arxiv.org/abs/2605.05365, Eq. 5): an AdamW step on b
+    with the gradient load_share - 1/num_experts, where load_share is each expert's share of the
+    global batch's assigned tokens. Its learning rate is `moe_router_bias_update_rate` (constant),
+    its other settings are `moe_router_bias_adam_*`, and its state is kept per router. The model's
+    optimizer is not involved."""
 
     moe_router_bias_derivative_rate: float = 0.0
     """Derivative gain K_d of ID Balancing (`moe_router_bias_update_type` "id"). The integral gain
     K_i is `moe_router_bias_update_rate`. The paper uses K_i = K_d = 6e-3 with sigmoid scores."""
+
+    moe_router_bias_adam_beta1: float = 0.9
+    """beta1 of the bias AdamW of `moe_router_bias_update_type` "zaya1"."""
+
+    moe_router_bias_adam_beta2: float = 0.95
+    """beta2 of the bias AdamW of `moe_router_bias_update_type` "zaya1"."""
+
+    moe_router_bias_adam_eps: float = 1e-8
+    """epsilon of the bias AdamW of `moe_router_bias_update_type` "zaya1"."""
+
+    moe_router_bias_adam_weight_decay: float = 0.0
+    """Decoupled weight decay of the bias AdamW of `moe_router_bias_update_type` "zaya1"."""
 
     moe_router_expert_bias_post_softmax: bool = False
     """With the softmax score function, add the expert bias of `moe_router_enable_expert_bias` to
