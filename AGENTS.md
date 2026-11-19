@@ -42,3 +42,14 @@ Relevant arguments:
 - `moe_router_load_balancing_type`
 - `load_balance_ste_width`
 - `moe_aux_loss_coeff`
+
+## Paper
+
+- The paper ("Direct Load Balancing", NeurIPS 2026 template) is an Overleaf
+  project synced through git, cloned at
+  `/e/project1/laionize/shechter1/repos/69e605251838c6ba1aa83140`.
+- Entry point: `main.tex`. Sections are in `sections/`, tables in `tables/`,
+  macros in `macros.tex`, bibliography in `bib.bib`. `neurips_2026.tex` is the
+  NeurIPS template sample and is not included by `main.tex`.
+- Whenever I ask about the paper, start by reading `PAPER.md` in the root of
+  this repository. It holds my rules and preferences for working on the paper.
